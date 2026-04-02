@@ -1,3 +1,35 @@
+# ─── MOEX Bot — runtime файлы (не коммитить) ─────────────────────────────────
+# Секреты и конфиг окружения
+.env
+.env.*
+
+# Runtime state (меняется при каждом запуске — у сервера и локали разные)
+signals_state.json
+signals_state.json.bak*
+h1_watch.json
+news_cache.json
+news_memory.json
+cbr_rate_cache.json
+trade_log.json
+signals_score_log.jsonl
+
+# Логи
+logs/
+bot.log
+*.log
+
+# Экспортные архивы
+trader_export_*.tar.gz
+*.tar.gz
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDE — PyCharm / IntelliJ
+.idea/
+
+# ─── Python стандартный ───────────────────────────────────────────────────────
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
