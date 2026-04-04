@@ -1,5 +1,5 @@
 """
-MOEX Signal Bot v0.9.23
+MOEX Signal Bot v0.9.25
 ════════════════════════════════════════════════════════════════
 Модуль 1: Объём + RSI(14 Уайлдера) + MA20 + MA50 + ADX(14) + Фибоначчи + BB Squeeze
 Модуль 2: Парсинг RSS-новостей + кэш (не повторять старое)
@@ -2042,11 +2042,23 @@ TICKER_MAP = {
     "__MACRO": ["санкци", "эмбарго", "мосбирж", "индекс ртс", "рубл"],
     "__GEO":   ["переговор", "мирн", "прекращен огня", "геополитик", "мобилизац"],
     "__USD":   ["курс доллара", "курс рубля", "usdrub", "ослаблен рубл", "укреплен рубл"],
+    # v0.9.25: корпоративные события — обязательные оферты, M&A, делистинг.
+    # Тикеры не назначаются массово — только обогащаем event_type для уже найденных тикеров.
+    "__CORP":  ["оферт", "обязательн предложен", "выкуп акций", "выкуп бумаг",
+                "делистинг", "поглощен", "слиян компан", "присоединен",
+                "buyout", "обратный выкуп", "buy-back"],
     # v0.9.6 — новые тикеры
     "ENPG":  ["эн+", "en+", "enpg", "эн плюс", "en plus"],
     "MAGN":  ["ммк", "магнитогорск", "магнитогорский металлургическ"],
     "AFLT":  ["аэрофлот", "aeroflot"],
-    "PIKK":  ["пик девелопер", "пик груп", "пик групп", "pikk"],
+    "PIKK":  ["пик девелопер", "пик груп", "пик групп", "pikk",
+               "пик сз", "пао пик", "пик-сз", "застройщик пик",
+               "акции пик", "группа пик",
+               " пик ",  " пик.",  " пик,",               # standalone: середина
+               " пика ", " пика.", " пика,", "акций пик", # genitive
+               " пику ", " пику.", " пиком",              # другие падежи
+               "пик ",                                    # начало предложения
+               ],                                         # v0.9.25: расширен
 }
 OIL_TICKERS  = ["GAZP", "LKOH", "ROSN", "NVTK", "TATN", "SNGS", "SIBN", "TRNFP"]
 BANK_TICKERS = ["SBER", "VTBR", "T"]    # T = T-Банк (замена TCSG, v0.9)
@@ -2064,6 +2076,21 @@ NEGATIVE_ROOTS = [
     "повыш ставк", "повышает ставк", "эскалац", "удар",
 ]
 STRONG_ROOTS = ["резко", "историческ", "критическ", "срочно", "экстренн", "рекордн"]
+
+# Стоп-слова: новости спорта, культуры, светской хроники — нерелевантны для торговли
+NOISE_STOPWORDS = [
+    # Спорт: тренеры, клубы, матчи
+    "футбол", "хоккей", "баскетбол", "волейбол", "теннис",
+    "главным тренером", "возглавит клуб", "возглавит команд",
+    "аланьяспор", "спартак тренер", "цска тренер", "зенит тренер",
+    "чемпионат мира по", "кубок уефа", "лига чемпионов",
+    "трансфер игрок", "футбольн клуб", "хоккейн клуб",
+    "матч ", "турнир по", "олимпийск",
+    # Культура / личные события
+    "скончался", "скончалась", "умер ", "умерла ", "похороны",
+    "день рождения", "юбилей ", "свадьб", "развод",
+    "кинофестивал", "театральн", "концерт", "выставк",
+]
 
 
 def _match_roots(text: str, roots: list[str]) -> int:
@@ -2106,6 +2133,10 @@ _ALL_FILTER_WORDS = (
 
 def is_relevant(item: NewsItem) -> bool:
     text = (item.title + " " + item.summary).lower()
+    # Сначала отсекаем спорт/культуру/личные новости
+    if any(sw in text for sw in NOISE_STOPWORDS):
+        logger.debug("is_relevant: noise filter [%s]", item.title[:60])
+        return False
     return any(kw in text for kw in _ALL_FILTER_WORDS)
 
 
@@ -2181,6 +2212,10 @@ def analyze_by_keywords(item: NewsItem) -> NewsItem:
                 elif ticker == "__USD":
                     matched.update(ALL_EXPORT)
                     item.event_type = "CURRENCY"
+                elif ticker == "__CORP":
+                    # v0.9.25: корпоративное событие — тикеры уже добавлены другими правилами.
+                    # Просто обогащаем event_type и даём boost strength.
+                    item.event_type = "CORP"
                 else:
                     matched.add(ticker)
                 break
@@ -2191,6 +2226,10 @@ def analyze_by_keywords(item: NewsItem) -> NewsItem:
     pos   = _match_roots(text, POSITIVE_ROOTS)
     neg   = _match_roots(text, NEGATIVE_ROOTS)
     boost = _match_roots(text, STRONG_ROOTS)
+
+    # v0.9.25: корпоративные события (оферта, M&A, делистинг) — сильный драйвер, +1 boost
+    if item.event_type == "CORP":
+        boost = max(boost, 1)
 
     if "санкц" in text or "эмбарго" in text:
         item.event_type = "SANCTIONS"
@@ -2254,7 +2293,8 @@ def build_ai_system_prompt(ctx: dict) -> str:
 1. Затронутые тикеры (только из: {tickers_list})
 2. Направление: LONG / SHORT / NEUTRAL
 3. Сила: 1 (слабый) / 2 (средний) / 3 (сильный)
-4. Тип: OIL / CB_RATE / SANCTIONS / MACRO / EARNINGS / GEOPOLITICS / CURRENCY / NEWS
+4. Тип: OIL / CB_RATE / SANCTIONS / MACRO / EARNINGS / GEOPOLITICS / CURRENCY / CORP / NEWS
+   CORP = оферта, M&A, делистинг, buyback, слияние, поглощение
 5. Причина (1 предложение на русском, с учётом текущей ставки и курса рубля)
 
 Отвечай ТОЛЬКО валидным JSON без markdown:
@@ -2798,6 +2838,7 @@ def print_news_signal(s: NewsItem):
         "EARNINGS":    "💰 Отчёт",
         "GEOPOLITICS": "🌍 Геополитика",
         "CURRENCY":    "💱 Валюта",
+        "CORP":        "🏢 M&A/Оферта",   # v0.9.25
         "NEWS":        "📰 Новость",
     }
     event_label = labels.get(s.event_type, "📰")
@@ -3067,6 +3108,7 @@ def tg_format_news_only(n: NewsItem) -> str:
         "OIL":     "🛢 Нефть",  "MACRO":       "📊 Макро",
         "EARNINGS":"💰 Отчёт",  "GEOPOLITICS": "🌍 Геополитика",
         "CURRENCY":"💱 Валюта", "NEWS":        "📰",
+        "CORP":    "🏢 M&A/Оферта",            # v0.9.25
     }
     evt   = labels.get(n.event_type, "📰")
     age   = parse_news_age(n.published)
@@ -4414,9 +4456,47 @@ def tg_notify_run(
             # Сигнал оценён, но should_send_tg вернул False — логируем причину
             append_score_log({**_score_base, "action": "skipped", "reason": "should_send_tg_false"})
 
-    # 3. Новостные сигналы без рыночного подтверждения — v0.9.19: не шлём в Telegram.
-    # Они сохраняются в news_memory для накопленного сентимента, но не засоряют чат.
-    # (news_orphan обрабатывается в run_once для обновления news_memory)
+    # 3. Новостные сигналы без рыночного подтверждения — v0.9.25: отправляем важные.
+    # Критерии: strength >= 2 (уверенный сигнал), не выходной, не дубль (dedup по title-hash).
+    # Дедупликация хранится в state под ключом "ntg_<hash>" с TTL 24 часа.
+    if not _is_weekend and news_orphan:
+        # Чистим старые ntg_* ключи (> 24 ч)
+        _now_utc = datetime.now(timezone.utc)
+        _stale_ntg = [
+            k for k, v in state.items()
+            if k.startswith("ntg_")
+            and (
+                _now_utc - datetime.fromisoformat(v["sent"]).replace(tzinfo=timezone.utc)
+            ).total_seconds() > 86400
+        ]
+        for _sk in _stale_ntg:
+            del state[_sk]
+
+        for n in news_orphan:
+            if n.direction == "NEUTRAL" or not n.tickers:
+                continue
+            # Порог: AI-сигналы от strength 2+, keyword — от 3 (AI точнее)
+            _min_str = 2 if n.analyzed_by == "ai" else 3
+            if n.strength < _min_str:
+                continue
+            # Дедупликация
+            _nk = "ntg_" + hashlib.md5(n.title.encode()).hexdigest()[:12]
+            if _nk in state:
+                continue
+            text = tg_format_news_only(n)
+            if tg_send(text):
+                state[_nk] = {
+                    "sent":      _now_utc.isoformat(),
+                    "title":     n.title[:80],
+                    "tickers":   n.tickers,
+                    "direction": n.direction,
+                }
+                sent += 1
+                logger.info(
+                    "tg_news_orphan: %s %s str=%d [%s]",
+                    n.tickers, n.direction, n.strength, n.title[:50],
+                )
+                print(f"  📰 Telegram [НОВОСТЬ]: {', '.join(n.tickers[:4])} {n.direction} str={n.strength}")
 
     save_signals_state(state)
     if sent:
@@ -4431,7 +4511,7 @@ def run_once(news_only: bool = False):
     now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     logger.info("─── скан начат (%s) ───", now)
     print(f"\n{'═'*54}")
-    print(f"  🤖 MOEX Signal Bot v0.9.20  |  {now}")
+    print(f"  🤖 MOEX Signal Bot v0.9.25  |  {now}")
     ai_status = "✅ AI включён" if ANTHROPIC_API_KEY else "⚠️  AI выключен (нет ключа)"
     print(f"  {ai_status}")
     if _tinvest_available():
