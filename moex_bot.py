@@ -1,5 +1,5 @@
 """
-MOEX Signal Bot v0.9.25
+MOEX Signal Bot v0.9.26
 ════════════════════════════════════════════════════════════════
 Модуль 1: Объём + RSI(14 Уайлдера) + MA20 + MA50 + ADX(14) + Фибоначчи + BB Squeeze
 Модуль 2: Парсинг RSS-новостей + кэш (не повторять старое)
@@ -643,7 +643,9 @@ MONDAY_RISK_MULT = float(os.environ.get("MONDAY_RISK_MULT", "0.5"))  # 0.5 = 50%
 # Лотность (акций в 1 лоте) — синхронизирована с tinvest_data.LOT_SIZE
 # Нужна локально для calc_position_size() без зависимости от tinvest модуля
 LOT_SIZES: dict[str, int] = {
-    "GAZP": 10,   "SBER": 10,   "LKOH": 1,    "ROSN": 1,    "NVTK": 1,
+    # v0.9.25: SBER 10→1 (MOEX изменил с 01.08.2025, официальный пресс-релиз moex.com/n92172)
+    # v0.9.25: GAZP 10→1 (подтверждено поиском, 1 акция в лоте с 2025)
+    "GAZP": 1,    "SBER": 1,    "LKOH": 1,    "ROSN": 1,    "NVTK": 1,
     "GMKN": 1,    "YDEX": 1,    "TATN": 1,    "MGNT": 1,    "PLZL": 1,
     "SNGS": 100,  "MTSS": 10,   "ALRS": 10,   "VTBR": 10000,"CHMF": 1,
     "T":    1,    "PHOR": 1,    "AFKS": 100,  "NLMK": 10,
@@ -653,6 +655,7 @@ LOT_SIZES: dict[str, int] = {
     "ENPG": 1,    "MAGN": 10,   "AFLT": 10,   "PIKK": 1,
     # v0.9.9 — новые тикеры
     "AKRN": 1,    "IRAO": 100,
+    # VTBR: 10 000 акций в лоте — подтверждено (апрель 2026, MOEX TQBR)
 }
 
 BASE_URL = "https://iss.moex.com/iss"
@@ -663,12 +666,14 @@ BASE_URL = "https://iss.moex.com/iss"
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_moex_open() -> bool:
-    """MOEX торгует 09:50–18:50 по Москве, Пн–Пт."""
+    """MOEX фондовый рынок: основная сессия 09:50–19:00 по Москве, Пн–Пт.
+    v0.9.25: исправлено 18:50 → 19:00 (официальное расписание moex.com)
+    """
     now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
     if now_msk.weekday() >= 5:   # Сб=5, Вс=6
         return False
     start = now_msk.replace(hour=9,  minute=50, second=0, microsecond=0)
-    end   = now_msk.replace(hour=18, minute=50, second=0, microsecond=0)
+    end   = now_msk.replace(hour=19, minute=0,  second=0, microsecond=0)
     return start <= now_msk <= end
 
 
@@ -2287,7 +2292,7 @@ def build_ai_system_prompt(ctx: dict) -> str:
 - Санкции США/ЕС действуют, экспорт ограничен; геополитика = главный риск
 
 ЭКСПОРТЁРЫ (выигрывают от слабого рубля): GAZP LKOH ROSN NVTK TATN SNGS GMKN PLZL ALRS CHMF PHOR NLMK
-ВНУТРЕННИЙ РЫНОК (страдают от слабого рубля): SBER VTBR TCSG MGNT MTSS YDEX AFKS
+ВНУТРЕННИЙ РЫНОК (страдают от слабого рубля): SBER VTBR T MGNT MTSS YDEX AFKS
 
 Тебе дают список новостей. Для каждой определи:
 1. Затронутые тикеры (только из: {tickers_list})
@@ -3774,17 +3779,17 @@ EVENT_CALENDAR: list[dict] = [
     # Тренд: снижение ставки (21%→15.5%→15%) → позитив для банков и застройщиков.
     # Опорные заседания (со среднесрочным прогнозом): апрель, июль, октябрь, декабрь.
     {"date": "2026-04-24", "event": "ЦБ РФ: заседание по ставке (опорное, ожидается снижение)",
-     "tickers": ["SBER", "VTBR", "TCSG", "LSRG", "SMLT"], "bias": "long"},
+     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK"], "bias": "long"},
     {"date": "2026-06-19", "event": "ЦБ РФ: заседание по ставке",
-     "tickers": ["SBER", "VTBR", "TCSG", "LSRG", "SMLT"], "bias": "long"},
+     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK"], "bias": "long"},
     {"date": "2026-07-24", "event": "ЦБ РФ: заседание по ставке (опорное)",
-     "tickers": ["SBER", "VTBR", "TCSG", "LSRG", "SMLT"], "bias": "long"},
+     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK"], "bias": "long"},
     {"date": "2026-09-11", "event": "ЦБ РФ: заседание по ставке",
-     "tickers": ["SBER", "VTBR", "TCSG", "LSRG", "SMLT"], "bias": "long"},
+     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK"], "bias": "long"},
     {"date": "2026-10-23", "event": "ЦБ РФ: заседание по ставке (опорное)",
-     "tickers": ["SBER", "VTBR", "TCSG", "LSRG", "SMLT"], "bias": "long"},
+     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK"], "bias": "long"},
     {"date": "2026-12-18", "event": "ЦБ РФ: заседание по ставке (опорное)",
-     "tickers": ["SBER", "VTBR", "TCSG", "LSRG", "SMLT"], "bias": "long"},
+     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK"], "bias": "long"},
     # ── Дивидендные отсечки 2026 (проверено по investmint.ru, banki.ru, livetrader.ru 01.04.2026) ──
     # bias=short: за 2-5 дней до отсечки акции обычно продают (дивидендный гэп вниз после).
     # bias=long:  за 5-10 дней до отсечки — накопление, рост к дивиденду.
@@ -3805,6 +3810,10 @@ EVENT_CALENDAR: list[dict] = [
     # ROSN: отсечка за 2П2024 уже прошла (янв 2026). Следующая ориентировочно дек 2026.
     {"date": "2026-12-10", "event": "Роснефть: дивидендная отсечка (ориентир 2П2026)",
      "tickers": ["ROSN"], "bias": "short"},
+    # LSRG: дивиденд ~78-100₽, отсечка ожидается 29 апреля – 2 мая 2026.
+    # v0.9.25: добавлено, источник: investmint.ru, bcs.ru/dividends
+    {"date": "2026-04-29", "event": "ЛСР: дивидендная отсечка (прогноз ~78-100₽/акц)",
+     "tickers": ["LSRG"], "bias": "short"},
 ]
 
 
@@ -4511,7 +4520,7 @@ def run_once(news_only: bool = False):
     now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     logger.info("─── скан начат (%s) ───", now)
     print(f"\n{'═'*54}")
-    print(f"  🤖 MOEX Signal Bot v0.9.25  |  {now}")
+    print(f"  🤖 MOEX Signal Bot v0.9.26  |  {now}")
     ai_status = "✅ AI включён" if ANTHROPIC_API_KEY else "⚠️  AI выключен (нет ключа)"
     print(f"  {ai_status}")
     if _tinvest_available():
