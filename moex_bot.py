@@ -1,10 +1,60 @@
 """
-MOEX Signal Bot v0.9.26
+MOEX Signal Bot v0.9.29
 ════════════════════════════════════════════════════════════════
-Модуль 1: Объём + RSI(14 Уайлдера) + MA20 + MA50 + ADX(14) + Фибоначчи + BB Squeeze
+Модуль 1: Объём + RSI(14 Уайлдера) + MA20 + MA50 + ADX(14) + Фибоначчи + BB Squeeze + OBV + MA Cross
 Модуль 2: Парсинг RSS-новостей + кэш (не повторять старое)
-Модуль 3: AI-анализ с контекстом рынка (ставка ЦБ, USDRUB, IMOEX)
-Модуль 4: Синтез — объём × новости × рубль × индекс × VWAP × стакан × score
+Модуль 3: AI-анализ с контекстом рынка (ставка ЦБ, USDRUB, IMOEX, Brent, Gold)
+Модуль 4: Синтез — объём × новости × рубль × индекс × VWAP × стакан × Brent × Gold × OBV × MA_cross × score
+
+Что добавлено в v0.9.29 (СЫРЬЁ + НОВЫЕ ТИКЕРЫ + OBV + MA CROSS, 08.04.2026):
+  + Brent нефть: fetch_brent_price() → ближайший BR фьючерс с MOEX ISS.
+    Влияние: OIL_TICKERS (LKOH ROSN TATN NVTK SNGS GAZP) получают brent_confirm True/False.
+    Пороги: ±1.5%/день. Бонус +2 к score при подтверждении, -1 при противоречии.
+  + Золото: fetch_gold_price() → GLDRUB_TOM с MOEX ISS (₽/г).
+    Влияние: только PLZL. Пороги: ±1.0%/день. Те же бонусы.
+  + Новые тикеры: X5 (ритейл), HEAD (ХХ, переименован из HHRU), POSI (кибербез), LSRG (застройщик).
+    Возвращён PIKK (снижение ставки — застройщики восстанавливаются).
+    RATE_SENSITIVE_TICKERS = {SBER VTBR T SMLT PIKK LSRG OZON X5 MGNT AFKS}.
+  + Rate-trend bias: если ставка < 17% и тикер в RATE_SENSITIVE → +1 к LONG.
+    Текущая ставка 15% (снижение с 21%) — все ставко-чувствительные тикеры получают бонус.
+  + Pre-dividend accumulation: за 3-7 дней до дивидендной отсечки → LONG +1 (накопление).
+    Отличается от Event Calendar (48ч вокруг события): это окно накопления.
+  + OBV (On-Balance Volume): calc_obv() считает накопление/распределение.
+    Бычья дивергенция (OBV↑ цена↓) → +2 к LONG; медвежья (OBV↓ цена↑) → +2 к SHORT.
+    Дивергенция против направления → -1. Простое совпадение тренда → +1.
+  + MA Crossover: detect_ma_crossover() — Golden/Death cross MA20/MA50.
+    Golden cross → +2 к LONG; Death cross → +2 к SHORT. Против → -1.
+    Требует 52 свечи (достаточно для надёжного сигнала).
+  + EVENT_CALENDAR расширен: ЦБ-заседания включают X5, LSRG, HEAD, POSI как бенефициаров снижения.
+  + AI промпт обновлён: Brent, Gold, RATE_SENSITIVE_TICKERS, новые тикеры в контексте.
+  + MAGN ключевые слова расширены: ФАС-урегулирование → возможная разблокировка дивидендов.
+  + TG-сообщение и консольный вывод: строки Brent и Gold теперь отображаются.
+  + Скоринг обновлён: максимум ~29 очков при всех факторах (было 17).
+    Пороги уверенности не изменены — более честная оценка с больших базы факторов.
+
+Что добавлено в v0.9.28 (ЭКОНОМИКА ВМЕСТО ВРЕМЕНИ, 07.04.2026):
+  + SHORT_ENTRY_CUTOFF_HOUR: 16 → 0 (отключён полностью).
+    Обоснование: short_margin_guard уже считает рентабельность (profit vs margin overnight).
+    Временно́й блок был избыточен и отклонял выгодные сигналы:
+    MAGN SHORT score=12 (vol×4.0, ожидаемая прибыль ~2%) заблокирован 24 раза
+    из-за cutoff=15, хотя маржа overnight составила бы <0.05% — в 40 раз меньше прибыли.
+    Теперь решение принимает short_margin_guard: если прибыль > 80% маржи → вход разрешён.
+    Жёсткий запрет остаётся доступен через .env: SHORT_ENTRY_CUTOFF_HOUR=18.
+
+Что добавлено в v0.9.27 (НАДЁЖНОСТЬ + ПРОЗРАЧНОСТЬ, 07.04.2026):
+  + SHORT_ENTRY_CUTOFF_HOUR: 15→16 МСК.
+    Причина: MAGN SHORT score=12 (объём ×4.0) был полностью заблокирован 07.04.2026.
+    Все 24 попытки входа (18:01–18:59) отклонены из-за лимита времени.
+    Теперь сигналы до 15:59 МСК проходят (было: до 14:59).
+  + TG-уведомление при сильном заблокированном сигнале (score ≥ 8):
+    Если SHORT заблокирован по времени но score ≥ 8 — в TG приходит:
+    "⏰ СИЛЬНЫЙ СИГНАЛ — ВХОД ЗАБЛОКИРОВАН" с объёмом и причиной.
+    Раньше такие сигналы молча исчезали в лог-файл.
+  + PID-файл (moex_bot.pid) — защита от двух параллельных экземпляров:
+    07.04.2026 с 18:37 работали два scan-а одновременно (--watch + возможно crontab).
+    Теперь второй экземпляр видит живой PID → пишет предупреждение → exit(0).
+  + Явный reason в score_log: вместо "should_send_tg_false" теперь пишется
+    реальная причина отклонения: "entry_cutoff", или другой код.
 
 Что добавлено в v0.9.23 (АНАЛИТИЧЕСКИЕ ЛОГИ):
   + signals_score_log.jsonl — лог ВСЕХ оцененных сигналов (JSONL, append-only):
@@ -368,8 +418,11 @@ TICKERS = [
     "T",    "PHOR", "AFKS", "NLMK",            # T = T-Банк (замена делистованного TCSG, v0.9)
     "SIBN", "FLOT", "RUAL", "OZON",            # добавлены в v0.7
     "MOEX", "SMLT", "TRNFP",                   # добавлены в v0.7
-    "ENPG", "MAGN", "AFLT",                     # добавлены в v0.9.6 (PIKK удалён v0.9.20: нет FIGI, 0W/1L)
+    "ENPG", "MAGN", "AFLT",                    # добавлены в v0.9.6
     "AKRN", "IRAO",                            # добавлены в v0.9.9: Акрон и ИнтерРАО
+    # v0.9.29: новые тикеры по итогам аудита рынка апрель 2026
+    "X5",   "HEAD", "POSI", "LSRG",            # X5 ритейл, Хэдхантер, Позитив, ЛСР
+    "PIKK",                                     # ПИК: возвращён — ставка 15%↓, девелоперы растут
 ]
 
 RSS_FEEDS = {
@@ -403,8 +456,21 @@ DOMESTIC_TICKERS = {
     "SMLT",                     # недвижимость (внутренний, ставкозависимый)
     "MOEX",                     # финансовая инфраструктура
     "AFLT",                     # Аэрофлот — авиаперевозки внутренний (v0.9.6)
-    "PIKK",                     # ПИК — девелопер, ставкозависимый (v0.9.6)
+    "PIKK",                     # ПИК — девелопер; возвращён v0.9.29 (ставка 15%↓, не 21%)
     "IRAO",                     # ИнтерРАО — энергетика, внутренний (v0.9.9)
+    # v0.9.29: новые тикеры
+    "X5",                       # X5 Retail Group — продуктовый ритейл
+    "HEAD",                     # Хэдхантер — IT/HR, бенефициар рынка труда
+    "POSI",                     # Группа Позитив — кибербезопасность
+    "LSRG",                     # ЛСР — девелопер, ставкозависимый
+}
+
+# v0.9.29: тикеры чувствительные к ставке ЦБ (растут при снижении ставки)
+RATE_SENSITIVE_TICKERS = {
+    "SBER", "VTBR", "T",   # банки: NIM улучшается при снижении стоимости фондирования
+    "SMLT", "PIKK", "LSRG",# девелоперы: ипотека дешевеет → спрос на жильё растёт
+    "OZON", "MGNT", "X5",  # ритейл/e-com: потребительский спрос восстанавливается
+    "AFKS",                 # АФК: закредитованный холдинг, процентные расходы падают
 }
 
 VOLUME_THRESHOLD     = 2.0          # объём выше среднего в X раз = аномалия
@@ -451,6 +517,11 @@ MIN_VOL_RUB_MAP: dict[str, int] = {
     # v0.9.9 — новые тикеры
     "AKRN":   30_000_000,    # Акрон: акция дорогая, ~20к₽, оборот ~300-500 млн/день
     "IRAO":  100_000_000,    # ИнтерРАО: очень ликвидная (топ-15 по обороту)
+    # v0.9.29 — новые тикеры
+    "X5":    150_000_000,    # X5 Retail: крупный ритейл, высокий оборот после релистинга
+    "HEAD":   50_000_000,    # Хэдхантер: средняя ликвидность, IT-сектор
+    "POSI":   50_000_000,    # Позитив: кибербезопасность, средняя ликвидность
+    "LSRG":   30_000_000,    # ЛСР: девелопер, относительно низкий оборот
 }
 NEWS_STRENGTH_MIN    = 1
 SCAN_INTERVAL_SEC    = 300          # --watch интервал (5 мин)
@@ -504,14 +575,18 @@ SANDBOX_MAX_TICKER_PCT = float(os.environ.get("SANDBOX_MAX_TICKER_PCT", "10.0"))
 #    Пример: equity=1M, лимит 20% → максимум 200 000 ₽ в открытых позициях суммарно.
 SANDBOX_MAX_TOTAL_PCT  = float(os.environ.get("SANDBOX_MAX_TOTAL_PCT",  "20.0"))
 
-# ─── Фильтр времени входа (v0.9.19 — раздельный для LONG/SHORT) ────────────
-# LONG: без маржи, держать можно сколько нужно → ограничений нет (=0).
-# SHORT: маржа ~17%/год = ~0.047%/день. Не открываем после 15:00 чтобы
-#   не накапливать плату за overnight. Установи 0 чтобы отключить фильтр.
-# Открытые позиции (стопы/тейки) мониторятся в любое время.
+# ─── Фильтр времени входа (v0.9.28 — временно́й блок SHORT отключён) ──────
+# LONG:  без маржи → нет ограничений (=0).
+# SHORT: v0.9.28 — установлено 0 (нет лимита по времени).
+#   Обоснование: short_margin_guard уже блокирует невыгодные шорты экономически
+#   (margin_cost_max > profit_per_share * 0.8). Блокировать по времени — значит
+#   отклонять сильные сигналы (score=12, vol×4.0) когда прибыль >> маржи overnight.
+#   Пример 07.04: MAGN SHORT score=12 заблокирован 24 раза подряд (18:01–18:59),
+#   хотя ожидаемая прибыль ~2% при марже overnight <0.05% — экономически выгодно.
+#   Если нужен жёсткий запрет — выставить через SHORT_ENTRY_CUTOFF_HOUR=18 в .env.
 LONG_ENTRY_CUTOFF_HOUR  = int(os.environ.get("LONG_ENTRY_CUTOFF_HOUR",  "0"))   # 0 = нет лимита
-SHORT_ENTRY_CUTOFF_HOUR = int(os.environ.get("SHORT_ENTRY_CUTOFF_HOUR", "15"))  # МСК (UTC+3)
-ENTRY_CUTOFF_HOUR = SHORT_ENTRY_CUTOFF_HOUR  # legacy alias, используется в should_send_tg
+SHORT_ENTRY_CUTOFF_HOUR = int(os.environ.get("SHORT_ENTRY_CUTOFF_HOUR", "0"))   # 0 = нет лимита; short_margin_guard — основной фильтр
+ENTRY_CUTOFF_HOUR = SHORT_ENTRY_CUTOFF_HOUR  # legacy alias
 
 # ─── Telegram ──────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "")
@@ -526,6 +601,8 @@ TRADE_LOG_FILE = os.path.join(
 SCORE_LOG_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "signals_score_log.jsonl"
 )
+# v0.9.27: PID-файл для защиты от запуска двух экземпляров одновременно
+PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moex_bot.pid")
 # Минимальный интервал повторной отправки одного сигнала (часов)
 TG_REPEAT_HOURS = float(os.environ.get("TG_REPEAT_HOURS", "3"))
 
@@ -656,6 +733,11 @@ LOT_SIZES: dict[str, int] = {
     # v0.9.9 — новые тикеры
     "AKRN": 1,    "IRAO": 100,
     # VTBR: 10 000 акций в лоте — подтверждено (апрель 2026, MOEX TQBR)
+    # v0.9.29 — новые тикеры (лотность подтверждена через MOEX/banki.ru, апрель 2026)
+    "X5":   1,    # X5 Retail Group (после редомициляции 2024, 1 акция в лоте)
+    "HEAD": 1,    # МКПАО Хэдхантер (переехал с HHRU, 1 акция, подтверждено MOEX)
+    "POSI": 1,    # Группа Позитив — кибербезопасность, 1 акция
+    "LSRG": 1,    # ЛСР Группа — девелопер, 1 акция
 }
 
 BASE_URL = "https://iss.moex.com/iss"
@@ -764,12 +846,98 @@ def fetch_cbr_rate() -> float:
     return CBR_KEY_RATE
 
 
+def fetch_brent_price() -> dict:
+    """
+    v0.9.29: Цена нефти Brent через MOEX ISS (ближайший фьючерс серии BR).
+    Алгоритм: получаем список активных фьючерсов BR → берём первый по дате →
+    дневные свечи за 5 дней → last price + % изменения.
+    Возвращает {"price": float|None, "change_pct": float|None}.
+    """
+    _empty = {"price": None, "change_pct": None}
+    try:
+        # Шаг 1: список активных контрактов BR (нефть Brent)
+        r = requests.get(
+            f"{BASE_URL}/engines/futures/markets/forts/securities.json"
+            "?q=BR&is_trading=1&limit=10",
+            timeout=10,
+        )
+        r.raise_for_status()
+        data  = r.json()
+        cols  = data["securities"]["columns"]
+        secs  = [dict(zip(cols, row)) for row in data["securities"]["data"]]
+        # Фильтруем только BR* (фьючерсы нефти, не спред-контракты)
+        br_contracts = [s for s in secs if str(s.get("SECID", "")).startswith("BR")
+                        and len(s.get("SECID", "")) <= 6]
+        if not br_contracts:
+            logger.debug("brent: нет активных контрактов BR")
+            return _empty
+        # Берём контракт с ближайшей датой экспирации (LASTTRADEDATE)
+        br_contracts.sort(key=lambda s: s.get("LASTTRADEDATE", "9999-99-99"))
+        code = br_contracts[0]["SECID"]
+
+        # Шаг 2: дневные свечи за последние 5 торговых дней
+        from_dt = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
+        till_dt = datetime.now().strftime("%Y-%m-%d")
+        r2 = requests.get(
+            f"{BASE_URL}/engines/futures/markets/forts/boards/RFUD"
+            f"/securities/{code}/candles.json"
+            f"?from={from_dt}&till={till_dt}&interval=24",
+            timeout=10,
+        )
+        r2.raise_for_status()
+        d2   = r2.json()
+        c2   = d2["candles"]["columns"]
+        rows = [dict(zip(c2, row)) for row in d2["candles"]["data"]]
+        if len(rows) < 2:
+            return _empty
+        last_price  = rows[-1]["close"]
+        prev_price  = rows[-2]["close"]
+        change_pct  = round((last_price - prev_price) / prev_price * 100, 2) if prev_price else None
+        logger.debug("brent %s: %.2f $ (%+.2f%%)", code, last_price, change_pct or 0)
+        return {"price": round(last_price, 2), "change_pct": change_pct}
+    except Exception as e:
+        logger.debug("brent: %s", e)
+        return _empty
+
+
+def fetch_gold_price() -> dict:
+    """
+    v0.9.29: Цена золота через MOEX ISS (GLDRUB_TOM — спот в ₽/грамм).
+    Возвращает {"price_rub_gram": float|None, "change_pct": float|None}.
+    """
+    _empty = {"price_rub_gram": None, "change_pct": None}
+    try:
+        from_dt = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        till_dt = datetime.now().strftime("%Y-%m-%d")
+        r = requests.get(
+            f"{BASE_URL}/engines/currency/markets/selt/boards/CETS"
+            "/securities/GLDRUB_TOM/candles.json"
+            f"?from={from_dt}&till={till_dt}&interval=24",
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        cols = data["candles"]["columns"]
+        rows = [dict(zip(cols, row)) for row in data["candles"]["data"]]
+        if len(rows) < 2:
+            return _empty
+        last_price = rows[-1]["close"]
+        prev_price = rows[-2]["close"]
+        change_pct = round((last_price - prev_price) / prev_price * 100, 2) if prev_price else None
+        logger.debug("gold GLDRUB_TOM: %.2f ₽/г (%+.2f%%)", last_price, change_pct or 0)
+        return {"price_rub_gram": round(last_price, 2), "change_pct": change_pct}
+    except Exception as e:
+        logger.debug("gold: %s", e)
+        return _empty
+
+
 def get_market_context() -> dict:
     """
-    Получаем USDRUB и IMOEX из MOEX ISS.
-    Возвращает словарь с курсом рубля, индексом, ставкой ЦБ.
+    Получаем USDRUB, IMOEX, Brent, Gold из MOEX ISS.
+    Возвращает словарь с курсом рубля, индексом, ставкой ЦБ, нефтью, золотом.
     IMOEX: 21 дн. история → поддержка, сопротивление, ATR, RSI, Фибоначчи, зона.
     v0.9.21: cbr_rate теперь всегда актуальный (fetch_cbr_rate с кэшем).
+    v0.9.29: добавлены Brent (фьючерс BR) и Gold (GLDRUB_TOM).
     """
     ctx = {
         "usdrub":            None,
@@ -778,7 +946,16 @@ def get_market_context() -> dict:
         "imoex_change_pct":  None,
         "imoex_levels":      None,   # технические уровни IMOEX (добавлено в v0.8)
         "cbr_rate":          fetch_cbr_rate(),  # v0.9.21: всегда актуально с cbr.ru
+        # v0.9.29: нефть и золото
+        "brent":             None,   # цена Brent ($)
+        "brent_change_pct":  None,   # дневное изменение Brent (%)
+        "gold_rub_gram":     None,   # золото ₽/грамм (GLDRUB_TOM)
+        "gold_change_pct":   None,   # дневное изменение золота (%)
     }
+    # v0.9.29: синхронизируем глобальный CBR_KEY_RATE с живой ставкой из кэша/cbr.ru.
+    # Это позволяет synthesize_signals() использовать актуальную ставку через CBR_KEY_RATE.
+    global CBR_KEY_RATE
+    CBR_KEY_RATE = ctx["cbr_rate"]
     yesterday = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
     today     = datetime.now().strftime("%Y-%m-%d")
 
@@ -883,6 +1060,22 @@ def get_market_context() -> dict:
     except Exception as e:
         logger.warning("IMOEX: не удалось получить данные: %s", e)
 
+    # v0.9.29: Brent нефть (влияние на экспортёров)
+    try:
+        _brent = fetch_brent_price()
+        ctx["brent"]            = _brent["price"]
+        ctx["brent_change_pct"] = _brent["change_pct"]
+    except Exception as e:
+        logger.debug("brent context: %s", e)
+
+    # v0.9.29: Золото GLDRUB_TOM (влияние на PLZL)
+    try:
+        _gold = fetch_gold_price()
+        ctx["gold_rub_gram"]    = _gold["price_rub_gram"]
+        ctx["gold_change_pct"]  = _gold["change_pct"]
+    except Exception as e:
+        logger.debug("gold context: %s", e)
+
     return ctx
 
 
@@ -896,8 +1089,14 @@ def print_market_context(ctx: dict):
         if ctx["imoex"] else "нет данных"
     )
     session_str = "🟢 открыта" if is_moex_open() else "🔴 закрыта"
+    brent_str = (f"{ctx['brent']}$ ({ctx['brent_change_pct']:+.2f}%)"
+                 if ctx.get("brent") else "нет данных")
+    gold_str  = (f"{ctx['gold_rub_gram']}₽/г ({ctx['gold_change_pct']:+.2f}%)"
+                 if ctx.get("gold_rub_gram") else "нет данных")
     print(f"\n  💱 USDRUB:    {usdrub_str}")
     print(f"  📈 IMOEX:     {imoex_str}")
+    print(f"  🛢️  Brent:     {brent_str}")
+    print(f"  🥇 Золото:    {gold_str}")
     lvls = ctx.get("imoex_levels")
     if lvls:
         zone_labels = {
@@ -1298,6 +1497,86 @@ def detect_volume_anomaly(candles: list[dict], ticker: str = "") -> dict:
     }
 
 
+def calc_obv(candles: list[dict]) -> dict:
+    """
+    v0.9.29: On-Balance Volume (OBV) — накопление/распределение объёма.
+
+    Логика: если цена закрытия выше предыдущей → объём прибавляем (покупатели),
+    ниже → вычитаем (продавцы). OBV растёт без роста цены = скрытое накопление.
+
+    Возвращает:
+      obv_trend   : "up" | "down" | "flat"  — направление OBV за 5 дней
+      obv_bull_div: True если OBV ↑ а цена ↓ (бычья дивергенция → LONG сигнал)
+      obv_bear_div: True если OBV ↓ а цена ↑ (медвежья дивергенция → SHORT сигнал)
+    """
+    if len(candles) < 6:
+        return {"obv_trend": "flat", "obv_bull_div": False, "obv_bear_div": False}
+
+    obv = 0.0
+    obv_series: list[float] = []
+    for i, c in enumerate(candles):
+        vol = c.get("value", 0) or 0
+        if i == 0:
+            obv_series.append(0.0)
+            continue
+        if (c.get("close") or 0) > (candles[i - 1].get("close") or 0):
+            obv += vol
+        elif (c.get("close") or 0) < (candles[i - 1].get("close") or 0):
+            obv -= vol
+        obv_series.append(obv)
+
+    if len(obv_series) < 5:
+        return {"obv_trend": "flat", "obv_bull_div": False, "obv_bear_div": False}
+
+    # OBV тренд за последние 5 дней
+    obv_recent   = obv_series[-5:]
+    obv_slope    = obv_recent[-1] - obv_recent[0]
+    obv_trend    = "up" if obv_slope > 0 else ("down" if obv_slope < 0 else "flat")
+
+    # Ценовой тренд за те же 5 дней
+    price_recent = [c.get("close", 0) or 0 for c in candles[-5:]]
+    price_slope  = price_recent[-1] - price_recent[0] if price_recent else 0
+
+    # Дивергенции
+    bull_div = obv_slope > 0 and price_slope < 0   # OBV растёт, цена падает → накопление
+    bear_div = obv_slope < 0 and price_slope > 0   # OBV падает, цена растёт → распределение
+
+    return {
+        "obv_trend":    obv_trend,
+        "obv_bull_div": bull_div,
+        "obv_bear_div": bear_div,
+    }
+
+
+def detect_ma_crossover(candles: list[dict]) -> str | None:
+    """
+    v0.9.29: Детектор пересечения MA20/MA50 — Golden Cross и Death Cross.
+
+    Golden Cross: MA20 пересекает MA50 снизу вверх → долгосрочный LONG сигнал.
+    Death Cross:  MA20 пересекает MA50 сверху вниз → долгосрочный SHORT сигнал.
+
+    Проверяем факт пересечения за последние 2 свечи:
+    Вчера MA20 ≤ MA50, сегодня MA20 > MA50 → golden_cross.
+    Вчера MA20 ≥ MA50, сегодня MA20 < MA50 → death_cross.
+
+    Требует ≥ 52 свечей (50 для MA50 + 2 сравнения).
+    """
+    closes = [c.get("close") for c in candles if c.get("close")]
+    if len(closes) < 52:
+        return None
+
+    ma20_now  = sum(closes[-20:]) / 20
+    ma50_now  = sum(closes[-50:]) / 50
+    ma20_prev = sum(closes[-21:-1]) / 20
+    ma50_prev = sum(closes[-51:-1]) / 50
+
+    if ma20_prev <= ma50_prev and ma20_now > ma50_now:
+        return "golden_cross"   # MA20 пробила MA50 снизу вверх
+    if ma20_prev >= ma50_prev and ma20_now < ma50_now:
+        return "death_cross"    # MA20 пробила MA50 сверху вниз
+    return None
+
+
 def calc_bb_squeeze(closes: list[float], period: int = 20) -> bool:
     """
     v0.9.8: Bollinger Band Squeeze — детектор сжатия и последующего прорыва.
@@ -1344,16 +1623,22 @@ def calc_levels(candles: list[dict]) -> dict:
     if not highs:
         return {}
     atr  = mean([h - l for h, l in zip(highs, lows)])
+    obv_data     = calc_obv(candles)        # v0.9.29: OBV накопление/распределение
+    ma_cross     = detect_ma_crossover(candles)  # v0.9.29: Golden/Death cross
     return {
-        "resistance": round(max(highs), 2),
-        "support":    round(min(lows), 2),
-        "atr":        round(atr, 2),
-        "last_close": round(closes[-1], 2) if closes else None,
-        "rsi":        calc_rsi(closes),
-        "ma20":       calc_ma(closes),
-        "ma50":       calc_ma(closes, 50),
-        "adx":        calc_adx(candles),      # v0.9.5: сила тренда
-        "bb_squeeze": calc_bb_squeeze(closes), # v0.9.8: сжатие BB
+        "resistance":    round(max(highs), 2),
+        "support":       round(min(lows), 2),
+        "atr":           round(atr, 2),
+        "last_close":    round(closes[-1], 2) if closes else None,
+        "rsi":           calc_rsi(closes),
+        "ma20":          calc_ma(closes),
+        "ma50":          calc_ma(closes, 50),
+        "adx":           calc_adx(candles),       # v0.9.5: сила тренда
+        "bb_squeeze":    calc_bb_squeeze(closes),  # v0.9.8: сжатие BB
+        "obv_trend":     obv_data["obv_trend"],    # v0.9.29: направление OBV
+        "obv_bull_div":  obv_data["obv_bull_div"], # v0.9.29: бычья дивергенция
+        "obv_bear_div":  obv_data["obv_bear_div"], # v0.9.29: медвежья дивергенция
+        "ma_crossover":  ma_cross,                 # v0.9.29: "golden_cross" | "death_cross" | None
     }
 
 
@@ -1583,6 +1868,44 @@ def build_market_signal(
         elif usd_chg <= -0.5 and direction == "LONG":
             usdrub_confirm = False
             usdrub_note    = f"₽ +{abs(usd_chg)}% → против LONG экспортёра"
+
+    # v0.9.29: Brent нефть — влияние на нефтегазовые тикеры
+    brent_note    = None
+    brent_confirm = None   # None=нейтр., True=подтверждает, False=против
+    brent_chg = ctx.get("brent_change_pct")
+    if brent_chg is not None and ticker in OIL_TICKERS:
+        brent_price = ctx.get("brent", "?")
+        if brent_chg >= 1.5 and direction == "LONG":
+            brent_confirm = True
+            brent_note    = f"Brent {brent_price}$ +{brent_chg}% → LONG нефтяника усилен"
+        elif brent_chg >= 1.5 and direction == "SHORT":
+            brent_confirm = False
+            brent_note    = f"Brent {brent_price}$ +{brent_chg}% → против SHORT нефтяника"
+        elif brent_chg <= -1.5 and direction == "SHORT":
+            brent_confirm = True
+            brent_note    = f"Brent {brent_price}$ {brent_chg}% → SHORT нефтяника усилен"
+        elif brent_chg <= -1.5 and direction == "LONG":
+            brent_confirm = False
+            brent_note    = f"Brent {brent_price}$ {brent_chg}% → против LONG нефтяника"
+
+    # v0.9.29: Золото — влияние на PLZL (Полюс Золото)
+    gold_note    = None
+    gold_confirm = None
+    gold_chg = ctx.get("gold_change_pct")
+    if gold_chg is not None and ticker == "PLZL":
+        gold_price = ctx.get("gold_rub_gram", "?")
+        if gold_chg >= 1.0 and direction == "LONG":
+            gold_confirm = True
+            gold_note    = f"Золото {gold_price}₽/г +{gold_chg}% → LONG PLZL усилен"
+        elif gold_chg >= 1.0 and direction == "SHORT":
+            gold_confirm = False
+            gold_note    = f"Золото {gold_price}₽/г +{gold_chg}% → против SHORT PLZL"
+        elif gold_chg <= -1.0 and direction == "SHORT":
+            gold_confirm = True
+            gold_note    = f"Золото {gold_price}₽/г {gold_chg}% → SHORT PLZL усилен"
+        elif gold_chg <= -1.0 and direction == "LONG":
+            gold_confirm = False
+            gold_note    = f"Золото {gold_price}₽/г {gold_chg}% → против LONG PLZL"
 
     # IMOEX: дневной фон + технические уровни (top-down анализ, добавлено в v0.8)
     imoex_note    = None
@@ -1894,6 +2217,11 @@ def build_market_signal(
         "nearest_fib":        nearest_fib,
         "usdrub_confirm":     usdrub_confirm,
         "usdrub_note":        usdrub_note,
+        # v0.9.29: Brent + Gold
+        "brent_confirm":      brent_confirm,
+        "brent_note":         brent_note,
+        "gold_confirm":       gold_confirm,
+        "gold_note":          gold_note,
         "imoex_note":            imoex_note,
         "imoex_confirm":         imoex_confirm,
         # v0.9.8 — IMOEX MA5 режим + BB squeeze
@@ -1914,6 +2242,11 @@ def build_market_signal(
         "weekly_trend":            None,   # заполняется в synthesize_signals
         "weekly_change":           None,
         "weekly_aligned":          None,
+        # v0.9.29 — OBV накопление/распределение + MA crossover
+        "obv_trend":     levels.get("obv_trend"),    # "up" | "down" | "flat"
+        "obv_bull_div":  levels.get("obv_bull_div"),  # True = OBV↑ цена↓ → скрытое накопление
+        "obv_bear_div":  levels.get("obv_bear_div"),  # True = OBV↓ цена↑ → скрытое распределение
+        "ma_crossover":  levels.get("ma_crossover"),  # "golden_cross" | "death_cross" | None
     }
 
 
@@ -2030,11 +2363,14 @@ TICKER_MAP = {
     "MTSS": ["мтс", "мобильные телесистемы"],
     "ALRS": ["алроса", "алмаз"],
     "VTBR": ["втб"],
-    "CHMF": ["северсталь"],
+    "CHMF": ["северсталь", "severstal", "chmf", "мордашов",
+              "череповецк", "череповецкий металлург",
+              "дивиденд северсталь", "отчёт северсталь"],  # v0.9.29: расширено
     "T":    ["т-банк", "тинькофф", "tinkoff", "tcsg", "т-технологии"],   # v0.9: TCSG → T
     "PHOR": ["фосагро", "phosfagro", "удобрен"],
     "AFKS": ["афк система", "система"],
-    "NLMK":  ["нлмк", "новолипецк"],
+    "NLMK":  ["нлмк", "новолипецк", "nlmk", "nlmk steel",
+               "липецкий металлург", "дивиденд нлмк", "лисин"],  # v0.9.29: расширено
     "SIBN":  ["газпром нефть", "газпромнефть"],
     "FLOT":  ["совкомфлот"],
     "RUAL":  ["русал", "rusal", "алюмин"],
@@ -2054,7 +2390,21 @@ TICKER_MAP = {
                 "buyout", "обратный выкуп", "buy-back"],
     # v0.9.6 — новые тикеры
     "ENPG":  ["эн+", "en+", "enpg", "эн плюс", "en plus"],
-    "MAGN":  ["ммк", "магнитогорск", "магнитогорский металлургическ"],
+    "MAGN":  ["ммк", "магнитка", "magn", "пао ммк",
+               "магнитогорск", "магнитогорский металлургическ", "магнитогорский меткомбинат",
+               "mmk steel", "дивиденд ммк", "отчёт ммк", "отчет ммк",
+               "ммк нарастил", "ммк сократил", "ммк выпустил",
+               "ммк акции", "ммк котировки", "ммк прибыл", "ммк выручк",
+               "цены на сталь", "steel price", "стальной прокат",
+               "арматура подорожал", "арматура подешевел",
+               "металлопродукц", "листовой прокат",
+               # v0.9.29: ФАС-урегулирование → разблокировка дивидендов ММК
+               "фас ммк", "ммк фас", "фас магнитогорск",
+               "антимонопольн.*ммк", "ммк.*антимонопольн",
+               "урегулирован.*ммк", "ммк.*урегулирован",
+               "дивиденд.*магнитогорск", "магнитогорск.*дивиденд",
+               "ммк возобновил дивиденд", "ммк дивиденды возобновл",
+               ],  # v0.9.29: ×5 расширение + ФАС-блок
     "AFLT":  ["аэрофлот", "aeroflot"],
     "PIKK":  ["пик девелопер", "пик груп", "пик групп", "pikk",
                "пик сз", "пао пик", "пик-сз", "застройщик пик",
@@ -2064,6 +2414,22 @@ TICKER_MAP = {
                " пику ", " пику.", " пиком",              # другие падежи
                "пик ",                                    # начало предложения
                ],                                         # v0.9.25: расширен
+    # v0.9.29 — новые тикеры
+    "X5":    ["x5 retail", "икс 5", "x5group", "x5 group", "кц икс 5",
+               "пятёрочка", "пятерочка", "перекрёсток", "перекресток",
+               "x5 выручк", "x5 прибыл", "x5 дивиденд", "торговая сеть x5",
+               "ретейл x5", "ретейлер x5", "продуктовый ритейл x5"],
+    "HEAD":  ["хэдхантер", "headhunter", "head hh", "hh.ru", "мкпао хэдхантер",
+               "рекрутинг платформ", "хэдхантер выручк", "head дивиденд",
+               "хэдхантер отчёт", "хэдхантер отчет", "рынок труда it",
+               "хэдхантер прибыл"],
+    "POSI":  ["позитив технолог", "positive technologies", "группа позитив",
+               "пао позитив", "posi", "кибербезопасност", "positive group",
+               "позитив выручк", "позитив дивиденд", "позитив отчёт",
+               "позитив отчет", "позитив прибыл", "инфобезопасност"],
+    "LSRG":  ["группа лср", "пао лср", "лср груп", "lsr group", "lsrg",
+               "лср дивиденд", "лср отчёт", "лср отчет", "лср выручк",
+               "лср жильё", "лср прибыл", "застройщик лср", "девелопер лср"],
 }
 OIL_TICKERS  = ["GAZP", "LKOH", "ROSN", "NVTK", "TATN", "SNGS", "SIBN", "TRNFP"]
 BANK_TICKERS = ["SBER", "VTBR", "T"]    # T = T-Банк (замена TCSG, v0.9)
@@ -2283,16 +2649,33 @@ def build_ai_system_prompt(ctx: dict) -> str:
         )
 
     tickers_list = ", ".join(TICKERS)
+    # v0.9.29: добавить Brent и Gold в контекст промпта
+    brent_ctx = ""
+    if ctx.get("brent") is not None:
+        brent_sign = "+" if (ctx.get("brent_change_pct") or 0) >= 0 else ""
+        brent_ctx = (
+            f"- Нефть Brent: {ctx['brent']}$ ({brent_sign}{ctx.get('brent_change_pct', 0):.1f}% за день)"
+            f" {'— рост нефти поддерживает ЛОНГ нефтяников' if (ctx.get('brent_change_pct') or 0) >= 1.5 else '— снижение нефти давит на нефтяников' if (ctx.get('brent_change_pct') or 0) <= -1.5 else '— нейтрально'}\n"
+        )
+    gold_ctx = ""
+    if ctx.get("gold_rub_gram") is not None:
+        gold_sign = "+" if (ctx.get("gold_change_pct") or 0) >= 0 else ""
+        gold_ctx = (
+            f"- Золото (GLDRUB): {ctx['gold_rub_gram']:.0f}₽/г ({gold_sign}{ctx.get('gold_change_pct', 0):.1f}% за день)"
+            f" {'— рост золота поддерживает ЛОНГ PLZL' if (ctx.get('gold_change_pct') or 0) >= 1.0 else '— снижение золота давит на PLZL' if (ctx.get('gold_change_pct') or 0) <= -1.0 else '— нейтрально'}\n"
+        )
     return f"""Ты — аналитик российского фондового рынка MOEX.
 
 АКТУАЛЬНЫЙ КОНТЕКСТ (учитывай при анализе каждой новости):
-- Ключевая ставка ЦБ РФ: {ctx['cbr_rate']}% {'(высокая, но снижается с 21% — позитивный тренд; застройщики и ритейл постепенно выходят из-под давления; закредитованные компании всё ещё под риском)' if ctx['cbr_rate'] < 17 else '(очень высокая → медвежий фон для акций; особенно для застройщиков, ритейла, закредитованных компаний)'}
+- Ключевая ставка ЦБ РФ: {ctx['cbr_rate']}% {'(снижается с 21%, позитивный тренд; SBER VTBR T SMLT PIKK LSRG OZON X5 MGNT — основные бенефициары снижения; закредитованные компании выходят из-под давления)' if ctx['cbr_rate'] < 17 else '(очень высокая → медвежий фон; застройщики, ритейл, закредитованные компании под давлением)'}
 - {usdrub_str} (слабый рубль = позитив для экспортёров: нефтяники, металлурги, золото, удобрения)
 - {imoex_str} (тренд и уровни индекса определяют общий фон; у сопротивления — осторожно с LONG)
-- Санкции США/ЕС действуют, экспорт ограничен; геополитика = главный риск
+{brent_ctx}{gold_ctx}- Санкции США/ЕС действуют, экспорт ограничен; геополитика = главный риск
 
-ЭКСПОРТЁРЫ (выигрывают от слабого рубля): GAZP LKOH ROSN NVTK TATN SNGS GMKN PLZL ALRS CHMF PHOR NLMK
-ВНУТРЕННИЙ РЫНОК (страдают от слабого рубля): SBER VTBR T MGNT MTSS YDEX AFKS
+ЭКСПОРТЁРЫ (выигрывают от слабого рубля): GAZP LKOH ROSN NVTK TATN SNGS GMKN PLZL ALRS CHMF PHOR NLMK MAGN
+СТАВКО-ЧУВСТВИТЕЛЬНЫЕ (бенефициары снижения ставки): SBER VTBR T SMLT PIKK LSRG OZON X5 MGNT AFKS
+ТЕХНОЛОГИИ/IT: YDEX POSI HEAD
+ВНУТРЕННИЙ РЫНОК: SBER VTBR T MGNT MTSS YDEX AFKS OZON X5 HEAD POSI LSRG
 
 Тебе дают список новостей. Для каждой определи:
 1. Затронутые тикеры (только из: {tickers_list})
@@ -2300,7 +2683,7 @@ def build_ai_system_prompt(ctx: dict) -> str:
 3. Сила: 1 (слабый) / 2 (средний) / 3 (сильный)
 4. Тип: OIL / CB_RATE / SANCTIONS / MACRO / EARNINGS / GEOPOLITICS / CURRENCY / CORP / NEWS
    CORP = оферта, M&A, делистинг, buyback, слияние, поглощение
-5. Причина (1 предложение на русском, с учётом текущей ставки и курса рубля)
+5. Причина (1 предложение на русском, с учётом текущей ставки, курса рубля, нефти, золота)
 
 Отвечай ТОЛЬКО валидным JSON без markdown:
 [{{"index":0,"tickers":["GAZP"],"direction":"LONG","strength":2,"event_type":"OIL","reason":"..."}}]
@@ -2712,6 +3095,129 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
             ms["calendar_event"] = evt_name
             ms["calendar_days"]  = days_to
 
+        # ── 16. Brent/Gold подтверждение (v0.9.29) ─────────────────────────────
+        # Нефть двигает 9 тикеров, золото — PLZL. Как USDRUB но для сырьевого фактора.
+        brent_pts = 0
+        brent_conf = ms.get("brent_confirm")
+        if brent_conf is True:
+            brent_pts = 2
+            brent_lbl = ms.get("brent_note", "Brent ✅")
+            patterns.append(f"🛢 {brent_lbl}")
+            score_breakdown.append(f"Brent=+{brent_pts}")
+        elif brent_conf is False:
+            brent_pts = -1
+            brent_lbl = ms.get("brent_note", "Brent ⚠️")
+            patterns.append(f"🛢 Brent против ⚠️")
+            score_breakdown.append(f"Brent={brent_pts}")
+        score += brent_pts
+
+        gold_pts = 0
+        gold_conf = ms.get("gold_confirm")
+        if gold_conf is True:
+            gold_pts = 2
+            gold_lbl = ms.get("gold_note", "Золото ✅")
+            patterns.append(f"🥇 {gold_lbl}")
+            score_breakdown.append(f"Gold=+{gold_pts}")
+        elif gold_conf is False:
+            gold_pts = -1
+            patterns.append(f"🥇 Золото против ⚠️")
+            score_breakdown.append(f"Gold={gold_pts}")
+        score += gold_pts
+
+        # ── 17. Rate-trend bias — снижение ставки ЦБ (v0.9.29) ────────────────
+        # Если ставка < 17% (снижение с 21%) → бенефициары: банки, застройщики, ритейл.
+        # +1 к LONG только при подтверждённом снижении ставки (< 17%).
+        # CBR_KEY_RATE — модульная переменная, всегда актуальна (обновляется fetch_cbr_rate).
+        rate_pts = 0
+        if CBR_KEY_RATE < 17.0 and ticker in RATE_SENSITIVE_TICKERS and direction == "LONG":
+            rate_pts = 1
+            patterns.append(f"📉 Ставка {CBR_KEY_RATE:.1f}% ↓ — {ticker} LONG ✅")
+            score_breakdown.append(f"RateTrend=+{rate_pts}")
+        score += rate_pts
+
+        # ── 18. Pre-dividend accumulation (v0.9.29) ─────────────────────────────
+        # За 3-7 дней до дивидендной отсечки: рынок накапливает бумагу.
+        # Это отдельно от Event Calendar (который смотрит на 48ч около события).
+        # Здесь: окно 3-7 дней → bias LONG (накопление) а не SHORT (гэп после отсечки).
+        prediv_pts = 0
+        _now_date  = datetime.now().date()
+        for _evt in EVENT_CALENDAR:
+            if ticker not in _evt.get("tickers", []):
+                continue
+            if _evt.get("bias") != "short":   # только дивидендные отсечки
+                continue
+            try:
+                _evt_date = datetime.strptime(_evt["date"], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            _days_to_div = (_evt_date - _now_date).days
+            if 3 <= _days_to_div <= 7 and direction == "LONG":
+                prediv_pts = 1
+                patterns.append(f"💰 Пред-дивиденд {_days_to_div}д ✅")
+                score_breakdown.append(f"PreDiv=+{prediv_pts}")
+                break
+        score += prediv_pts
+
+        # ── 19. OBV накопление/распределение (v0.9.29) ──────────────────────────
+        # On-Balance Volume: аномальное накопление/распределение без движения цены.
+        # Дивергенция OBV vs цена — опережающий индикатор институциональных позиций.
+        obv_pts = 0
+        obv_bull = ms.get("obv_bull_div")
+        obv_bear = ms.get("obv_bear_div")
+        obv_trnd = ms.get("obv_trend")
+
+        if obv_bull and direction == "LONG":
+            obv_pts = 2
+            patterns.append("📊 OBV↑ дивергенция (скрытое накопление) ✅")
+            score_breakdown.append(f"OBV_div=+{obv_pts}")
+        elif obv_bear and direction == "SHORT":
+            obv_pts = 2
+            patterns.append("📊 OBV↓ дивергенция (скрытое распределение) ✅")
+            score_breakdown.append(f"OBV_div=+{obv_pts}")
+        elif obv_bull and direction == "SHORT":
+            obv_pts = -1
+            patterns.append("📊 OBV↑ против SHORT ⚠️")
+            score_breakdown.append(f"OBV_div={obv_pts}")
+        elif obv_bear and direction == "LONG":
+            obv_pts = -1
+            patterns.append("📊 OBV↓ против LONG ⚠️")
+            score_breakdown.append(f"OBV_div={obv_pts}")
+        score += obv_pts
+
+        # OBV тренд без дивергенции: просто подтверждение/противоречие (+1/0)
+        obv_trend_pts = 0
+        if not obv_bull and not obv_bear:
+            if obv_trnd == "up" and direction == "LONG":
+                obv_trend_pts = 1
+                score_breakdown.append(f"OBV_trend=+{obv_trend_pts}")
+            elif obv_trnd == "down" and direction == "SHORT":
+                obv_trend_pts = 1
+                score_breakdown.append(f"OBV_trend=+{obv_trend_pts}")
+        score += obv_trend_pts
+
+        # ── 20. MA crossover — Golden/Death cross (v0.9.29) ─────────────────────
+        # MA20 пробивает MA50 — надёжный среднесрочный разворотный сигнал.
+        # Golden cross при LONG = подтверждение; Death cross при SHORT = подтверждение.
+        cross_pts = 0
+        ma_cross = ms.get("ma_crossover")
+        if ma_cross == "golden_cross" and direction == "LONG":
+            cross_pts = 2
+            patterns.append("⚡ Golden Cross MA20/MA50 ✅")
+            score_breakdown.append(f"GoldenCross=+{cross_pts}")
+        elif ma_cross == "death_cross" and direction == "SHORT":
+            cross_pts = 2
+            patterns.append("⚡ Death Cross MA20/MA50 ✅")
+            score_breakdown.append(f"DeathCross=+{cross_pts}")
+        elif ma_cross == "golden_cross" and direction == "SHORT":
+            cross_pts = -1
+            patterns.append("⚡ Golden Cross против SHORT ⚠️")
+            score_breakdown.append(f"GoldenCross={cross_pts}")
+        elif ma_cross == "death_cross" and direction == "LONG":
+            cross_pts = -1
+            patterns.append("⚡ Death Cross против LONG ⚠️")
+            score_breakdown.append(f"DeathCross={cross_pts}")
+        score += cross_pts
+
         score = max(0, score)  # score не может быть отрицательным
         confidence = _score_to_confidence(score)
         pattern    = "  ".join(patterns) if patterns else "📊 Только объём"
@@ -2790,6 +3296,12 @@ def print_synthesized_signal(s: dict):
     # USDRUB заметка
     usd_line = f"  💱 {s['usdrub_note']}\n" if s.get("usdrub_note") else ""
 
+    # Brent / Gold заметка (v0.9.29)
+    brent_icon_c = " ✅" if s.get("brent_confirm") is True else (" ⚠️" if s.get("brent_confirm") is False else "")
+    brent_line_c = f"  🛢 {s['brent_note']}{brent_icon_c}\n" if s.get("brent_note") else ""
+    gold_icon_c  = " ✅" if s.get("gold_confirm") is True else (" ⚠️" if s.get("gold_confirm") is False else "")
+    gold_line_c  = f"  🥇 {s['gold_note']}{gold_icon_c}\n" if s.get("gold_note") else ""
+
     # IMOEX заметка
     imoex_line = f"  📈 {s['imoex_note']}\n" if s.get("imoex_note") else ""
 
@@ -2828,7 +3340,7 @@ def print_synthesized_signal(s: dict):
   Тренд↗  {s.get('trend_target', '—')}  (ориентир)
   R/R     1:{s['rr']}
 ╠══════════════════════════════════════════════╣
-{ind_line}{ma50_line}{h1_line}{pos_line}{fib_line}{usd_line}{imoex_line}{vwap_line}{ob_line}{pattern_line}{news_summary}╚══════════════════════════════════════════════╝""")
+{ind_line}{ma50_line}{h1_line}{pos_line}{fib_line}{usd_line}{brent_line_c}{gold_line_c}{imoex_line}{vwap_line}{ob_line}{pattern_line}{news_summary}╚══════════════════════════════════════════════╝""")
 
 
 def print_news_signal(s: NewsItem):
@@ -3028,12 +3540,16 @@ def tg_format_signal(s: dict, reason: str = "new") -> str:
         fn, fv = s["nearest_fib"]
         fib_line = f"📐 Фибо {fn}: {fv}\n"
 
-    # USDRUB / IMOEX
+    # USDRUB / IMOEX / Brent / Gold  (v0.9.29)
     usd_line   = f"💱 {s['usdrub_note']}\n"   if s.get("usdrub_note")  else ""
     imoex_against = " ⚠️" if s.get("imoex_confirm") is False else (
                     " ✅" if s.get("imoex_confirm") is True else ""
     )
     imoex_line = f"📈 {s['imoex_note']}{imoex_against}\n" if s.get("imoex_note") else ""
+    brent_icon = " ✅" if s.get("brent_confirm") is True else (" ⚠️" if s.get("brent_confirm") is False else "")
+    brent_line = f"🛢 {_esc(s['brent_note'])}{brent_icon}\n" if s.get("brent_note") else ""
+    gold_icon  = " ✅" if s.get("gold_confirm") is True else (" ⚠️" if s.get("gold_confirm") is False else "")
+    gold_line  = f"🥇 {_esc(s['gold_note'])}{gold_icon}\n" if s.get("gold_note") else ""
 
     # v0.9.14: недельный TF
     weekly_line = ""
@@ -3092,6 +3608,8 @@ def tg_format_signal(s: dict, reason: str = "new") -> str:
         f"{h1_line}"
         f"{fib_line}"
         f"{usd_line}"
+        f"{brent_line}"
+        f"{gold_line}"
         f"{imoex_line}"
         f"{weekly_line}"
         f"{margin_line}"
@@ -3778,18 +4296,19 @@ EVENT_CALENDAR: list[dict] = [
     # v0.9.21: Официальный календарь ЦБ РФ 2026 (источник: cbr.ru, проверено 30.03.2026).
     # Тренд: снижение ставки (21%→15.5%→15%) → позитив для банков и застройщиков.
     # Опорные заседания (со среднесрочным прогнозом): апрель, июль, октябрь, декабрь.
+    # v0.9.29: расширен список тикеров — добавлены X5, HEAD, POSI, LSRG как бенефициары снижения ставки
     {"date": "2026-04-24", "event": "ЦБ РФ: заседание по ставке (опорное, ожидается снижение)",
-     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK"], "bias": "long"},
+     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK", "LSRG", "OZON", "X5", "MGNT"], "bias": "long"},
     {"date": "2026-06-19", "event": "ЦБ РФ: заседание по ставке",
-     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK"], "bias": "long"},
+     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK", "LSRG", "OZON", "X5", "MGNT"], "bias": "long"},
     {"date": "2026-07-24", "event": "ЦБ РФ: заседание по ставке (опорное)",
-     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK"], "bias": "long"},
+     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK", "LSRG", "OZON", "X5", "MGNT"], "bias": "long"},
     {"date": "2026-09-11", "event": "ЦБ РФ: заседание по ставке",
-     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK"], "bias": "long"},
+     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK", "LSRG", "OZON", "X5", "MGNT"], "bias": "long"},
     {"date": "2026-10-23", "event": "ЦБ РФ: заседание по ставке (опорное)",
-     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK"], "bias": "long"},
+     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK", "LSRG", "OZON", "X5", "MGNT"], "bias": "long"},
     {"date": "2026-12-18", "event": "ЦБ РФ: заседание по ставке (опорное)",
-     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK"], "bias": "long"},
+     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK", "LSRG", "OZON", "X5", "MGNT"], "bias": "long"},
     # ── Дивидендные отсечки 2026 (проверено по investmint.ru, banki.ru, livetrader.ru 01.04.2026) ──
     # bias=short: за 2-5 дней до отсечки акции обычно продают (дивидендный гэп вниз после).
     # bias=long:  за 5-10 дней до отсечки — накопление, рост к дивиденду.
@@ -3884,9 +4403,10 @@ def should_send_tg(s: dict, state: dict) -> tuple[bool, str]:
     base_key = signal_key(s)
     now = datetime.now(timezone.utc)
 
-    # v0.9.19: раздельный time-cutoff для LONG и SHORT.
-    # LONG: без маржи → LONG_ENTRY_CUTOFF_HOUR=0 (нет ограничений).
-    # SHORT: маржа капает каждый день → SHORT_ENTRY_CUTOFF_HOUR=15.
+    # v0.9.28: SHORT_ENTRY_CUTOFF_HOUR=0 (отключён по умолчанию).
+    # Экономическую фильтрацию SHORT выполняет short_margin_guard в build_signal():
+    # блокирует позицию если margin_cost_max > profit_per_share * 0.8.
+    # Временно́й cutoff срабатывает только если явно задан через .env (например, =18).
     msk_hour  = (now + timedelta(hours=3)).hour
     direction = s.get("direction", "LONG")
     _cutoff   = SHORT_ENTRY_CUTOFF_HOUR if direction == "SHORT" else LONG_ENTRY_CUTOFF_HOUR
@@ -3896,7 +4416,7 @@ def should_send_tg(s: dict, state: dict) -> tuple[bool, str]:
                 "entry_cutoff: %s %s заблокирован (%d МСК ≥ %d)",
                 s.get("ticker"), direction, msk_hour, _cutoff,
             )
-            return False, ""
+            return False, "entry_cutoff"
 
     # v0.9.10: если базовый ключ занят закрытым сигналом — ищем свободный суффикс
     key = base_key
@@ -4462,8 +4982,25 @@ def tg_notify_run(
                     log_new_signal(s, key)
                 sent += 1
         else:
-            # Сигнал оценён, но should_send_tg вернул False — логируем причину
-            append_score_log({**_score_base, "action": "skipped", "reason": "should_send_tg_false"})
+            # v0.9.27: логируем реальную причину вместо общего "should_send_tg_false"
+            _skip_reason = reason if reason else "should_send_tg_false"
+            append_score_log({**_score_base, "action": "skipped", "reason": _skip_reason})
+            # v0.9.27: TG-уведомление при сильном сигнале, заблокированном по времени (≥8 очков)
+            if _skip_reason == "entry_cutoff" and (_score_base.get("score") or 0) >= 8:
+                _d_emoji = "🟢" if s.get("direction") == "LONG" else "🔴"
+                _vol_str = f"×{s.get('volume_ratio', '?')}" if s.get("volume_ratio") else ""
+                _blocked_tg = (
+                    f"⏰ <b>СИЛЬНЫЙ СИГНАЛ — ВХОД ЗАБЛОКИРОВАН</b>\n"
+                    f"{_d_emoji} <b>{s.get('ticker')} {s.get('direction')}</b>"
+                    f"  score=<b>{_score_base.get('score', '?')}</b>  {_vol_str}\n"
+                    f"⚠️ SHORT после {SHORT_ENTRY_CUTOFF_HOUR}:00 МСК не открываем (маржа overnight)\n"
+                    f"📋 {s.get('score_breakdown', '')}"
+                )
+                tg_send(_blocked_tg)
+                logger.info(
+                    "entry_cutoff_tg_alert: %s %s score=%s — уведомление отправлено",
+                    s.get("ticker"), s.get("direction"), _score_base.get("score"),
+                )
 
     # 3. Новостные сигналы без рыночного подтверждения — v0.9.25: отправляем важные.
     # Критерии: strength >= 2 (уверенный сигнал), не выходной, не дубль (dedup по title-hash).
@@ -4887,6 +5424,40 @@ def clear_bot_log() -> None:
     print(f"✅ bot.log очищен. Архив: {archive}  ({size_kb} КБ)")
 
 
+def _acquire_pid_lock() -> bool:
+    """
+    v0.9.27: Защита от двойного запуска.
+    Создаёт PID-файл. Если процесс с таким PID уже запущен — возвращает False.
+    При нормальном завершении PID-файл удаляется через _release_pid_lock().
+    """
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE) as _f:
+                _old_pid = int(_f.read().strip())
+            os.kill(_old_pid, 0)   # SIGZERO — проверяем, жив ли процесс (не убивает)
+            # Процесс жив — это дубль
+            print(f"⚠️  Бот уже запущен (PID {_old_pid}). Новый экземпляр не нужен — выход.")
+            logger.warning("pid_lock: already running (PID %d) — exit", _old_pid)
+            return False
+        except (ProcessLookupError, OSError):
+            # Старый PID-файл от упавшего процесса — игнорируем, перезапишем
+            pass
+        except ValueError:
+            pass  # PID-файл повреждён
+    with open(PID_FILE, "w") as _f:
+        _f.write(str(os.getpid()))
+    return True
+
+
+def _release_pid_lock() -> None:
+    """v0.9.27: Удаляем PID-файл при завершении."""
+    try:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+    except OSError:
+        pass
+
+
 def main():
     watch_mode  = "--watch"      in sys.argv
     news_only   = "--news-only"  in sys.argv
@@ -4912,18 +5483,25 @@ def main():
             print("📋 Трейд-лог пуст — нечего экспортировать.")
         return
 
-    if watch_mode:
-        print(f"🔁 Watch-режим каждые {SCAN_INTERVAL_SEC//60} мин. Ctrl+C для остановки.")
-        while True:
-            try:
-                run_once(news_only=news_only)
-                print(f"⏳ Следующий скан через {SCAN_INTERVAL_SEC//60} мин...\n")
-                time.sleep(SCAN_INTERVAL_SEC)
-            except KeyboardInterrupt:
-                print("\n👋 Остановлено")
-                break
-    else:
-        run_once(news_only=news_only)
+    # v0.9.27: Защита от двойного запуска (--watch или разовый скан)
+    if not _acquire_pid_lock():
+        sys.exit(0)
+
+    try:
+        if watch_mode:
+            print(f"🔁 Watch-режим каждые {SCAN_INTERVAL_SEC//60} мин. Ctrl+C для остановки.")
+            while True:
+                try:
+                    run_once(news_only=news_only)
+                    print(f"⏳ Следующий скан через {SCAN_INTERVAL_SEC//60} мин...\n")
+                    time.sleep(SCAN_INTERVAL_SEC)
+                except KeyboardInterrupt:
+                    print("\n👋 Остановлено")
+                    break
+        else:
+            run_once(news_only=news_only)
+    finally:
+        _release_pid_lock()
 
 
 if __name__ == "__main__":
