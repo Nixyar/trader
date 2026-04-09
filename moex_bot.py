@@ -1,10 +1,21 @@
 """
-MOEX Signal Bot v0.9.29
+MOEX Signal Bot v0.9.30
 ════════════════════════════════════════════════════════════════
 Модуль 1: Объём + RSI(14 Уайлдера) + MA20 + MA50 + ADX(14) + Фибоначчи + BB Squeeze + OBV + MA Cross
 Модуль 2: Парсинг RSS-новостей + кэш (не повторять старое)
 Модуль 3: AI-анализ с контекстом рынка (ставка ЦБ, USDRUB, IMOEX, Brent, Gold)
 Модуль 4: Синтез — объём × новости × рубль × индекс × VWAP × стакан × Brent × Gold × OBV × MA_cross × score
+
+Что добавлено в v0.9.30 (MARKET HOURS + LOG ROTATION, 10.04.2026):
+  + _moex_is_open(): не сканируем когда биржа закрыта.
+    Основная сессия 09:45–18:55 МСК, вечерняя 19:00–23:50 МСК, пн–пт.
+    Watch-цикл при закрытой бирже спит до открытия (батч до 1 часа).
+    Выводит: "🌙 [HH:MM МСК] Биржа закрыта. Следующая проверка через N мин."
+  + rotate_score_log(): вызывается при старте watch-режима.
+    Удаляет записи старше 7 дней из signals_score_log.jsonl.
+    Если файл всё равно > 10 МБ — обрезает старые строки.
+  + cleanup_old_exports(): при старте оставляет последние 5 файлов
+    trader_export_*.tar.gz, остальные удаляет автоматически.
 
 Что добавлено в v0.9.29 (СЫРЬЁ + НОВЫЕ ТИКЕРЫ + OBV + MA CROSS, 08.04.2026):
   + Brent нефть: fetch_brent_price() → ближайший BR фьючерс с MOEX ISS.
@@ -5424,6 +5435,134 @@ def clear_bot_log() -> None:
     print(f"✅ bot.log очищен. Архив: {archive}  ({size_kb} КБ)")
 
 
+# ─── v0.9.30: Market-hours guard ────────────────────────────────────────────
+
+def _moex_is_open() -> tuple:
+    """
+    Возвращает (is_open: bool, seconds_until_open: int).
+    MOEX основная сессия: 09:50–18:55 МСК пн–пт.
+    Вечерняя сессия:      19:00–23:50 МСК пн–пт.
+    Выходные — биржа не торгует.
+    Буфер старта: 09:45 (5 мин до открытия) — бот успевает скачать данные.
+    """
+    import pytz
+    msk = pytz.timezone("Europe/Moscow")
+    now = datetime.now(msk)
+    wd  = now.weekday()          # 0=пн … 6=вс
+    if wd >= 5:                  # сб, вс
+        # До открытия пн 09:45
+        days_to_mon = 7 - wd    # сб→2, вс→1
+        open_mon = now.replace(hour=9, minute=45, second=0, microsecond=0)
+        open_mon += __import__("datetime").timedelta(days=days_to_mon)
+        return False, max(0, int((open_mon - now).total_seconds()))
+
+    t = now.time()
+    import datetime as _dt
+    MAIN_OPEN   = _dt.time(9,  45)
+    MAIN_CLOSE  = _dt.time(18, 55)
+    EVE_OPEN    = _dt.time(19,  0)
+    EVE_CLOSE   = _dt.time(23, 50)
+
+    if MAIN_OPEN <= t <= MAIN_CLOSE or EVE_OPEN <= t <= EVE_CLOSE:
+        return True, 0
+
+    # До следующего открытия
+    if t < MAIN_OPEN:
+        target = now.replace(hour=9, minute=45, second=0, microsecond=0)
+    elif MAIN_CLOSE < t < EVE_OPEN:
+        # перерыв 18:55–19:00 — очень короткий, считаем «открытым через минуты»
+        target = now.replace(hour=19, minute=0, second=0, microsecond=0)
+    else:
+        # после 23:50 — завтра 09:45 (или пн, если пятница)
+        base = now + __import__("datetime").timedelta(days=1)
+        if base.weekday() >= 5:
+            # перепрыгиваем на пн
+            skip = 7 - base.weekday()
+            base = base + __import__("datetime").timedelta(days=skip)
+        target = base.replace(hour=9, minute=45, second=0, microsecond=0)
+
+    return False, max(0, int((target - now).total_seconds()))
+
+
+# ─── v0.9.30: Score-log rotation ────────────────────────────────────────────
+
+def rotate_score_log(max_days: int = 7, max_mb: float = 10.0):
+    """
+    Удаляет из signals_score_log.jsonl записи старше max_days дней.
+    Если файл всё равно > max_mb МБ — обрезает по размеру (оставляет хвост).
+    Вызывается при старте watch-режима.
+    """
+    if not os.path.exists(SCORE_LOG_FILE):
+        return
+    size_mb = os.path.getsize(SCORE_LOG_FILE) / 1024 / 1024
+    if size_mb < 0.5:
+        return  # файл маленький — не трогаем
+
+    cutoff = datetime.now() - __import__("datetime").timedelta(days=max_days)
+    kept   = []
+    total  = 0
+    try:
+        with open(SCORE_LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        total = len(lines)
+        for ln in lines:
+            try:
+                obj = __import__("json").loads(ln)
+                ts  = obj.get("ts") or obj.get("timestamp") or ""
+                if ts:
+                    dt = datetime.fromisoformat(ts[:19])
+                    if dt >= cutoff:
+                        kept.append(ln)
+                else:
+                    kept.append(ln)  # нет метки — оставляем
+            except Exception:
+                kept.append(ln)
+
+        # Если после фильтрации всё ещё > max_mb — режем по размеру с хвоста
+        kb_kept = sum(len(l.encode()) for l in kept) / 1024 / 1024
+        if kb_kept > max_mb:
+            # оставляем последние строки, пока < max_mb
+            trimmed = []
+            acc = 0.0
+            for ln in reversed(kept):
+                acc += len(ln.encode()) / 1024 / 1024
+                if acc > max_mb:
+                    break
+                trimmed.append(ln)
+            kept = list(reversed(trimmed))
+
+        with open(SCORE_LOG_FILE, "w", encoding="utf-8") as f:
+            f.writelines(kept)
+        removed = total - len(kept)
+        if removed:
+            print(f"🧹 score_log: удалено {removed} старых записей "
+                  f"({size_mb:.1f}MB → {kb_kept:.1f}MB). Осталось {len(kept)} строк.")
+    except Exception as e:
+        print(f"⚠️  rotate_score_log: {e}")
+
+
+# ─── v0.9.30: Export .tar.gz cleanup ────────────────────────────────────────
+
+def cleanup_old_exports(keep: int = 5):
+    """
+    Удаляет старые файлы trader_export_*.tar.gz, оставляя последние `keep` штук.
+    Вызывается при старте watch-режима.
+    """
+    _dir = os.path.dirname(os.path.abspath(__file__))
+    import glob as _glob
+    archives = sorted(
+        _glob.glob(os.path.join(_dir, "trader_export_*.tar.gz")),
+        key=os.path.getmtime
+    )
+    to_delete = archives[:-keep] if len(archives) > keep else []
+    for path in to_delete:
+        try:
+            os.remove(path)
+            print(f"🗑  Удалён старый экспорт: {os.path.basename(path)}")
+        except Exception as e:
+            print(f"⚠️  cleanup_old_exports: {e}")
+
+
 def _acquire_pid_lock() -> bool:
     """
     v0.9.27: Защита от двойного запуска.
@@ -5490,8 +5629,23 @@ def main():
     try:
         if watch_mode:
             print(f"🔁 Watch-режим каждые {SCAN_INTERVAL_SEC//60} мин. Ctrl+C для остановки.")
+            # v0.9.30: очистка при старте
+            rotate_score_log()
+            cleanup_old_exports()
             while True:
                 try:
+                    is_open, secs = _moex_is_open()
+                    if not is_open:
+                        # Биржа закрыта — спим до открытия (не более 1 ч за раз)
+                        sleep_secs = min(secs, 3600)
+                        mins = sleep_secs // 60
+                        import pytz as _ptz
+                        _msk = _ptz.timezone("Europe/Moscow")
+                        _now_msk = datetime.now(_msk).strftime("%H:%M МСК")
+                        print(f"🌙 [{_now_msk}] Биржа закрыта. Следующая проверка через "
+                              f"{mins} мин (откроется через ~{secs//60} мин).")
+                        time.sleep(sleep_secs)
+                        continue
                     run_once(news_only=news_only)
                     print(f"⏳ Следующий скан через {SCAN_INTERVAL_SEC//60} мин...\n")
                     time.sleep(SCAN_INTERVAL_SEC)
