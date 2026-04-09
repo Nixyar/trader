@@ -625,7 +625,9 @@ def get_sandbox_portfolio(account_id: str = "") -> Optional[dict]:
             qty    = _proto_to_float(pos.quantity)
             avg    = _proto_to_float(pos.average_position_price)
             curr   = _proto_to_float(pos.current_price)
-            pnl    = round((curr - avg) / avg * 100, 2) if avg else 0
+            # qty < 0 = SHORT: прибыль когда цена падает → инвертируем знак PnL
+            raw_pnl = round((curr - avg) / avg * 100, 2) if avg else 0
+            pnl     = raw_pnl if qty >= 0 else -raw_pnl
             if qty != 0:
                 positions.append({
                     "ticker":     ticker,
