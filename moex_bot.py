@@ -7,12 +7,17 @@ MOEX Signal Bot v0.9.32
 Модуль 4: Синтез — объём × новости × рубль × индекс × VWAP × стакан × Brent × Gold × OBV × MA_cross × score
 
 Что добавлено в v0.9.32 (EOD REPORT + BUGFIXES, 10.04.2026):
-  + EOD-отчёт в Telegram: каждый день в 23:50–00:05 МСК бот отправляет итог дня:
+  + EOD-отчёт в Telegram: каждый день в 18:55–19:10 МСК (после закрытия основной
+    сессии, вместе с первым сканом вечерней) бот отправляет итог дня:
       💼 Портфель: 1 000 200 ₽  (+200 ₽  +0.02% за день)
       📂 Открытые позиции с PnL
       📊 Сделки дня: N (wins), PnL каждой + итог
     SOD equity фиксируется при первом скане открытой сессии.
     Состояние сохраняется в eod_state.json (переживает рестарт).
+  + BOT_VERSION константа: убран хардкод "v0.9.26" из run_once().
+    Версия видна в заголовке каждого скана И под строкой "Готово":
+      ✅ Готово. 0 рыночных + 0 новостных
+      🔖 v0.9.32
   + Баг: Monday risk multiplier смотрел на UTC weekday вместо МСК.
     Риск мог применяться в неправильный день (например, в воскресенье ночью вместо понедельника).
   + Баг: trail_stop = 0.0 (breakeven) проглатывался цепочкой `or` → использовался старый стоп.
@@ -561,6 +566,7 @@ MIN_VOL_RUB_MAP: dict[str, int] = {
 }
 NEWS_STRENGTH_MIN    = 1
 SCAN_INTERVAL_SEC    = 300          # --watch интервал (5 мин)
+BOT_VERSION          = "v0.9.32"    # отображается в заголовке каждого скана и строке "Готово"
 AI_MAX_NEWS          = int(os.environ.get("AI_MAX_NEWS", "10"))  # новостей за один AI-вызов
 CACHE_TTL_HOURS      = 24
 CACHE_FILE           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "news_cache.json")
@@ -5114,7 +5120,7 @@ def run_once(news_only: bool = False):
     now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     logger.info("─── скан начат (%s) ───", now)
     print(f"\n{'═'*54}")
-    print(f"  🤖 MOEX Signal Bot v0.9.26  |  {now}")
+    print(f"  🤖 MOEX Signal Bot {BOT_VERSION}  |  {now}")
     ai_status = "✅ AI включён" if ANTHROPIC_API_KEY else "⚠️  AI выключен (нет ключа)"
     print(f"  {ai_status}")
     if _tinvest_available():
@@ -5438,6 +5444,7 @@ def run_once(news_only: bool = False):
 
     print(f"\n{'═'*54}")
     print(f"  ✅ Готово. {len(market_signals)} рыночных + {len(news_signals)} новостных")
+    print(f"  🔖 {BOT_VERSION}")
     print(f"{'═'*54}\n")
     logger.info("─── скан завершён: %d рыночных + %d новостных сигналов ───",
                 len(market_signals), len(news_signals))
@@ -5673,7 +5680,8 @@ def _try_record_sod_equity() -> None:
 
 def send_eod_report() -> None:
     """
-    v0.9.32: Отправляет итоговый отчёт дня в Telegram после закрытия вечерней сессии.
+    v0.9.32: Отправляет итоговый отчёт дня в Telegram в 18:55–19:10 МСК
+    (после закрытия основной сессии, вместе с первым сканом вечерней).
     Содержит: текущий портфель, изменение за день, открытые позиции, P&L сделок.
     """
     global _eod_sent_date
@@ -5861,10 +5869,10 @@ def main():
 
                     is_open, secs = _moex_is_open()
 
-                    # v0.9.32: EOD-отчёт — отправляем один раз в окне 23:50–00:05 МСК
-                    # (после закрытия вечерней сессии, до полуночи)
-                    _eod_window = _dt.time(23, 50) <= _t_msk or _t_msk <= _dt.time(0, 5)
-                    if _eod_window and not is_open:
+                    # v0.9.32: EOD-отчёт — после закрытия основной сессии (18:55–19:10 МСК).
+                    # Отправляется вместе с первым сканом вечерней сессии или в паузе между ними.
+                    _eod_window = _dt.time(18, 55) <= _t_msk <= _dt.time(19, 10)
+                    if _eod_window:
                         send_eod_report()
 
                     if not is_open:
