@@ -1,10 +1,35 @@
 """
-MOEX Signal Bot v0.9.30
+MOEX Signal Bot v0.9.32
 ════════════════════════════════════════════════════════════════
 Модуль 1: Объём + RSI(14 Уайлдера) + MA20 + MA50 + ADX(14) + Фибоначчи + BB Squeeze + OBV + MA Cross
 Модуль 2: Парсинг RSS-новостей + кэш (не повторять старое)
 Модуль 3: AI-анализ с контекстом рынка (ставка ЦБ, USDRUB, IMOEX, Brent, Gold)
 Модуль 4: Синтез — объём × новости × рубль × индекс × VWAP × стакан × Brent × Gold × OBV × MA_cross × score
+
+Что добавлено в v0.9.32 (EOD REPORT + BUGFIXES, 10.04.2026):
+  + EOD-отчёт в Telegram: каждый день в 23:50–00:05 МСК бот отправляет итог дня:
+      💼 Портфель: 1 000 200 ₽  (+200 ₽  +0.02% за день)
+      📂 Открытые позиции с PnL
+      📊 Сделки дня: N (wins), PnL каждой + итог
+    SOD equity фиксируется при первом скане открытой сессии.
+    Состояние сохраняется в eod_state.json (переживает рестарт).
+  + Баг: Monday risk multiplier смотрел на UTC weekday вместо МСК.
+    Риск мог применяться в неправильный день (например, в воскресенье ночью вместо понедельника).
+  + Баг: trail_stop = 0.0 (breakeven) проглатывался цепочкой `or` → использовался старый стоп.
+    Исправлено: явная проверка `if _ts is not None`.
+  + Баг: rotate_score_log накапливал байты после обрезки → файл мог превышать max_mb.
+    Исправлено: проверка размера до добавления строки.
+
+Что добавлено в v0.9.31 (CONFIDENCE-SCALED SIZING, 10.04.2026):
+  + Размер позиции теперь масштабируется по уровню уверенности сигнала:
+      🔥🔥 ОТЛИЧНАЯ (score≥12): risk×1.5, pos_cap=15% equity  (~300 лотов AFLT при 1M)
+      🔥  ВЫСОКАЯ   (score≥9):  risk×1.0, pos_cap=10% equity  (~200 лотов AFLT при 1M)
+      🟡  СРЕДНЯЯ   (score≥6):  risk×0.5, pos_cap= 5% equity  (~100 лотов AFLT при 1M)
+      🔴  СЛАБАЯ    (score<6):  пропуск (не торгуется)
+  + Исправлен баг: 🔥🔥 ОТЛИЧНАЯ ранее падала в else→continue (не торговалась).
+    Теперь все 4 уровня явно обрабатываются через словарь _CONF_PARAMS.
+  + Fallback (без equity) тоже масштабируется: ОТЛИЧНАЯ=1.5лота, ВЫСОКАЯ=1, СРЕДНЯЯ=0.5.
+  + SANDBOX_MAX_POS_PCT из .env теперь глобальный «потолок» (не более 2× от него на уровень).
 
 Что добавлено в v0.9.30 (MARKET HOURS + LOG ROTATION, 10.04.2026):
   + _moex_is_open(): не сканируем когда биржа закрыта.
@@ -4653,21 +4678,37 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
         logger.warning("sandbox equity fetch failed: %s", _e)
 
     # v0.9.20: в понедельник риск вдвое — статистика 2 недель: 31% vs 53% winrate
-    _is_monday = datetime.now(timezone.utc).weekday() == 0
+    _is_monday = (datetime.now(timezone.utc) + timedelta(hours=3)).weekday() == 0  # МСК, не UTC
     _day_risk_mult = MONDAY_RISK_MULT if _is_monday else 1.0
     if _is_monday and MONDAY_RISK_MULT < 1.0:
         logger.info("monday_risk: риск снижен до %.0f%% (MONDAY_RISK_MULT=%.1f)",
                     RISK_PCT * _day_risk_mult, MONDAY_RISK_MULT)
 
+    # v0.9.31: таблица размера позиции по уверенности.
+    # risk_mult — масштаб риск-рубля (RISK_PCT × mult).
+    # pos_pct   — лимит одной позиции (% equity), НЕЗАВИСИМО от SANDBOX_MAX_POS_PCT.
+    # Итог: ОТЛИЧНАЯ торгуется в 1.5× по сравнению с ВЫСОКАЯ, СРЕДНЯЯ — в 0.5×.
+    # До v0.9.31: ОТЛИЧНАЯ падала в else→continue (баг), сейчас исправлено.
+    _CONF_PARAMS: dict[str, dict] = {
+        "ОТЛИЧНАЯ": {"risk_mult": 1.5, "pos_pct": 15.0},  # score≥12 → 15% equity
+        "ВЫСОКАЯ":  {"risk_mult": 1.0, "pos_pct": 10.0},  # score≥9  → 10% equity
+        "СРЕДНЯЯ":  {"risk_mult": 0.5, "pos_pct":  5.0},  # score≥6  → 5% equity
+    }
+
     placed = 0
     for s in synthesized:
         confidence = s.get("confidence", "")
-        if "ВЫСОКАЯ" in confidence:
-            risk_multiplier = 1.0 * _day_risk_mult   # полный RISK_PCT × день
-        elif "СРЕДНЯЯ" in confidence:
-            risk_multiplier = 0.5 * _day_risk_mult   # половинный риск × день
-        else:
-            continue
+        # Определяем параметры по ключевому слову в строке уверенности
+        _cp = None
+        for _key, _params in _CONF_PARAMS.items():
+            if _key in confidence:
+                _cp = _params
+                break
+        if _cp is None:
+            continue  # 🔴 СЛАБАЯ — пропускаем
+
+        risk_multiplier = _cp["risk_mult"] * _day_risk_mult
+        _conf_pos_pct   = _cp["pos_pct"]  # лимит позиции для этого уровня уверенности
 
         key = signal_key(s)
         sb_key = f"sb_{key}"
@@ -4701,23 +4742,25 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
             risk_rub = equity * RISK_PCT / 100 * risk_multiplier
             lots_by_risk = max(1, int(risk_rub / (stop_dist * lot_size)))
 
-            # v0.9.10: лимит позиции по размеру — не более SANDBOX_MAX_POS_PCT% от equity.
-            # Защищает от абсурдных размеров когда стоп очень узкий (1–2 руб).
-            # Пример без лимита: equity=1M, стоп ROSN=5₽ → 2039 лотов × 507₽ = 1 033 673₽ (весь депозит!)
-            max_position_rub = equity * SANDBOX_MAX_POS_PCT / 100
+            # v0.9.31: лимит позиции масштабируется по уверенности (_conf_pos_pct),
+            # а не по фиксированному SANDBOX_MAX_POS_PCT.
+            # ОТЛИЧНАЯ=15%, ВЫСОКАЯ=10%, СРЕДНЯЯ=5% — итоговый cap выше для лучших сигналов.
+            # SANDBOX_MAX_POS_PCT из .env теперь служит только глобальным «потолком» (safety).
+            conf_pos_pct     = min(_conf_pos_pct, SANDBOX_MAX_POS_PCT * 2)  # не больше 2×глобального
+            max_position_rub = equity * conf_pos_pct / 100
             lots_by_pos  = max(1, int(max_position_rub / (entry * lot_size)))
             lots = min(lots_by_risk, lots_by_pos)
 
             sizing_note = (
                 f"equity={equity:,.0f}₽ × {RISK_PCT * risk_multiplier:.1f}% "
                 f"÷ стоп{stop_dist:.2f}×{lot_size}л = {lots_by_risk}л "
-                f"→ лимит позиции {SANDBOX_MAX_POS_PCT:.0f}% = {lots_by_pos}л "
+                f"→ лимит позиции {conf_pos_pct:.0f}% ({confidence.split()[-1]}) = {lots_by_pos}л "
                 f"→ итого {lots}л"
             )
             logger.info("sandbox sizing %s: %s", ticker, sizing_note)
         else:
-            # Fallback: фиксированное число лотов
-            lots = SANDBOX_ORDER_LOTS if "ВЫСОКАЯ" in confidence else 1
+            # Fallback: фиксированное число лотов, масштабируется по уверенности
+            lots = max(1, int(SANDBOX_ORDER_LOTS * _cp["risk_mult"]))
             sizing_note = f"fallback {lots}л (equity или stop_dist недоступны)"
             logger.info("sandbox sizing %s: %s", ticker, sizing_note)
 
@@ -4911,7 +4954,10 @@ def tg_notify_run(
         if sval.get("hit") not in (None,):   # None = открыта (или take1 hit и trailing)
             continue
         entry = float(sval.get("entry") or 0)
-        stop  = float(sval.get("trail_stop") or sval.get("stop") or 0)  # актуальный стоп
+        # v0.9.32: trail_stop может быть 0.0 (breakeven) — нельзя использовать `or`,
+        # иначе 0.0 считается falsy и берётся старый стоп.
+        _ts = sval.get("trail_stop")
+        stop = float(_ts if _ts is not None else (sval.get("stop") or 0))
         if entry > 0 and stop > 0:
             risk = abs(entry - stop) / entry * 100
             open_risk_pct += risk
@@ -5519,24 +5565,26 @@ def rotate_score_log(max_days: int = 7, max_mb: float = 10.0):
                 kept.append(ln)
 
         # Если после фильтрации всё ещё > max_mb — режем по размеру с хвоста
-        kb_kept = sum(len(l.encode()) for l in kept) / 1024 / 1024
-        if kb_kept > max_mb:
-            # оставляем последние строки, пока < max_mb
+        # v0.9.32: проверяем размер ДО добавления строки, чтобы не превысить лимит
+        mb_kept = sum(len(l.encode()) for l in kept) / 1024 / 1024
+        if mb_kept > max_mb:
             trimmed = []
             acc = 0.0
             for ln in reversed(kept):
-                acc += len(ln.encode()) / 1024 / 1024
-                if acc > max_mb:
+                ln_mb = len(ln.encode()) / 1024 / 1024
+                if acc + ln_mb > max_mb:
                     break
+                acc += ln_mb
                 trimmed.append(ln)
-            kept = list(reversed(trimmed))
+            kept   = list(reversed(trimmed))
+            mb_kept = acc
 
         with open(SCORE_LOG_FILE, "w", encoding="utf-8") as f:
             f.writelines(kept)
         removed = total - len(kept)
         if removed:
             print(f"🧹 score_log: удалено {removed} старых записей "
-                  f"({size_mb:.1f}MB → {kb_kept:.1f}MB). Осталось {len(kept)} строк.")
+                  f"({size_mb:.1f}MB → {mb_kept:.1f}MB). Осталось {len(kept)} строк.")
     except Exception as e:
         print(f"⚠️  rotate_score_log: {e}")
 
@@ -5561,6 +5609,176 @@ def cleanup_old_exports(keep: int = 5):
             print(f"🗑  Удалён старый экспорт: {os.path.basename(path)}")
         except Exception as e:
             print(f"⚠️  cleanup_old_exports: {e}")
+
+
+# ─── v0.9.32: EOD portfolio report ──────────────────────────────────────────
+
+# Хранит equity на момент открытия рынка в текущий день
+_equity_day_start: float = 0.0
+_eod_sent_date: str = ""           # дата последнего EOD-отчёта (YYYY-MM-DD МСК)
+_sod_loaded_date: str = ""         # дата загрузки начального equity
+
+_EOD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eod_state.json")
+
+
+def _load_eod_state() -> None:
+    """Загружает сохранённое состояние EOD из файла (нужно при рестарте бота)."""
+    global _equity_day_start, _eod_sent_date, _sod_loaded_date
+    try:
+        if os.path.exists(_EOD_FILE):
+            with open(_EOD_FILE, "r") as f:
+                d = __import__("json").load(f)
+            _equity_day_start  = float(d.get("equity_day_start", 0))
+            _eod_sent_date     = d.get("eod_sent_date", "")
+            _sod_loaded_date   = d.get("sod_loaded_date", "")
+    except Exception:
+        pass
+
+
+def _save_eod_state() -> None:
+    try:
+        with open(_EOD_FILE, "w") as f:
+            __import__("json").dump({
+                "equity_day_start": _equity_day_start,
+                "eod_sent_date":    _eod_sent_date,
+                "sod_loaded_date":  _sod_loaded_date,
+            }, f)
+    except Exception:
+        pass
+
+
+def _try_record_sod_equity() -> None:
+    """
+    Записывает equity в начале торгового дня (SOD = Start of Day).
+    Вызывается при первом скане дня, когда биржа открыта.
+    """
+    global _equity_day_start, _sod_loaded_date
+    import pytz as _ptz
+    _today = datetime.now(_ptz.timezone("Europe/Moscow")).strftime("%Y-%m-%d")
+    if _sod_loaded_date == _today:
+        return  # уже записали сегодня
+    if not _tinvest_available():
+        return
+    try:
+        portfolio = _tinvest.get_sandbox_portfolio()   # type: ignore[union-attr]
+        eq = portfolio.get("total_amount_rub", 0) if portfolio else 0
+        if eq > 0:
+            _equity_day_start = eq
+            _sod_loaded_date  = _today
+            _save_eod_state()
+            logger.info("eod: SOD equity записан = %.0f (дата=%s)", eq, _today)
+    except Exception as _e:
+        logger.warning("eod: не удалось записать SOD equity: %s", _e)
+
+
+def send_eod_report() -> None:
+    """
+    v0.9.32: Отправляет итоговый отчёт дня в Telegram после закрытия вечерней сессии.
+    Содержит: текущий портфель, изменение за день, открытые позиции, P&L сделок.
+    """
+    global _eod_sent_date
+    import pytz as _ptz
+    _msk    = _ptz.timezone("Europe/Moscow")
+    _today  = datetime.now(_msk).strftime("%Y-%m-%d")
+
+    if _eod_sent_date == _today:
+        return  # уже отправили сегодня
+
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        return
+
+    # ── Портфель ──────────────────────────────────────────────────────────────
+    equity_now: float = 0.0
+    open_positions: list[str] = []
+    if _tinvest_available():
+        try:
+            portfolio = _tinvest.get_sandbox_portfolio()   # type: ignore[union-attr]
+            if portfolio:
+                equity_now = portfolio.get("total_amount_rub", 0)
+                for pos in portfolio.get("positions", []):
+                    t   = pos.get("ticker", "?")
+                    qty = pos.get("quantity", 0)
+                    pnl = pos.get("pnl", 0)
+                    if qty != 0:
+                        emoji = "🟢" if qty > 0 else "🔴"
+                        sign  = "+" if pnl >= 0 else ""
+                        open_positions.append(f"{emoji}{t} {sign}{pnl:.1f}%")
+        except Exception as _e:
+            logger.warning("eod: не удалось получить портфель: %s", _e)
+
+    # ── Сделки за день ────────────────────────────────────────────────────────
+    try:
+        state = load_state()
+    except Exception:
+        state = {}
+
+    day_trades = []
+    try:
+        if os.path.exists(TRADE_LOG_FILE):
+            with open(TRADE_LOG_FILE, "r", encoding="utf-8") as _f:
+                all_trades = __import__("json").load(_f)
+            for tr in all_trades:
+                # exit_time формат: "YYYY-MM-DD HH:MM"
+                et = tr.get("exit_time", "")
+                if et.startswith(_today):
+                    day_trades.append(tr)
+    except Exception:
+        pass
+
+    # ── Форматируем сообщение ─────────────────────────────────────────────────
+    _date_str   = datetime.now(_msk).strftime("%d.%m.%Y")
+    _now_str    = datetime.now(_msk).strftime("%H:%M МСК")
+
+    # Изменение equity за день
+    if equity_now > 0 and _equity_day_start > 0:
+        day_change     = equity_now - _equity_day_start
+        day_change_pct = day_change / _equity_day_start * 100
+        sign           = "+" if day_change >= 0 else ""
+        equity_line    = (
+            f"💼 Портфель: {equity_now:,.0f} ₽  "
+            f"({sign}{day_change:+,.0f} ₽  {sign}{day_change_pct:.2f}% за день)"
+        )
+    elif equity_now > 0:
+        equity_line = f"💼 Портфель: {equity_now:,.0f} ₽"
+    else:
+        equity_line = "💼 Портфель: данные недоступны"
+
+    # Открытые позиции
+    pos_line = ("📂 Открытые: " + "  ".join(open_positions)) if open_positions else "📂 Открытых позиций нет"
+
+    # Сделки дня
+    if day_trades:
+        total_pnl = sum(t.get("pnl_pct", 0) for t in day_trades)
+        wins      = sum(1 for t in day_trades if t.get("pnl_pct", 0) > 0)
+        trades_lines = []
+        for t in day_trades:
+            p   = t.get("pnl_pct", 0)
+            sig = "+" if p >= 0 else ""
+            res = "✅" if p > 0 else "❌"
+            trades_lines.append(f"  {res} {t['ticker']} {t['direction']}  {sig}{p:.2f}%")
+        trades_block = (
+            f"📊 Сделок за день: {len(day_trades)}  ({wins} прибыльных)\n"
+            + "\n".join(trades_lines) + f"\n  Итого: {'+' if total_pnl>=0 else ''}{total_pnl:.2f}%"
+        )
+    else:
+        trades_block = "📊 Сделок за день: 0"
+
+    msg = (
+        f"🌙 *Итог дня — {_date_str}*\n"
+        f"{'─'*30}\n"
+        f"{equity_line}\n"
+        f"{pos_line}\n"
+        f"{'─'*30}\n"
+        f"{trades_block}\n"
+        f"{'─'*30}\n"
+        f"⏰ {_now_str}  |  MOEX Bot v0.9.32"
+    )
+
+    tg_send(msg)
+    _eod_sent_date = _today
+    _save_eod_state()
+    logger.info("eod: отчёт дня отправлен (%s)", _today)
+    print(f"📋 EOD-отчёт отправлен в Telegram ({_today})")
 
 
 def _acquire_pid_lock() -> bool:
@@ -5629,23 +5847,39 @@ def main():
     try:
         if watch_mode:
             print(f"🔁 Watch-режим каждые {SCAN_INTERVAL_SEC//60} мин. Ctrl+C для остановки.")
-            # v0.9.30: очистка при старте
+            # v0.9.30: очистка при старте; v0.9.32: восстанавливаем EOD-состояние
             rotate_score_log()
             cleanup_old_exports()
+            _load_eod_state()
             while True:
                 try:
+                    import pytz as _ptz
+                    _msk_tz  = _ptz.timezone("Europe/Moscow")
+                    _now_msk = datetime.now(_msk_tz)
+                    _t_msk   = _now_msk.time()
+                    import datetime as _dt
+
                     is_open, secs = _moex_is_open()
+
+                    # v0.9.32: EOD-отчёт — отправляем один раз в окне 23:50–00:05 МСК
+                    # (после закрытия вечерней сессии, до полуночи)
+                    _eod_window = _dt.time(23, 50) <= _t_msk or _t_msk <= _dt.time(0, 5)
+                    if _eod_window and not is_open:
+                        send_eod_report()
+
                     if not is_open:
                         # Биржа закрыта — спим до открытия (не более 1 ч за раз)
                         sleep_secs = min(secs, 3600)
-                        mins = sleep_secs // 60
-                        import pytz as _ptz
-                        _msk = _ptz.timezone("Europe/Moscow")
-                        _now_msk = datetime.now(_msk).strftime("%H:%M МСК")
-                        print(f"🌙 [{_now_msk}] Биржа закрыта. Следующая проверка через "
+                        mins       = sleep_secs // 60
+                        _now_str   = _now_msk.strftime("%H:%M МСК")
+                        print(f"🌙 [{_now_str}] Биржа закрыта. Следующая проверка через "
                               f"{mins} мин (откроется через ~{secs//60} мин).")
                         time.sleep(sleep_secs)
                         continue
+
+                    # v0.9.32: фиксируем equity в начале дня (первый скан открытой сессии)
+                    _try_record_sod_equity()
+
                     run_once(news_only=news_only)
                     print(f"⏳ Следующий скан через {SCAN_INTERVAL_SEC//60} мин...\n")
                     time.sleep(SCAN_INTERVAL_SEC)
