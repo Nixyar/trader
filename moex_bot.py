@@ -464,6 +464,8 @@ TICKERS = [
     # v0.9.29: новые тикеры по итогам аудита рынка апрель 2026
     "X5",   "HEAD", "POSI", "LSRG",            # X5 ритейл, Хэдхантер, Позитив, ЛСР
     "PIKK",                                     # ПИК: возвращён — ставка 15%↓, девелоперы растут
+    # v0.9.34: новые тикеры
+    "CBOM",                                     # МКБ: событийные всплески (оферты, реорганизация)
 ]
 
 RSS_FEEDS = {
@@ -504,6 +506,8 @@ DOMESTIC_TICKERS = {
     "HEAD",                     # Хэдхантер — IT/HR, бенефициар рынка труда
     "POSI",                     # Группа Позитив — кибербезопасность
     "LSRG",                     # ЛСР — девелопер, ставкозависимый
+    # v0.9.34:
+    "CBOM",                     # МКБ — частный банк, событийные всплески
 }
 
 # v0.9.29: тикеры чувствительные к ставке ЦБ (растут при снижении ставки)
@@ -563,10 +567,22 @@ MIN_VOL_RUB_MAP: dict[str, int] = {
     "HEAD":   50_000_000,    # Хэдхантер: средняя ликвидность, IT-сектор
     "POSI":   50_000_000,    # Позитив: кибербезопасность, средняя ликвидность
     "LSRG":   30_000_000,    # ЛСР: девелопер, относительно низкий оборот
+    # v0.9.34 — новые тикеры
+    "CBOM":   20_000_000,    # МКБ: банк, средняя ликвидность; 50% событийные всплески
 }
 NEWS_STRENGTH_MIN    = 1
 SCAN_INTERVAL_SEC    = 300          # --watch интервал (5 мин)
-BOT_VERSION          = "v0.9.32"    # отображается в заголовке каждого скана и строке "Готово"
+BOT_VERSION          = "v0.9.34"    # отображается в заголовке каждого скана и строке "Готово"
+
+# ─── v0.9.33: Timezone helper ────────────────────────────────────────────────
+# Единая точка получения «сейчас в МСК». Использовать ВЕЗДЕ вместо now_msk().
+# Гарантирует корректность на VPS с любым серверным timezone (UTC, CET и т.д.).
+import pytz as _pytz
+_MSK_TZ = _pytz.timezone("Europe/Moscow")
+
+def now_msk() -> "datetime":
+    """Текущее время в часовом поясе МСК (UTC+3), timezone-aware."""
+    return datetime.now(_MSK_TZ)
 AI_MAX_NEWS          = int(os.environ.get("AI_MAX_NEWS", "10"))  # новостей за один AI-вызов
 CACHE_TTL_HOURS      = 24
 CACHE_FILE           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "news_cache.json")
@@ -780,6 +796,8 @@ LOT_SIZES: dict[str, int] = {
     "HEAD": 1,    # МКПАО Хэдхантер (переехал с HHRU, 1 акция, подтверждено MOEX)
     "POSI": 1,    # Группа Позитив — кибербезопасность, 1 акция
     "LSRG": 1,    # ЛСР Группа — девелопер, 1 акция
+    # v0.9.34 — новые тикеры
+    "CBOM": 10,   # МКБ — акция дешёвая (~5–10 ₽), 10 акций в лоте (подтверждено MOEX)
 }
 
 BASE_URL = "https://iss.moex.com/iss"
@@ -830,8 +848,8 @@ def fetch_cbr_rate() -> float:
     try:
         # ЦБ публикует XML статистику ключевой ставки
         # Запрашиваем последние 30 дней, берём последнюю запись
-        date_to   = datetime.now().strftime("%d/%m/%Y")
-        date_from = (datetime.now() - timedelta(days=30)).strftime("%d/%m/%Y")
+        date_to   = now_msk().strftime("%d/%m/%Y")
+        date_from = (now_msk() - timedelta(days=30)).strftime("%d/%m/%Y")
         url = (
             "https://www.cbr.ru/scripts/XML_val.asp"
         )
@@ -918,8 +936,8 @@ def fetch_brent_price() -> dict:
         code = br_contracts[0]["SECID"]
 
         # Шаг 2: дневные свечи за последние 5 торговых дней
-        from_dt = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
-        till_dt = datetime.now().strftime("%Y-%m-%d")
+        from_dt = (now_msk() - timedelta(days=10)).strftime("%Y-%m-%d")
+        till_dt = now_msk().strftime("%Y-%m-%d")
         r2 = requests.get(
             f"{BASE_URL}/engines/futures/markets/forts/boards/RFUD"
             f"/securities/{code}/candles.json"
@@ -949,8 +967,8 @@ def fetch_gold_price() -> dict:
     """
     _empty = {"price_rub_gram": None, "change_pct": None}
     try:
-        from_dt = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-        till_dt = datetime.now().strftime("%Y-%m-%d")
+        from_dt = (now_msk() - timedelta(days=7)).strftime("%Y-%m-%d")
+        till_dt = now_msk().strftime("%Y-%m-%d")
         r = requests.get(
             f"{BASE_URL}/engines/currency/markets/selt/boards/CETS"
             "/securities/GLDRUB_TOM/candles.json"
@@ -998,8 +1016,8 @@ def get_market_context() -> dict:
     # Это позволяет synthesize_signals() использовать актуальную ставку через CBR_KEY_RATE.
     global CBR_KEY_RATE
     CBR_KEY_RATE = ctx["cbr_rate"]
-    yesterday = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
-    today     = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (now_msk() - timedelta(days=5)).strftime("%Y-%m-%d")
+    today     = now_msk().strftime("%Y-%m-%d")
 
     # USDRUB — дневные свечи валютной секции
     # v0.9.6: используем USD000UTSTOM (TOM, самый ликвидный инструмент) вместо TOD.
@@ -1032,7 +1050,7 @@ def get_market_context() -> dict:
 
     # IMOEX — индекс МосБиржи (35 дн. → 21 свеча для технического анализа)
     try:
-        imoex_from = (datetime.now() - timedelta(days=35)).strftime("%Y-%m-%d")
+        imoex_from = (now_msk() - timedelta(days=35)).strftime("%Y-%m-%d")
         r = requests.get(
             f"{BASE_URL}/engines/stock/markets/index/boards/SNDX"
             f"/securities/IMOEX/candles.json"
@@ -1163,7 +1181,7 @@ def print_market_context(ctx: dict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_candles(ticker: str, days: int = 21) -> list[dict]:
-    date_from = (datetime.now() - timedelta(days=days + 10)).strftime("%Y-%m-%d")
+    date_from = (now_msk() - timedelta(days=days + 10)).strftime("%Y-%m-%d")
     url = (
         f"{BASE_URL}/engines/stock/markets/shares/boards/TQBR"
         f"/securities/{ticker}/candles.json?from={date_from}&interval=24"
@@ -1187,8 +1205,8 @@ def get_h1_candles_moex(ticker: str, days: int = 5) -> list[dict]:
     Используется когда T-Invest недоступен или тикер не имеет FIGI (FLOT и др.).
     Возвращает список {"open","close","high","low","value","begin"}.
     """
-    date_from = (datetime.now() - timedelta(days=days + 3)).strftime("%Y-%m-%d")
-    date_to   = datetime.now().strftime("%Y-%m-%d")
+    date_from = (now_msk() - timedelta(days=days + 3)).strftime("%Y-%m-%d")
+    date_to   = now_msk().strftime("%Y-%m-%d")
     url = (
         f"{BASE_URL}/engines/stock/markets/shares/boards/TQBR"
         f"/securities/{ticker}/candles.json"
@@ -1251,8 +1269,8 @@ def get_weekly_trend(ticker: str) -> dict:
               "ma5_weekly": None, "last_close": None, "candles_count": 0}
 
     try:
-        from_date = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
-        today     = datetime.now().strftime("%Y-%m-%d")
+        from_date = (now_msk() - timedelta(weeks=12)).strftime("%Y-%m-%d")
+        today     = now_msk().strftime("%Y-%m-%d")
         url = (
             f"{BASE_URL}/engines/stock/markets/shares/boards/TQBR"
             f"/securities/{ticker}/candles.json"
@@ -1340,7 +1358,7 @@ def calc_vwap(candles: list[dict]) -> float | None:
 
 def get_intraday_price(ticker: str) -> dict:
     """10-минутные свечи текущего дня → дневное изменение цены + VWAP."""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now_msk().strftime("%Y-%m-%d")
     url = (
         f"{BASE_URL}/engines/stock/markets/shares/boards/TQBR"
         f"/securities/{ticker}/candles.json?from={today}&till={today}&interval=10"
@@ -2327,7 +2345,7 @@ def parse_news_age(published: str) -> float | None:
     for fmt in ["%Y-%m-%dT%H:%M:%S", "%d %b %Y %H:%M:%S"]:
         try:
             dt  = datetime.strptime(published[:19], fmt)
-            age = (datetime.now() - dt).total_seconds() / 3600
+            age = (now_msk() - dt).total_seconds() / 3600
             return round(max(age, 0), 2)
         except Exception:
             continue
@@ -2472,9 +2490,15 @@ TICKER_MAP = {
     "LSRG":  ["группа лср", "пао лср", "лср груп", "lsr group", "lsrg",
                "лср дивиденд", "лср отчёт", "лср отчет", "лср выручк",
                "лср жильё", "лср прибыл", "застройщик лср", "девелопер лср"],
+    # v0.9.34: МКБ — крупный частный банк, события (оферты, реорганизация) дают +50%
+    "CBOM":  ["мкб", "московский кредитный банк", "cbom", "мкб банк",
+               "выкуп мкб", "реорганизация мкб", "оферта мкб",
+               "мкб акци", "мкб дивиденд", "мкб отчёт", "мкб отчет",
+               "мкб прибыл", "мкб выручк", "мкб капитал",
+               "акции мкб", "акций мкб"],
 }
 OIL_TICKERS  = ["GAZP", "LKOH", "ROSN", "NVTK", "TATN", "SNGS", "SIBN", "TRNFP"]
-BANK_TICKERS = ["SBER", "VTBR", "T"]    # T = T-Банк (замена TCSG, v0.9)
+BANK_TICKERS = ["SBER", "VTBR", "T", "CBOM"]    # T = T-Банк (замена TCSG, v0.9); CBOM = МКБ (v0.9.34)
 ALL_EXPORT   = list(EXPORTER_TICKERS)
 
 POSITIVE_ROOTS = [
@@ -2530,7 +2554,7 @@ def save_cache(cache: dict):
 
 
 def clean_cache(cache: dict) -> dict:
-    cutoff = (datetime.now() - timedelta(hours=CACHE_TTL_HOURS)).isoformat()
+    cutoff = (now_msk() - timedelta(hours=CACHE_TTL_HOURS)).isoformat()
     return {k: v for k, v in cache.items() if v > cutoff}
 
 
@@ -2566,7 +2590,7 @@ def fetch_news(cache: dict) -> list[NewsItem]:
         )
     }
     new_items = []
-    now_iso   = datetime.now().isoformat()
+    now_iso   = now_msk().isoformat()
 
     for source, url in RSS_FEEDS.items():
         print(f"  📡 {source}...", end=" ", flush=True)
@@ -3182,7 +3206,7 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
         # Это отдельно от Event Calendar (который смотрит на 48ч около события).
         # Здесь: окно 3-7 дней → bias LONG (накопление) а не SHORT (гэп после отсечки).
         prediv_pts = 0
-        _now_date  = datetime.now().date()
+        _now_date  = now_msk().date()
         for _evt in EVENT_CALENDAR:
             if ticker not in _evt.get("tickers", []):
                 continue
@@ -3627,7 +3651,7 @@ def tg_format_signal(s: dict, reason: str = "new") -> str:
     if not news_lines:
         news_lines = "📭 Новостей нет\n"
 
-    now_str = datetime.now().strftime("%H:%M МСК")
+    now_str = now_msk().strftime("%H:%M МСК")
 
     text = (
         f"{header_emoji} <b>{header_label}</b>   {now_str}\n"
@@ -3767,7 +3791,7 @@ def tg_format_open(s: dict, lots: int, equity: float, risk_rub, state: dict) -> 
     stop_pct  = _pct(stop, entry)
     take_pct  = _pct(take2, entry)
     risk_str  = f"{int(risk_rub)}₽" if risk_rub else "—"
-    now_str   = datetime.now().strftime("%H:%M МСК")
+    now_str   = now_msk().strftime("%H:%M МСК")
 
     text = (
         f"🚨 <b>ВХОД</b>  {now_str}\n"
@@ -3806,7 +3830,7 @@ def tg_format_close(s: dict, reason: str, equity: float, state: dict) -> str:
         sign = "+" if pnl_pct >= 0 else ""
         pnl_str = f"\n💸 P&L: {sign}{pnl_pct:.2f}%"
 
-    now_str = datetime.now().strftime("%H:%M МСК")
+    now_str = now_msk().strftime("%H:%M МСК")
     text = (
         f"{icon} <b>{label}</b>  {now_str}\n"
         f"{d_emoji} <b>{direction} — {ticker}</b>\n"
@@ -3851,7 +3875,7 @@ def append_score_log(entry: dict) -> None:
     Так я могу анализировать что блокируется и почему, без потери данных.
     """
     try:
-        entry.setdefault("ts", datetime.now().strftime("%Y-%m-%d %H:%M"))
+        entry.setdefault("ts", now_msk().strftime("%Y-%m-%d %H:%M"))
         with open(SCORE_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
@@ -3891,8 +3915,8 @@ def log_new_signal(s: dict, signal_id: str) -> None:
         "weekly_change":   s.get("weekly_change"),
         "h1_type":         s.get("h1_confirm", {}).get("type") if s.get("h1_confirm") else None,
         "pattern":         s.get("pattern", ""),
-        "date":            datetime.now().strftime("%Y-%m-%d"),
-        "time":            datetime.now().strftime("%H:%M"),
+        "date":            now_msk().strftime("%Y-%m-%d"),
+        "time":            now_msk().strftime("%H:%M"),
         "result":          None,   # "win_t1","win_t2","loss","be" — заполнится позже
         "exit_price":      None,
         "exit_time":       None,
@@ -3914,7 +3938,7 @@ def update_trade_result(signal_id: str, result: str, exit_price: float | None = 
         if r["signal_id"] == signal_id:
             r["result"]     = result
             r["exit_price"] = exit_price
-            r["exit_time"]  = datetime.now().strftime("%Y-%m-%d %H:%M")
+            r["exit_time"]  = now_msk().strftime("%Y-%m-%d %H:%M")
             if exit_price and r.get("entry"):
                 entry = r["entry"]
                 mult  = 1 if r.get("direction") == "LONG" else -1
@@ -4261,8 +4285,8 @@ def update_news_memory(news_signals: list, memory: dict) -> dict:
     Каждый день усредняем все score по тикеру.
     Удаляем записи старше NEWS_MEMORY_DAYS.
     """
-    today = datetime.now().strftime("%Y-%m-%d")
-    cutoff = (datetime.now() - timedelta(days=NEWS_MEMORY_DAYS)).strftime("%Y-%m-%d")
+    today = now_msk().strftime("%Y-%m-%d")
+    cutoff = (now_msk() - timedelta(days=NEWS_MEMORY_DAYS)).strftime("%Y-%m-%d")
 
     for n in news_signals:
         # score: +1 для LONG, -1 для SHORT, умножаем на strength
@@ -4383,7 +4407,7 @@ def get_upcoming_event(ticker: str, hours_ahead: int = 48) -> dict | None:
     Возвращает ближайшее событие для тикера в горизонте hours_ahead часов.
     None если событий нет.
     """
-    now = datetime.now()
+    now = now_msk()
     deadline = now + timedelta(hours=hours_ahead)
     for evt in EVENT_CALENDAR:
         try:
@@ -4428,7 +4452,7 @@ def signal_key(s: dict) -> str:
     Политика: один сигнал на тикер+направление в торговый день.
     При повышении уверенности СРЕДНЯЯ→ВЫСОКАЯ — отправляем upgrade (но не новый ордер).
     """
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now_msk().strftime("%Y-%m-%d")
     return f"{s['ticker']}_{s['direction']}_{today}"
 
 
@@ -4637,6 +4661,113 @@ def check_stop_target_hits(synthesized: list[dict], state: dict, intraday: dict)
                 logger.info("trailing: %s %s — trail_stop=%.2f", ticker, direction, be_stop)
 
     return alerts
+
+
+# ─── v0.9.34: Portfolio reconciliation ──────────────────────────────────────
+
+# Тикеры денежных позиций (кэш) — их исключаем из сравнения с sb_-ключами
+_CASH_TICKERS = {"RUB000UTSTOM", "RUB000", "USD000UTSTOM", "EUR000UTSTOM"}
+
+def reconcile_sandbox_state(state: dict) -> None:
+    """
+    v0.9.34: Синхронизирует signals_state.json с реальным портфелем T-Invest.
+
+    Два класса несоответствий:
+      Ghost  — sb_KEY в state без closed_at, но позиции этого тикера НЕТ в портфеле.
+               → Помечаем как закрытую (reason='reconcile_ghost'), текущую цену берём
+                 из last-price API. Бот не будет держать «мёртвую» позицию в риск-лимите.
+
+      Orphan — позиция ЕСТЬ в портфеле, но нет соответствующего sb_KEY в state.
+               → Создаём минимальную запись-заглушку (reason='reconcile_orphan'),
+                 чтобы бот видел позицию и мог управлять ею (трейлинг, закрытие).
+
+    Вызывается из run_once() перед sandbox_execute_signals().
+    """
+    if not SANDBOX_AUTO_ORDER or not _tinvest_available():
+        return
+
+    try:
+        portfolio = _tinvest.get_sandbox_portfolio()   # type: ignore[union-attr]
+    except Exception as _e:
+        logger.warning("reconcile: не удалось получить портфель: %s", _e)
+        return
+    if not portfolio:
+        return
+
+    # Словарь {ticker: position_dict} для реальных позиций (без кэша)
+    real_positions: dict[str, dict] = {}
+    for pos in portfolio.get("positions", []):
+        t   = pos.get("ticker", "")
+        qty = pos.get("quantity", 0)
+        if t and t not in _CASH_TICKERS and qty != 0:
+            real_positions[t] = pos
+
+    real_tickers = set(real_positions.keys())
+
+    # ── 1. Ghost-позиции: в state есть, в портфеле нет ──────────────────────
+    changed = False
+    for key, val in list(state.items()):
+        if not key.startswith("sb_"):
+            continue
+        if val.get("closed_at"):
+            continue  # уже закрыта
+        ticker = val.get("ticker", "")
+        if ticker and ticker not in real_tickers:
+            # Попытаемся взять текущую цену
+            try:
+                price_data = _tinvest.get_last_price(ticker)   # type: ignore[union-attr]
+                ghost_price = price_data.get("price") if price_data else None
+            except Exception:
+                ghost_price = None
+
+            state[key]["closed_at"]    = datetime.now(timezone.utc).isoformat()
+            state[key]["close_reason"] = "reconcile_ghost"
+            if ghost_price:
+                state[key]["close_price"] = ghost_price
+            changed = True
+            msg = (f"🔄 [reconcile] Ghost-позиция {key} ({ticker}) — "
+                   f"нет в портфеле → закрываем в state (ghost)")
+            print(msg)
+            logger.info(msg)
+            if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                tg_send(f"⚠️ *Reconcile*: позиция `{ticker}` не найдена в портфеле — "
+                        f"помечена как закрытая (ghost). Проверьте вручную.")
+
+    # ── 2. Orphan-позиции: в портфеле есть, в state нет ────────────────────
+    # Собираем тикеры из state (открытые)
+    tracked_tickers: set[str] = set()
+    for key, val in state.items():
+        if key.startswith("sb_") and not val.get("closed_at"):
+            tracked_tickers.add(val.get("ticker", ""))
+
+    for ticker, pos in real_positions.items():
+        if ticker in tracked_tickers:
+            continue
+        qty = pos.get("quantity", 0)
+        direction = "LONG" if qty > 0 else "SHORT"
+        orphan_key = f"sb_{ticker}_orphan"
+        if orphan_key not in state:
+            state[orphan_key] = {
+                "ticker":     ticker,
+                "direction":  direction,
+                "entry":      pos.get("avg_price", 0),
+                "stop":       0,
+                "price":      pos.get("curr_price", 0),
+                "lots":       int(abs(qty)),
+                "opened_at":  datetime.now(timezone.utc).isoformat(),
+                "note":       "reconcile_orphan — позиция без записи в state",
+            }
+            changed = True
+            msg = (f"🔄 [reconcile] Orphan-позиция {ticker} ({direction} ×{abs(qty):.0f}) — "
+                   f"нет в state → создана запись-заглушка")
+            print(msg)
+            logger.info(msg)
+            if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                tg_send(f"⚠️ *Reconcile*: найдена неизвестная позиция `{ticker}` "
+                        f"({direction} ×{abs(qty):.0f}) — добавлена в state как orphan.")
+
+    if changed:
+        save_signals_state(state)
 
 
 def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
@@ -5117,7 +5248,7 @@ def tg_notify_run(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_once(news_only: bool = False):
-    now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    now = now_msk().strftime("%d.%m.%Y %H:%M:%S")
     logger.info("─── скан начат (%s) ───", now)
     print(f"\n{'═'*54}")
     print(f"  🤖 MOEX Signal Bot {BOT_VERSION}  |  {now}")
@@ -5422,6 +5553,11 @@ def run_once(news_only: bool = False):
                 print_news_signal(s)
 
     # ── Sandbox (бумажная торговля) ───────────────────────────────────────────
+    if _tinvest_available() and SANDBOX_AUTO_ORDER:
+        # v0.9.34: reconcile всегда (даже без новых сигналов) — чистит ghost/orphan
+        _sb_state_rec = load_signals_state()
+        reconcile_sandbox_state(_sb_state_rec)
+
     if _tinvest_available() and SANDBOX_AUTO_ORDER and synthesized:
         print(f"\n📋 Sandbox-ордера...")
         sb_state = load_signals_state()
@@ -5465,7 +5601,7 @@ def clear_bot_log() -> None:
     v0.9.10: лог-файлы теперь в подпапке logs/.
     """
     os.makedirs(_LOG_DIR, exist_ok=True)
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = now_msk().strftime("%Y-%m-%d")
     archive  = os.path.join(_LOG_DIR, f"bot_{date_str}.log")
 
     if not os.path.exists(_LOG_FILE) or os.path.getsize(_LOG_FILE) == 0:
@@ -5477,7 +5613,7 @@ def clear_bot_log() -> None:
     if os.path.exists(archive):
         with open(archive, "a", encoding="utf-8") as dst, \
              open(_LOG_FILE,  "r", encoding="utf-8", errors="replace") as src:
-            dst.write(f"\n# ── append {datetime.now().strftime('%H:%M:%S')} ──\n")
+            dst.write(f"\n# ── append {now_msk().strftime('%H:%M:%S')} ──\n")
             shutil.copyfileobj(src, dst)
     else:
         shutil.copy2(_LOG_FILE, archive)
@@ -5551,7 +5687,8 @@ def rotate_score_log(max_days: int = 7, max_mb: float = 10.0):
     if size_mb < 0.5:
         return  # файл маленький — не трогаем
 
-    cutoff = datetime.now() - __import__("datetime").timedelta(days=max_days)
+    # v0.9.33: cutoff naive (ts[:19] в лог-файле тоже naive — без timezone)
+    cutoff = now_msk().replace(tzinfo=None) - __import__("datetime").timedelta(days=max_days)
     kept   = []
     total  = 0
     try:
@@ -5706,8 +5843,9 @@ def send_eod_report() -> None:
                 for pos in portfolio.get("positions", []):
                     t   = pos.get("ticker", "?")
                     qty = pos.get("quantity", 0)
-                    pnl = pos.get("pnl", 0)
-                    if qty != 0:
+                    pnl = pos.get("pnl_pct", pos.get("pnl", 0))
+                    # v0.9.34: фильтруем кэш-позиции (RUB000UTSTOM и аналоги)
+                    if qty != 0 and t not in _CASH_TICKERS and pos.get("avg_price", 0) != 0:
                         emoji = "🟢" if qty > 0 else "🔴"
                         sign  = "+" if pnl >= 0 else ""
                         open_positions.append(f"{emoji}{t} {sign}{pnl:.1f}%")
@@ -5779,7 +5917,7 @@ def send_eod_report() -> None:
         f"{'─'*30}\n"
         f"{trades_block}\n"
         f"{'─'*30}\n"
-        f"⏰ {_now_str}  |  MOEX Bot v0.9.32"
+        f"⏰ {_now_str}  |  MOEX Bot {BOT_VERSION}"
     )
 
     tg_send(msg)
@@ -5823,12 +5961,96 @@ def _release_pid_lock() -> None:
         pass
 
 
+def cmd_close_position(ticker: str) -> None:
+    """
+    v0.9.34: Ручное закрытие sandbox-позиции из CLI.
+    Использование: python3 moex_bot.py --close TRNFP
+
+    1. Вызывает sandbox_close_position() в T-Invest API.
+    2. Помечает все открытые sb_-записи по этому тикеру как closed_at.
+    3. Выводит результат и новый баланс портфеля.
+    """
+    ticker = ticker.upper().strip()
+    print(f"\n🔒 Закрываем sandbox-позицию: {ticker}")
+
+    if not _tinvest_available():
+        print("❌ T-Invest API недоступен. Проверьте .env (TINVEST_TOKEN).")
+        return
+
+    # ── 1. Закрываем в T-Invest ───────────────────────────────────────────────
+    try:
+        result = _tinvest.sandbox_close_position(ticker)   # type: ignore[union-attr]
+    except Exception as e:
+        print(f"❌ Ошибка API при закрытии {ticker}: {e}")
+        return
+
+    if not result:
+        print(f"⚠️  sandbox_close_position({ticker}) вернул None — позиция уже закрыта или не существует.")
+    else:
+        close_price = result.get("price", "?")
+        print(f"✅ T-Invest: позиция {ticker} закрыта по цене {close_price}")
+
+    # ── 2. Помечаем в state.json ──────────────────────────────────────────────
+    state   = load_signals_state()
+    changed = False
+    for key, val in list(state.items()):
+        if not key.startswith("sb_"):
+            continue
+        if val.get("ticker", "").upper() != ticker:
+            continue
+        if val.get("closed_at"):
+            continue  # уже закрыта
+        val["closed_at"]    = datetime.now(timezone.utc).isoformat()
+        val["close_reason"] = "manual_cli"
+        if result:
+            val["close_price"] = result.get("price")
+        changed = True
+        print(f"  📝 state: {key} → closed_at = manual_cli")
+
+    if changed:
+        save_signals_state(state)
+        print("  💾 signals_state.json обновлён.")
+    else:
+        print(f"  ℹ️  В state.json нет открытых записей по {ticker}.")
+
+    # ── 3. Показываем текущий портфель ───────────────────────────────────────
+    try:
+        portfolio = _tinvest.get_sandbox_portfolio()   # type: ignore[union-attr]
+        if portfolio:
+            total = portfolio.get("total_amount_rub", 0)
+            positions = [
+                p for p in portfolio.get("positions", [])
+                if p.get("ticker") not in _CASH_TICKERS and p.get("avg_price", 0) != 0
+            ]
+            print(f"\n💼 Портфель после закрытия: {total:,.0f} ₽")
+            if positions:
+                for p in positions:
+                    t   = p.get("ticker")
+                    qty = p.get("quantity", 0)
+                    pnl = p.get("pnl_pct", 0)
+                    sign = "+" if pnl >= 0 else ""
+                    print(f"  {'🟢' if qty > 0 else '🔴'} {t}  ×{qty:+.0f}  PnL {sign}{pnl:.1f}%")
+            else:
+                print("  Открытых позиций нет.")
+    except Exception as e:
+        print(f"  ⚠️  Не удалось получить портфель: {e}")
+
+
 def main():
     watch_mode  = "--watch"      in sys.argv
     news_only   = "--news-only"  in sys.argv
     show_log    = "--trade-log"  in sys.argv
     export_csv  = "--export-csv" in sys.argv
     clear_log   = "--clear-log"  in sys.argv   # v0.9.7: архивировать и очистить лог
+
+    # v0.9.34: ручное закрытие позиции
+    if "--close" in sys.argv:
+        idx = sys.argv.index("--close")
+        if idx + 1 < len(sys.argv):
+            cmd_close_position(sys.argv[idx + 1])
+        else:
+            print("❌ Укажите тикер: python3 moex_bot.py --close TRNFP")
+        return
 
     # v0.9.7: очистка лога
     if clear_log:
