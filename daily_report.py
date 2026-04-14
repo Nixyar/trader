@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
 """
-MOEX Bot — Ежедневный отчёт (19:00 МСК, будни)
-════════════════════════════════════════════════
-Собирает за сегодняшний день:
-  • Открытые/закрытые сделки из trade_log.json
-  • Текущие позиции из signals_state.json
-  • Ошибки и предупреждения из bot.log
-  • Итоговую статистику: P&L, winrate
+MOEX Bot — Ежедневный отчёт  v0.9.35
+══════════════════════════════════════
+Что нового (v0.9.35):
+  + Δ депозита в ₽ (реальное изменение капитала, не % от входа)
+  + P&L позиций переименован — без путаницы с P&L портфеля
+  + Недельная статистика (скользящие 7 дн. из trade_log)
+  + Открытые позиции: дней в позиции + % до стопа + оценка риска в ₽
+  + Закрытые позиции: цена выхода + проскальзывание стопа (если стоп пробит)
+  + Активность: ошибки / предупреждения / INFO-строк раздельно
+  + Правильный путь к логу: logs/bot.log (RotatingFileHandler)
+  + МСК-дата (не UTC) — работает корректно на иностранном VPS
+  + load_dotenv при ручном запуске
 
 Запуск вручную:   python daily_report.py
-Запуск через крон: добавь в crontab (crontab -e):
-  0 16 * * 1-5 cd /path/to/trader && python daily_report.py
-  (16:00 UTC = 19:00 МСК)
+Cron (UTC VPS):   55 15 * * 1-5 cd /path/to/trader && python daily_report.py
+                  (15:55 UTC = 18:55 МСК — за 5 мин до отправки)
 
-Переменные окружения (те же что у бота):
-  TELEGRAM_TOKEN   — токен бота
-  TELEGRAM_CHAT_ID — ID чата
+Env:  TELEGRAM_TOKEN, TELEGRAM_CHAT_ID  (из .env или EnvironmentFile)
 """
 
 import json
 import os
-import re
 import sys
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
+import pytz
 import requests
 
 # ─── Конфиг ──────────────────────────────────────────────────────────────────
@@ -33,13 +35,31 @@ _DIR = Path(__file__).parent
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-TRADE_LOG_FILE   = _DIR / "trade_log.json"
-STATE_FILE       = _DIR / "signals_state.json"
-LOG_FILE         = _DIR / "bot.log"
-LOG_DIR          = _DIR / "logs"
+TRADE_LOG_FILE = _DIR / "trade_log.json"
+STATE_FILE     = _DIR / "signals_state.json"
+EOD_FILE       = _DIR / "eod_state.json"
+LOG_DIR        = _DIR / "logs"
+LOG_FILE       = _DIR / "bot.log"   # fallback если logs/ нет
 
-TODAY_STR = date.today().strftime("%Y-%m-%d")
-TODAY_LABEL = date.today().strftime("%d.%m.%Y")
+# МСК — фиксируем один раз на весь запуск (без скачков при переходе суток)
+_MSK_TZ     = pytz.timezone("Europe/Moscow")
+_NOW_MSK    = datetime.now(_MSK_TZ)
+TODAY_STR   = _NOW_MSK.strftime("%Y-%m-%d")
+TODAY_LABEL = _NOW_MSK.strftime("%d.%m.%Y")
+
+# Лотность — синхронизирована с moex_bot.py (нужна для расчёта ₽ P&L)
+LOT_SIZES: dict[str, int] = {
+    "GAZP": 1,    "SBER": 1,    "LKOH": 1,    "ROSN": 1,    "NVTK": 1,
+    "GMKN": 1,    "YDEX": 1,    "TATN": 1,    "MGNT": 1,    "PLZL": 1,
+    "SNGS": 100,  "MTSS": 10,   "ALRS": 10,   "VTBR": 10000,"CHMF": 1,
+    "T":    1,    "PHOR": 1,    "AFKS": 100,  "NLMK": 10,
+    "SIBN": 10,   "FLOT": 10,   "RUAL": 100,  "OZON": 1,
+    "MOEX": 10,   "SMLT": 1,    "TRNFP": 1,
+    "ENPG": 1,    "MAGN": 10,   "AFLT": 10,   "PIKK": 1,
+    "AKRN": 1,    "IRAO": 100,
+    "X5":   1,    "HEAD": 1,    "POSI": 1,    "LSRG": 1,
+    "CBOM": 10,
+}
 
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
@@ -51,8 +71,8 @@ def tg_send(text: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         r = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text":    text,
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       text,
             "parse_mode": "HTML",
         }, timeout=15)
         r.raise_for_status()
@@ -62,7 +82,7 @@ def tg_send(text: str) -> bool:
         return False
 
 
-# ─── Данные ───────────────────────────────────────────────────────────────────
+# ─── Загрузка данных ──────────────────────────────────────────────────────────
 def load_trade_log() -> list[dict]:
     if not TRADE_LOG_FILE.exists():
         return []
@@ -83,191 +103,478 @@ def load_state() -> dict:
         return {}
 
 
+def load_eod_state() -> dict:
+    """Читаем equity на начало дня из eod_state.json (пишется moex_bot.py)."""
+    if not EOD_FILE.exists():
+        return {}
+    try:
+        with open(EOD_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def load_today_log_lines() -> list[str]:
-    """Читаем сегодняшние строки из bot.log (или logs/bot_YYYY-MM-DD.log)."""
-    lines = []
-
-    # Сначала пробуем именованный лог в logs/
-    named = LOG_DIR / f"bot_{TODAY_STR}.log"
-    if named.exists():
+    """
+    Сегодняшние строки из лога.
+    Порядок: logs/bot_YYYY-MM-DD.log → logs/bot.log → bot.log
+    Фильтрует по МСК-дате (TODAY_STR = '2026-04-14').
+    """
+    candidates = [
+        LOG_DIR / f"bot_{TODAY_STR}.log",
+        LOG_DIR / "bot.log",
+        LOG_FILE,
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
         try:
-            lines = named.read_text(errors="replace").splitlines()
+            all_lines = path.read_text(errors="replace").splitlines()
+            matched = [l for l in all_lines if l.startswith(TODAY_STR)]
+            if matched:
+                return matched
         except Exception:
             pass
-
-    # Если нет — читаем основной bot.log и фильтруем по дате
-    if not lines and LOG_FILE.exists():
-        try:
-            all_lines = LOG_FILE.read_text(errors="replace").splitlines()
-            prefix = TODAY_STR  # логи обычно начинаются с "2026-04-01 ..."
-            lines = [l for l in all_lines if l.startswith(prefix)]
-        except Exception:
-            pass
-
-    return lines
+    return []
 
 
-# ─── Анализ ───────────────────────────────────────────────────────────────────
-def trades_today(all_trades: list[dict]) -> tuple[list, list, list]:
-    """Возвращает (открытые_сегодня, закрытые_сегодня, всё_ещё_открытые)."""
-    opened_today  = [t for t in all_trades if t.get("date") == TODAY_STR]
-    closed_today  = [t for t in all_trades if (t.get("exit_time") or "").startswith(TODAY_STR)]
-    still_open    = [t for t in all_trades if t.get("result") is None and t.get("exit_price") is None]
-    return opened_today, closed_today, still_open
-
-
-def parse_errors_warnings(lines: list[str]) -> tuple[list[str], list[str]]:
-    errors   = [l for l in lines if " ERROR " in l or " CRITICAL " in l]
-    warnings = [l for l in lines if " WARNING " in l]
-    return errors[-10:], warnings[-10:]   # последние 10
+# ─── Анализ сделок ────────────────────────────────────────────────────────────
+def trades_today(all_trades: list[dict]) -> tuple[list, list]:
+    """Возвращает (открытые_сегодня, закрытые_сегодня)."""
+    opened = [t for t in all_trades if t.get("date") == TODAY_STR]
+    closed = [t for t in all_trades if (t.get("exit_time") or "").startswith(TODAY_STR)]
+    return opened, closed
 
 
 def day_pnl_stats(closed: list[dict]) -> dict:
     pnls = [t["pnl_pct"] for t in closed if t.get("pnl_pct") is not None]
     if not pnls:
-        return {"count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0, "winrate": 0.0, "avg_win": 0.0, "avg_loss": 0.0}
+        return {
+            "count": 0, "wins": 0, "losses": 0, "breakevens": 0,
+            "total_pnl": 0.0, "winrate": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
+        }
     wins   = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
+    losses = [p for p in pnls if p < 0]
+    bes    = [p for p in pnls if p == 0]
     return {
-        "count":     len(pnls),
-        "wins":      len(wins),
-        "losses":    len(losses),
-        "total_pnl": round(sum(pnls), 2),
-        "winrate":   round(len(wins) / len(pnls) * 100, 1) if pnls else 0.0,
-        "avg_win":   round(sum(wins)   / len(wins),   2) if wins   else 0.0,
-        "avg_loss":  round(sum(losses) / len(losses), 2) if losses else 0.0,
+        "count":      len(pnls),
+        "wins":       len(wins),
+        "losses":     len(losses),
+        "breakevens": len(bes),
+        "total_pnl":  round(sum(pnls), 2),
+        "winrate":    round(len(wins) / len(pnls) * 100, 1),
+        "avg_win":    round(sum(wins)   / len(wins),   2) if wins   else 0.0,
+        "avg_loss":   round(sum(losses) / len(losses), 2) if losses else 0.0,
     }
 
 
-def open_positions_summary(state: dict) -> tuple[str, int]:
+def weekly_stats(all_trades: list[dict]) -> dict:
+    """Скользящие 7 дней: все закрытые сделки за последние 7 календарных дней."""
+    cutoff = (datetime.now(_MSK_TZ) - timedelta(days=7)).strftime("%Y-%m-%d")
+    recent = [
+        t for t in all_trades
+        if t.get("exit_time") and t["exit_time"] >= cutoff
+        and t.get("pnl_pct") is not None
+    ]
+    if not recent:
+        return {}
+    pnls   = [t["pnl_pct"] for t in recent]
+    wins   = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    return {
+        "count":   len(pnls),
+        "wins":    len(wins),
+        "losses":  len(losses),
+        "total":   round(sum(pnls), 2),
+        "winrate": round(len(wins) / len(pnls) * 100, 1),
+        "from":    cutoff,
+    }
+
+
+def parse_log_stats(lines: list[str]) -> dict:
+    """Разбиваем лог по уровням: ERROR/CRITICAL, WARNING, INFO/DEBUG.
+    Формат строки: '2026-04-14 09:18:37 [INFO] module: message'
     """
-    Читаем signals_state.json — только активные сандбокс-позиции (ключи sb_* с order_id).
-    Возвращает (строка-сводка, кол-во позиций).
+    errors   = [l for l in lines if "[ERROR]"    in l or "[CRITICAL]" in l]
+    warnings = [l for l in lines if "[WARNING]"  in l]
+    infos    = [l for l in lines if "[INFO]"      in l or "[DEBUG]"    in l]
+    return {
+        "total":    len(lines),
+        "errors":   errors[-5:],    # последние 5 для вывода
+        "n_errors": len(errors),
+        "n_warn":   len(warnings),
+        "n_info":   len(infos),
+    }
+
+
+# ─── Открытые позиции ─────────────────────────────────────────────────────────
+def open_positions_summary(state: dict) -> tuple[list[str], int, float]:
     """
-    positions = []
+    Активные sandbox-позиции (sb_* с order_id и без closed_at).
+    Возвращает (список строк, кол-во, суммарный deployed_rub).
+    """
+    rows: list[tuple[str, dict]] = []   # (key, val)
     for key, val in state.items():
-        # Только сандбокс-записи с реальным order_id
         if not key.startswith("sb_") or not isinstance(val, dict):
             continue
         if not val.get("order_id"):
             continue
+        if val.get("closed_at"):          # v0.9.35: фикс — пропускаем закрытые
+            continue
+        rows.append((key, val))
+
+    # Сортировка: сначала свежие (по opened_at)
+    rows.sort(key=lambda kv: kv[1].get("opened_at", ""), reverse=True)
+
+    lines: list[str] = []
+    total_deployed: float = 0.0
+
+    for key, val in rows:
         ticker    = val.get("ticker", key.replace("sb_", "").split("_")[0])
         direction = val.get("direction", "?")
-        price     = val.get("price") or val.get("entry", 0)
-        lots      = val.get("lots", 1)
-        stop      = val.get("stop", 0)
-        take2     = val.get("take2", 0)
-        arrow     = "🟢" if direction == "LONG" else "🔴"
-        stop_str  = f"  стоп {stop:.1f}" if stop else ""
-        take_str  = f"  цель {take2:.1f}" if take2 else ""
-        # Дата открытия из ключа: sb_PHOR_LONG_2026-03-12 → 2026-03-12
+        price     = float(val.get("price") or val.get("entry") or 0)
+        lots      = int(val.get("lots", 1))
+        stop      = float(val.get("stop", 0))
+        take2     = float(val.get("take2", 0))
+        opened_at = val.get("opened_at", "")
+
+        arrow = "🟢" if direction == "LONG" else "🔴"
+
+        # Deployed ₽
+        lot_size    = LOT_SIZES.get(ticker, 1)
+        deployed    = price * lots * lot_size
+        total_deployed += deployed
+
+        # Дней в позиции
+        days_open = ""
+        if opened_at:
+            try:
+                import pytz as _ptz
+                from datetime import timezone as _tz
+                dt_open = datetime.fromisoformat(opened_at)
+                if dt_open.tzinfo is None:
+                    dt_open = dt_open.replace(tzinfo=_tz.utc)
+                delta_d = (_NOW_MSK - dt_open.astimezone(_MSK_TZ)).days
+                days_open = f" {delta_d}д" if delta_d > 0 else " <1д"
+            except Exception:
+                pass
+
+        # % до стопа
+        stop_dist = ""
+        if stop and price:
+            dist_pct = abs(stop - price) / price * 100
+            stop_dist = f"  стоп {stop:.1f} ({dist_pct:.1f}%)"
+
+        take_str = f"  цель {take2:.1f}" if take2 else ""
+
+        # Дата из ключа: sb_TICKER_DIR_2026-04-14
         parts = key.split("_")
         open_date = parts[-1] if len(parts) >= 4 and "-" in parts[-1] else ""
         date_str  = f"  [{open_date}]" if open_date else ""
-        positions.append(f"  {arrow}{ticker} {direction} × {lots} лот @ {price:.1f}{stop_str}{take_str}{date_str}")
 
-    text = "\n".join(positions) if positions else "  нет открытых позиций"
-    return text, len(positions)
+        deployed_str = f"  (~{deployed/1000:.0f}k₽)" if deployed >= 1000 else ""
 
+        lines.append(
+            f"  {arrow}{ticker} {direction} × {lots}л @ {price:.1f}"
+            f"{stop_dist}{take_str}{deployed_str}{days_open}{date_str}"
+        )
 
-# ─── Форматирование ───────────────────────────────────────────────────────────
-def format_trade(t: dict, prefix: str = "") -> str:
-    ticker = t.get("ticker", "?")
-    dirn   = t.get("direction", "?")
-    entry  = t.get("entry", 0)
-    result = t.get("result", "")
-    pnl    = t.get("pnl_pct")
-    arrow  = "🟢" if dirn == "LONG" else "🔴"
-    pnl_str = f"  {'+' if pnl and pnl>0 else ''}{pnl:.2f}%" if pnl is not None else ""
-    result_icon = {"win": "✅", "loss": "❌", "breakeven": "➖"}.get(str(result).lower(), "⏳")
-    return f"{prefix}{result_icon}{arrow}{ticker} {dirn} @ {entry:.1f}{pnl_str}"
+    if not lines:
+        lines = ["  нет открытых позиций"]
+
+    return lines, len(rows), total_deployed
 
 
+# ─── Форматирование сделок ────────────────────────────────────────────────────
+def format_trade_closed(t: dict) -> str:
+    """Закрытая сделка: вход → выход, P&L, проскальзывание стопа если было."""
+    ticker    = t.get("ticker", "?")
+    dirn      = t.get("direction", "?")
+    entry     = float(t.get("entry", 0))
+    stop      = float(t.get("stop", 0))
+    exit_p    = t.get("exit_price")
+    pnl       = t.get("pnl_pct")
+    conf      = t.get("confidence", "")
+    result    = str(t.get("result", "")).lower()
+
+    arrow     = "🟢" if dirn == "LONG" else "🔴"
+    res_icon  = {"win": "✅", "win_t1": "✅", "win_t2": "✅",
+                 "loss": "❌", "stop": "❌",
+                 "breakeven": "➖"}.get(result, "❌" if (pnl or 0) < 0 else "✅")
+
+    pnl_str = f"  {'+' if (pnl or 0) > 0 else ''}{pnl:.2f}%" if pnl is not None else ""
+
+    # Проскальзывание стопа: выход хуже стопа на ≥ 0.1%
+    slip_str = ""
+    if stop and exit_p and pnl is not None and pnl < 0:
+        if dirn == "SHORT":
+            slip = exit_p - stop   # SHORT: выход выше стопа = плохо
+        else:
+            slip = stop - exit_p   # LONG:  выход ниже стопа = плохо
+        if slip > 0.05 * stop / 100 * 100:  # > 0.05₽ проскальзывание
+            slip_str = f"  ⚠️slip+{slip:.1f}₽"
+
+    # Краткий тег уверенности
+    conf_tag = ""
+    if "ОТЛИЧНАЯ" in conf:
+        conf_tag = " [🔥🔥]"
+    elif "ВЫСОКАЯ" in conf:
+        conf_tag = " [🔥]"
+    elif "СРЕДНЯЯ" in conf:
+        conf_tag = " [🟡]"
+
+    exit_str = f" → {exit_p:.2f}" if exit_p else ""
+    return f"  {res_icon}{arrow} {ticker} {dirn}  @ {entry:.1f}{exit_str}{pnl_str}{slip_str}{conf_tag}"
+
+
+def format_trade_opened(t: dict) -> str:
+    """Открытая сегодня сделка (может быть ещё открыта или уже закрыта)."""
+    ticker      = t.get("ticker", "?")
+    dirn        = t.get("direction", "?")
+    entry       = float(t.get("entry", 0))
+    pnl         = t.get("pnl_pct")
+    raw_result  = t.get("result")
+    result      = str(raw_result).lower() if raw_result is not None else ""
+    conf        = t.get("confidence", "")
+    rsi         = t.get("rsi")
+    vwap        = t.get("vwap_confirm")
+
+    arrow    = "🟢" if dirn == "LONG" else "🔴"
+    if result in ("win", "win_t1", "win_t2"):
+        res_icon = "✅"
+    elif result in ("loss", "stop") or (pnl is not None and pnl < 0):
+        res_icon = "❌"
+    elif raw_result is None and pnl is None:   # ещё открыта
+        res_icon = "⏳"
+    else:
+        res_icon = "➖"
+
+    pnl_str = f"  {'+' if (pnl or 0) > 0 else ''}{pnl:.2f}%" if pnl is not None else "  открыта"
+
+    # Предупреждения
+    flags = []
+    if rsi and rsi > 73 and dirn == "LONG":
+        flags.append(f"RSI⚠️{rsi:.0f}")
+    if vwap is False:
+        flags.append("VWAP✗")
+
+    flag_str = "  [" + " | ".join(flags) + "]" if flags else ""
+    return f"  {res_icon}{arrow} {ticker} {dirn}  @ {entry:.1f}{pnl_str}{flag_str}"
+
+
+# ─── Δ депозита ───────────────────────────────────────────────────────────────
+def estimate_deposit_delta(state: dict, closed_today: list[dict], equity_sod: float) -> str:
+    """
+    Оценка реального изменения депозита в ₽ за день.
+    Два источника (комбинируем оба):
+      1. trade_log closed_today → pnl_pct × примерный размер позиции (5% equity)
+      2. sb_*-записи из state, закрытые сегодня и НЕ входящие в trade_log
+         (сюда попадают orphan-сделки вроде TRNFP — с реальными lots/close_price)
+    Пропускаем reconcile_ghost (без реальной сделки).
+    """
+    if equity_sod <= 0:
+        return ""
+
+    total_rub: float = 0.0
+    has_data  = False
+
+    # ── Источник 1: trade_log ─────────────────────────────────────────────────
+    tickers_in_tradelog: set[str] = set()
+    for t in closed_today:
+        p      = t.get("pnl_pct")
+        ticker = t.get("ticker", "")
+        if p is not None:
+            # Позиция ≈ 5% equity (SANDBOX_MAX_POS_PCT по умолчанию)
+            approx_pos = equity_sod * 0.05
+            total_rub += approx_pos * p / 100
+            has_data = True
+        if ticker:
+            tickers_in_tradelog.add(ticker)
+
+    # ── Источник 2: sb_* из state, закрытые сегодня (orphan/manual) ──────────
+    for key, val in state.items():
+        if not key.startswith("sb_") or not isinstance(val, dict):
+            continue
+        closed_at    = val.get("closed_at", "")
+        close_reason = val.get("close_reason", "")
+        # Только закрытые сегодня
+        if not (closed_at and closed_at[:10] == TODAY_STR):
+            continue
+        # Пропускаем ghost — реальной рыночной сделки не было
+        if close_reason == "reconcile_ghost":
+            continue
+        ticker    = val.get("ticker", "")
+        # Пропускаем, если тикер уже посчитан через trade_log
+        if ticker in tickers_in_tradelog:
+            continue
+        entry_p  = float(val.get("price") or val.get("entry") or 0)
+        close_p  = float(val.get("close_price") or 0)
+        lots     = int(val.get("lots", 0))
+        if not (entry_p and close_p and lots):
+            continue
+        direction = val.get("direction", "LONG")
+        lot_size  = LOT_SIZES.get(ticker, 1)
+        mult      = -1 if direction == "SHORT" else 1
+        total_rub += mult * (close_p - entry_p) * lots * lot_size
+        has_data   = True
+
+    if not has_data:
+        return ""
+
+    pct    = total_rub / equity_sod * 100
+    sign   = "+" if total_rub >= 0 else ""
+    emoji  = "🟢" if total_rub >= 0 else "🔴"
+    # "≈" только если оценивали через trade_log (не точные данные sb_)
+    approx = "≈ " if closed_today else ""
+    return (
+        f"{emoji} Δ депозита: {approx}{sign}{total_rub:,.0f} ₽  ({sign}{pct:.2f}%)\n"
+        f"   SOD: {equity_sod:,.0f} ₽  →  {approx}{equity_sod + total_rub:,.0f} ₽"
+    )
+
+
+# ─── Сборка отчёта ────────────────────────────────────────────────────────────
 def build_report(
     opened:     list[dict],
     closed:     list[dict],
-    still_open: list[dict],
     stats:      dict,
     state:      dict,
-    errors:     list[str],
-    warnings:   list[str],
-    log_lines:  int,
+    log_stats:  dict,
+    eod_state:  dict,
+    week:       dict,
 ) -> str:
-    lines = [f"📊 <b>Отчёт бота за {TODAY_LABEL}</b>"]
+    parts: list[str] = []
 
-    # ── Статистика дня ────────────────────────────────────────────────────────
-    total_pnl = stats["total_pnl"]
-    pnl_emoji = "🟢" if total_pnl > 0 else ("🔴" if total_pnl < 0 else "⚪")
-    lines.append(
-        f"\n{pnl_emoji} <b>P&amp;L дня: {'+' if total_pnl > 0 else ''}{total_pnl:.2f}%</b>"
-        f"  |  Закрыто: {stats['count']} сд."
-        + (f"  |  WR: {stats['winrate']:.0f}%" if stats["count"] else "")
-    )
+    # ── Заголовок ─────────────────────────────────────────────────────────────
+    parts.append(f"📊 <b>Отчёт бота за {TODAY_LABEL}</b>")
+
+    # ── P&L позиций + Δ депозита ──────────────────────────────────────────────
     if stats["count"]:
-        lines.append(
-            f"   ✅ побед {stats['wins']} (ср. +{stats['avg_win']:.2f}%)  "
-            f"❌ убытков {stats['losses']} (ср. {stats['avg_loss']:.2f}%)"
+        total_pnl = stats["total_pnl"]
+        pnl_emoji = "🟢" if total_pnl > 0 else ("🔴" if total_pnl < 0 else "⚪")
+        wr_str    = f"  |  WR: {stats['winrate']:.0f}%" if stats["count"] else ""
+
+        parts.append(
+            f"\n{pnl_emoji} <b>P&amp;L позиций: {'+' if total_pnl > 0 else ''}{total_pnl:.2f}%</b>"
+            f"  |  Закрыто: {stats['count']} сд.{wr_str}"
+        )
+        detail = []
+        if stats["wins"]:
+            detail.append(f"✅ {stats['wins']} побед (ср. +{stats['avg_win']:.2f}%)")
+        if stats["losses"]:
+            detail.append(f"❌ {stats['losses']} убытков (ср. {stats['avg_loss']:.2f}%)")
+        if detail:
+            parts.append("   " + "   ".join(detail))
+
+        # Реальное изменение депозита
+        equity_sod = float(eod_state.get("equity_day_start", 0))
+        delta_line = estimate_deposit_delta(state, closed, equity_sod)
+        if delta_line:
+            parts.append(delta_line)
+
+    elif eod_state.get("equity_day_start"):
+        equity_sod = float(eod_state["equity_day_start"])
+        parts.append(f"\n💼 Депозит SOD: {equity_sod:,.0f} ₽  |  сделок за день: 0")
+
+    # ── Открытые сегодня ──────────────────────────────────────────────────────
+    if opened:
+        parts.append(f"\n📥 <b>Открыто сегодня ({len(opened)}):</b>")
+        for t in opened:
+            parts.append(format_trade_opened(t))
+
+    # ── Закрытые сегодня ──────────────────────────────────────────────────────
+    if closed:
+        parts.append(f"\n📤 <b>Закрыто сегодня ({len(closed)}):</b>")
+        for t in closed:
+            parts.append(format_trade_closed(t))
+
+    # ── Текущий портфель ──────────────────────────────────────────────────────
+    pos_lines, pos_count, deployed_rub = open_positions_summary(state)
+    header = f"💼 <b>Текущий портфель ({pos_count} поз.)</b>"
+    if deployed_rub > 0:
+        header += f"  ~{deployed_rub/1000:.0f}k₽ задействовано"
+    parts.append(f"\n{header}:")
+    parts.extend(pos_lines)
+
+    # ── Неделя ────────────────────────────────────────────────────────────────
+    if week and week.get("count"):
+        w_emoji = "🟢" if week["total"] > 0 else "🔴"
+        parts.append(
+            f"\n📈 <b>Неделя (скользящие 7 дн.):</b>  {week['count']} сд.  "
+            f"|  ✅{week['wins']} ❌{week['losses']}  "
+            f"|  WR {week['winrate']:.0f}%  "
+            f"|  {w_emoji} Σ {'+' if week['total'] > 0 else ''}{week['total']:.2f}%"
         )
 
-    # ── Открытые сегодня ─────────────────────────────────────────────────────
-    if opened:
-        lines.append(f"\n📥 <b>Открыто сегодня ({len(opened)}):</b>")
-        for t in opened:
-            lines.append(format_trade(t, prefix="  "))
+    # ── Активность ────────────────────────────────────────────────────────────
+    n_tot  = log_stats["total"]
+    n_err  = log_stats["n_errors"]
+    n_warn = log_stats["n_warn"]
+    n_info = log_stats["n_info"]
+    if n_tot:
+        act_line = f"🔄 <b>Активность:</b> {n_tot} строк"
+        if n_err:
+            act_line += f"  🚨 {n_err} ошибок"
+        if n_warn:
+            act_line += f"  ⚠️ {n_warn} предупр."
+        if n_info:
+            act_line += f"  ℹ️ {n_info} info"
+    else:
+        act_line = "🔄 <b>Активность:</b> 0 строк в логе — бот, возможно, не запущен"
+    parts.append(f"\n{act_line}")
 
-    # ── Закрытые сегодня ─────────────────────────────────────────────────────
-    if closed:
-        lines.append(f"\n📤 <b>Закрыто сегодня ({len(closed)}):</b>")
-        for t in closed:
-            lines.append(format_trade(t, prefix="  "))
+    # ── Ошибки (последние 3) ──────────────────────────────────────────────────
+    if log_stats["errors"]:
+        parts.append(f"\n🚨 <b>Последние ошибки:</b>")
+        for e in log_stats["errors"][-3:]:
+            short = e[20:120] if len(e) > 20 else e
+            parts.append(f"  <code>{short}</code>")
 
-    # ── Текущие позиции ───────────────────────────────────────────────────────
-    pos_text, pos_count = open_positions_summary(state)
-    lines.append(f"\n💼 <b>Текущий портфель ({pos_count} поз.):</b>")
-    lines.append(pos_text)
+    # ── Подвал ────────────────────────────────────────────────────────────────
+    parts.append(
+        f"\n⏰ {_NOW_MSK.strftime('%H:%M:%S')} МСК  |  MOEX Bot v0.9.35"
+    )
 
-    # ── Активность за день ────────────────────────────────────────────────────
-    lines.append(f"\n🔄 <b>Активность:</b> {log_lines} строк в логе за сегодня")
-
-    # ── Ошибки ────────────────────────────────────────────────────────────────
-    if errors:
-        lines.append(f"\n🚨 <b>Ошибки ({len(errors)}):</b>")
-        for e in errors[:5]:
-            # Обрезаем длинные строки
-            short = e[20:100] if len(e) > 20 else e
-            lines.append(f"  <code>{short}</code>")
-
-    if warnings:
-        lines.append(f"\n⚠️ <b>Предупреждения: {len(warnings)}</b> (последнее: {warnings[-1][20:80] if warnings else ''})")
-
-    lines.append(f"\n⏰ Сгенерирован в {datetime.now().strftime('%H:%M:%S')} МСК")
-    return "\n".join(lines)
+    return "\n".join(parts)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
-def main():
+def main() -> int:
+    # Грузим .env при ручном запуске (systemd берёт env из EnvironmentFile)
+    try:
+        import dotenv as _dotenv
+        _dotenv.load_dotenv(Path(__file__).parent / ".env", override=False)
+        global TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+        TELEGRAM_TOKEN   = TELEGRAM_TOKEN   or os.environ.get("TELEGRAM_TOKEN",   "")
+        TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID or os.environ.get("TELEGRAM_CHAT_ID", "")
+    except ImportError:
+        pass
+
     print(f"📋 Формирую отчёт за {TODAY_LABEL}...")
 
-    all_trades           = load_trade_log()
-    state                = load_state()
-    log_lines_raw        = load_today_log_lines()
-    errors, warnings     = parse_errors_warnings(log_lines_raw)
-    opened, closed, still_open = trades_today(all_trades)
-    stats                = day_pnl_stats(closed)
+    all_trades         = load_trade_log()
+    state              = load_state()
+    eod_state          = load_eod_state()
+    log_lines_raw      = load_today_log_lines()
+    log_stats          = parse_log_stats(log_lines_raw)
+    opened, closed     = trades_today(all_trades)
+    stats              = day_pnl_stats(closed)
+    week               = weekly_stats(all_trades)
 
     report = build_report(
-        opened     = opened,
-        closed     = closed,
-        still_open = still_open,
-        stats      = stats,
-        state      = state,
-        errors     = errors,
-        warnings   = warnings,
-        log_lines  = len(log_lines_raw),
+        opened    = opened,
+        closed    = closed,
+        stats     = stats,
+        state     = state,
+        log_stats = log_stats,
+        eod_state = eod_state,
+        week      = week,
     )
 
     ok = tg_send(report)
-    print("✅ Отчёт отправлен в Telegram" if ok else "📄 Отчёт выведен в консоль")
+    if ok:
+        print("✅ Отчёт отправлен в Telegram")
+    else:
+        print("📄 Отчёт выведен в консоль (Telegram недоступен или токен не задан)")
     return 0
 
 
