@@ -6037,6 +6037,16 @@ def cmd_close_position(ticker: str) -> None:
 
 
 def main():
+    # v0.9.34: загружаем .env при любом запуске из консоли
+    # (systemd подтягивает переменные через EnvironmentFile= — там это не нужно,
+    #  но при ручном `python3 moex_bot.py --close` без него токены не видны)
+    try:
+        import dotenv as _dotenv
+        _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        _dotenv.load_dotenv(_env_path, override=False)  # override=False: не перезаписываем уже заданные
+    except ImportError:
+        pass  # python-dotenv не установлен — переменные должны быть заданы в окружении
+
     watch_mode  = "--watch"      in sys.argv
     news_only   = "--news-only"  in sys.argv
     show_log    = "--trade-log"  in sys.argv
