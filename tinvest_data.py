@@ -38,6 +38,42 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# ─── v0.9.36: Runtime blacklist для тикеров с 50002 (NOT_FOUND) ──────────────
+# Кейс 16.04.2026: OZON получал 50002 от T-Invest sandbox 3 раза за день,
+# плюс ~14 risk-blocks потому что подмножество сигналов по нему создавалось.
+# Solution: при первом 50002 помечаем тикер как недоступный на TTL часов.
+# После TTL пробуем снова (вдруг T-Invest добавил инструмент).
+_SANDBOX_UNAVAILABLE: dict[str, datetime] = {}   # ticker -> marked_at_utc
+SANDBOX_BLACKLIST_TTL_HOURS = 24
+
+
+def mark_sandbox_unavailable(ticker: str) -> None:
+    """Отметить тикер как недоступный в sandbox (50002) на TTL часов."""
+    if ticker not in _SANDBOX_UNAVAILABLE:
+        logger.warning(
+            "[SANDBOX_BLACKLIST] %s → runtime-blacklist на %dч (первый 50002)",
+            ticker, SANDBOX_BLACKLIST_TTL_HOURS,
+        )
+    _SANDBOX_UNAVAILABLE[ticker] = datetime.now(timezone.utc)
+
+
+def is_sandbox_available(ticker: str) -> bool:
+    """True — если тикер не в blacklist или TTL истёк."""
+    marked = _SANDBOX_UNAVAILABLE.get(ticker)
+    if not marked:
+        return True
+    age_h = (datetime.now(timezone.utc) - marked).total_seconds() / 3600
+    if age_h >= SANDBOX_BLACKLIST_TTL_HOURS:
+        _SANDBOX_UNAVAILABLE.pop(ticker, None)
+        logger.info("[SANDBOX_BLACKLIST] %s → TTL истёк (%dч), снимаем блок", ticker, age_h)
+        return True
+    return False
+
+
+def list_sandbox_unavailable() -> list[str]:
+    """Для диагностики / EOD-отчёта."""
+    return sorted(_SANDBOX_UNAVAILABLE.keys())
+
 # ── Fallback logging (при запуске tinvest_data.py напрямую) ───────────────────
 # Когда модуль запускается как скрипт (python tinvest_data.py --portfolio),
 # moex_bot.py не инициализирует logging, поэтому настраиваем его здесь.
@@ -456,15 +492,35 @@ def get_candles_tinvest(ticker: str, days: int = 21) -> list[dict]:
         return []
 
 
+# Тикеры, у которых H1-свечи в T-Invest возвращают NOT_FOUND (50002).
+# Для них сразу используем MOEX ISS — T-Invest даже не пробуем,
+# чтобы не засорять лог [ERROR] от SDK-логгера t_tech.invest.logging.
+# v0.9.35: добавлен SMLT (BBG006HBB564 даёт NOT_FOUND в sandbox).
+_TINVEST_CANDLES_SKIP: set[str] = {
+    "FLOT",   # BBG000NF0ZQ4 — NOT_FOUND v0.9.6
+    "SMLT",   # BBG006HBB564 — NOT_FOUND v0.9.35
+    "SIBN",   # BBG004FWGS36 — NOT_FOUND (упоминался в комментариях)
+    "PIKK",   # BBG004730ZL5 — NOT_FOUND (упоминался в комментариях)
+}
+
+
 def get_h1_candles(ticker: str, days: int = 5) -> list[dict]:
     """
     История часовых (H1) свечей через T-Invest API.
     Используется для анализа H1-уровней поддержки/сопротивления (v0.9.2).
 
+    Тикеры из _TINVEST_CANDLES_SKIP сразу возвращают [] (fallback на MOEX ISS),
+    без вызова T-Invest и без шумного [ERROR] от t_tech.invest.logging.
+
     Returns: список {"open", "close", "high", "low", "value", "begin"}
     Количество свечей: ~days × 7 часов торгов MOEX ≈ 35 свечей за 5 дней.
     """
     if not is_available():
+        return []
+
+    # v0.9.35: быстрый выход для тикеров с известным NOT_FOUND в T-Invest
+    if ticker in _TINVEST_CANDLES_SKIP:
+        logger.debug("get_h1_candles(%s): в списке CANDLES_SKIP → MOEX ISS fallback", ticker)
         return []
 
     figi = get_figi(ticker)
@@ -503,12 +559,15 @@ def get_h1_candles(ticker: str, days: int = 5) -> list[dict]:
 
     except Exception as e:
         err_str = str(e)
-        # 50002 = "Instrument not found" — нет в T-Invest sandbox (SIBN, PIKK и др.)
-        # Это ожидаемо и не является ошибкой конфигурации → понижаем до WARNING
+        # 50002 = "Instrument not found" — нет в T-Invest (неизвестный тикер)
+        # Добавь тикер в _TINVEST_CANDLES_SKIP чтобы избежать этой ошибки в будущем
         if "50002" in err_str:
-            logger.warning(f"T-Invest get_h1_candles({ticker}): инструмент не найден (50002) — используем MOEX ISS fallback")
+            logger.warning(
+                "T-Invest get_h1_candles(%s): NOT_FOUND 50002 → MOEX ISS fallback "
+                "(добавь '%s' в _TINVEST_CANDLES_SKIP для тишины)", ticker, ticker
+            )
         else:
-            logger.error(f"T-Invest get_h1_candles({ticker}): {e}")
+            logger.error("T-Invest get_h1_candles(%s): %s", ticker, e)
         return []
 
 
@@ -746,6 +805,8 @@ def sandbox_place_order(
                 f"[SANDBOX] {ticker} не найден в T-Invest (50002) — "
                 f"инструмент недоступен в sandbox, ордер пропущен"
             )
+            # v0.9.36: помечаем в runtime-blacklist до рестарта / TTL
+            mark_sandbox_unavailable(ticker)
         else:
             logger.error(f"sandbox_place_order({ticker}): {e}")
         return None
