@@ -572,7 +572,7 @@ MIN_VOL_RUB_MAP: dict[str, int] = {
 }
 NEWS_STRENGTH_MIN    = 1
 SCAN_INTERVAL_SEC    = 300          # --watch интервал (5 мин)
-BOT_VERSION          = "v0.9.36"    # отображается в заголовке каждого скана и строке "Готово"
+BOT_VERSION          = "v0.9.35"    # отображается в заголовке каждого скана и строке "Готово"
 
 # ─── v0.9.33: Timezone helper ────────────────────────────────────────────────
 # Единая точка получения «сейчас в МСК». Использовать ВЕЗДЕ вместо now_msk().
@@ -630,24 +630,8 @@ SANDBOX_MAX_TICKER_PCT = float(os.environ.get("SANDBOX_MAX_TICKER_PCT", "10.0"))
 
 # 3. Максимальный суммарный открытый риск (% от equity)
 #    Отличается от portfolio_heat: считает не потенциальный убыток, а развёрнутый капитал.
-#    Пример: equity=1M, лимит 40% → максимум 400 000 ₽ в открытых позициях суммарно.
-# v0.9.36: default поднят до 40.0 — чтобы совпадал с .env и Notion KB.
-#          Ранее default=20 и если .env не подхватывался, срезало ОТЛИЧНЫЕ сигналы.
-SANDBOX_MAX_TOTAL_PCT  = float(os.environ.get("SANDBOX_MAX_TOTAL_PCT",  "40.0"))
-
-# ─── v0.9.36: Risk-block dedup + daily loss brake ────────────────────────────
-# За 16.04 было 33 повторяющихся WARNING risk-block по одним и тем же парам
-# (ticker, reason). Держим окно 30 мин на уникальную пару — лог чище.
-_RISK_BLOCK_SEEN: dict[tuple, tuple] = {}   # (ticker, reason_code) -> (last_logged_utc, suppressed_count)
-_RISK_BLOCK_DEDUP_MIN = 30
-
-# Максимальный дневной убыток: если внутри дня −2% к SOD equity — стоп новых входов.
-MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "2.0"))
-
-# Кулдаун после target2 / stop_hit в том же направлении (anti-chasing).
-# Кейс 16.04: CBOM target2 → через 27 мин v2 вошёл на эйфории → stop_hit.
-COOLDOWN_AFTER_T2_MIN   = int(os.environ.get("COOLDOWN_AFTER_T2_MIN",   "90"))
-COOLDOWN_AFTER_STOP_MIN = int(os.environ.get("COOLDOWN_AFTER_STOP_MIN", "60"))
+#    Пример: equity=1M, лимит 20% → максимум 200 000 ₽ в открытых позициях суммарно.
+SANDBOX_MAX_TOTAL_PCT  = float(os.environ.get("SANDBOX_MAX_TOTAL_PCT",  "20.0"))
 
 # ─── Фильтр времени входа (v0.9.28 — временно́й блок SHORT отключён) ──────
 # LONG:  без маржи → нет ограничений (=0).
@@ -1849,40 +1833,6 @@ def _avoid_round_number_stop(stop: float, price: float, direction: str) -> float
     return stop
 
 
-def _validate_entry(ticker: str, entry: float, last_price: float | None,
-                    tol: float = 0.05) -> float:
-    """
-    v0.9.36: Sanity-чек entry против last_price.
-
-    Кейс 16.04.2026: OZON entry=4368 при реальной цене 548 ₽ (ratio ×8).
-    Причина пока не выяснена (возможно, получили котировку с другого инструмента
-    с тем же тикером, либо где-то в пайплайне умножается на lot/notional).
-    Этот guard защищает от проблемы до выяснения корневой причины.
-
-    Если отклонение >×5 или <×0.2 — возвращаем last_price (с ERROR в лог).
-    Если 5%..×5 — WARNING, но entry не меняем (может быть запаздывание котировки).
-    """
-    if not last_price or last_price <= 0:
-        return entry
-    if not entry or entry <= 0:
-        logger.error("[%s] entry=%r некорректный → using last_price=%s",
-                     ticker, entry, last_price)
-        return last_price
-    ratio = entry / last_price
-    if ratio > 5 or ratio < 0.2:
-        logger.error(
-            "[%s] entry_sanity FAIL: entry=%s last=%s ratio=×%.2f → using last_price",
-            ticker, entry, last_price, ratio,
-        )
-        return last_price
-    if abs(ratio - 1) > tol:
-        logger.warning(
-            "[%s] entry отклонение от last >%d%%: entry=%s last=%s (ratio=×%.2f)",
-            ticker, int(tol * 100), entry, last_price, ratio,
-        )
-    return entry
-
-
 def build_market_signal(
     ticker: str,
     levels: dict,
@@ -1920,9 +1870,6 @@ def build_market_signal(
     # Уточняем цену входа по intraday (точнее daily close)
     if intraday and intraday.get("last"):
         price = intraday["last"]
-
-    # v0.9.36: Sanity-guard против абсурдных entry (кейс OZON 16.04: 4368 vs 548).
-    price = _validate_entry(ticker, price, intraday.get("last") if intraday else None)
 
     # v0.9.4: умное определение направления с учётом MA50-тренда
     direction, signal_type = determine_direction(price, levels)
@@ -3508,99 +3455,48 @@ def _esc(text: str) -> str:
     return _html.escape(str(text), quote=False)
 
 
-_TG_MAX_LEN = 4000   # чуть меньше Telegram-лимита 4096 для безопасности
-
-
-def _tg_chunks(s: str, n: int = _TG_MAX_LEN) -> list[str]:
-    """Режет длинное сообщение на части по \n, не ломая HTML-теги."""
-    if len(s) <= n:
-        return [s]
-    out, buf, cur = [], [], 0
-    for line in s.split("\n"):
-        line_len = len(line) + 1
-        if cur + line_len > n and buf:
-            out.append("\n".join(buf))
-            buf, cur = [line], line_len
-        else:
-            buf.append(line)
-            cur += line_len
-    if buf:
-        out.append("\n".join(buf))
-    return out
-
-
 def tg_send(text: str, parse_mode: str = "HTML") -> bool:
     """Отправляем сообщение в Telegram Bot API. Возвращает True при успехе.
 
     v0.9.10: если HTML-сообщение получает 400 (parse error) — автоматически
     повторяем отправку в plain text, чтобы уведомление не потерялось.
-    v0.9.36: добавлено авто-чанкование сообщений > 4000 символов.
     Полный текст и ответ сервера логируются для диагностики.
     """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-    # v0.9.36: если сообщение длинное — шлём по частям, иначе Telegram ответит 400
-    chunks = _tg_chunks(text)
-    if len(chunks) > 1:
-        logger.info("tg_send: длина %d → %d частей", len(text), len(chunks))
-    all_ok = True
-    for idx, chunk in enumerate(chunks, 1):
-        try:
-            logger.debug("tg_send [%s, part %d/%d, %d chars]: %.300s",
-                         parse_mode, idx, len(chunks), len(chunk), chunk)
-            r = requests.post(url, json={
-                "chat_id":    TELEGRAM_CHAT_ID,
-                "text":       chunk,
-                "parse_mode": parse_mode,
-            }, timeout=10)
-            if r.status_code == 200:
-                continue
-
-            err_body = r.text[:400]
-            print(f"  ⚠️  Telegram error {r.status_code}: {err_body}")
-            logger.warning("tg_send HTTP %d (part %d/%d): %s",
-                           r.status_code, idx, len(chunks), err_body)
-
-            # fallback — если HTML не прошёл (400), шлём без форматирования
-            if r.status_code == 400 and parse_mode == "HTML":
-                import re as _re
-                plain = _re.sub(r"<[^>]+>", "", chunk)   # убираем все HTML-теги
-                logger.warning("tg_send fallback plain-text: %.300s", plain)
-                r2 = requests.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text":    plain,
-                }, timeout=10)
-                if r2.status_code == 200:
-                    print("  ✅ Telegram: повторно отправлено (plain text)")
-                    logger.info("tg_send fallback OK")
-                    continue
-                logger.warning("tg_send fallback HTTP %d: %s",
-                               r2.status_code, r2.text[:200])
-            all_ok = False
-        except Exception as e:
-            print(f"  ⚠️  Telegram недоступен: {e}")
-            logger.warning("tg_send: %s", e)
-            all_ok = False
-    return all_ok
-
-
-def tg_selfcheck() -> bool:
-    """v0.9.36: при старте бота — убедиться, что токен валиден (getMe)."""
-    if not TELEGRAM_TOKEN:
-        logger.warning("tg_selfcheck: токен пустой")
-        return False
     try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe", timeout=5
-        )
-        r.raise_for_status()
-        bot_name = r.json().get("result", {}).get("username", "?")
-        logger.info("tg_selfcheck OK: @%s", bot_name)
-        return True
+        logger.debug("tg_send [%s, %d chars]: %.300s", parse_mode, len(text), text)
+        r = requests.post(url, json={
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       text,
+            "parse_mode": parse_mode,
+        }, timeout=10)
+        if r.status_code == 200:
+            return True
+
+        err_body = r.text[:400]
+        print(f"  ⚠️  Telegram error {r.status_code}: {err_body}")
+        logger.warning("tg_send HTTP %d: %s", r.status_code, err_body)
+
+        # v0.9.10: fallback — если HTML не прошёл (400), шлём без форматирования
+        if r.status_code == 400 and parse_mode == "HTML":
+            import re as _re
+            plain = _re.sub(r"<[^>]+>", "", text)   # убираем все HTML-теги
+            logger.warning("tg_send fallback plain-text: %.300s", plain)
+            r2 = requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text":    plain,
+            }, timeout=10)
+            if r2.status_code == 200:
+                print("  ✅ Telegram: повторно отправлено (plain text)")
+                logger.info("tg_send fallback OK")
+                return True
+            logger.warning("tg_send fallback HTTP %d: %s", r2.status_code, r2.text[:200])
+        return False
     except Exception as e:
-        logger.error("tg_selfcheck FAIL: %s — проверь TG_TOKEN в .env", e)
+        print(f"  ⚠️  Telegram недоступен: {e}")
+        logger.warning("tg_send: %s", e)
         return False
 
 
@@ -4031,63 +3927,22 @@ def log_new_signal(s: dict, signal_id: str) -> None:
     save_trade_log(log)
 
 
-def update_trade_result(signal_id: str, result: str, exit_price: float | None = None,
-                        state: dict | None = None) -> None:
+def update_trade_result(signal_id: str, result: str, exit_price: float | None = None) -> None:
     """
     Обновляет результат сделки в trade_log.json.
     result: "win_t1" | "win_t2" | "loss" | "be" | "open"
-
-    v0.9.36: добавлено поле `executed` (True/False) — отличает реально
-    размещённые sandbox-ордера от «виртуальных» сигналов (risk-block, 50002,
-    нет equity и т.д.). Агрегирующие отчёты должны фильтровать по executed=True
-    для честной статистики. Legacy-записи без поля считаются executed=True.
     """
     log = load_trade_log()
-
-    # Определяем, был ли реально размещён sb_-ордер. Состояние либо передано
-    # из вызывающего кода (быстрее), либо читаем файл (fallback).
-    if state is None:
-        try:
-            state = load_signals_state()
-        except Exception:
-            state = {}
-    sb_entry = state.get(f"sb_{signal_id}") if isinstance(state, dict) else None
-    # Фолбэк для _v2/_v3 — sb_-ордер может быть на базовом ключе без суффикса.
-    if not sb_entry:
-        import re as _re
-        base_key = _re.sub(r"_v\d+$", "", signal_id)
-        if base_key != signal_id:
-            sb_entry = state.get(f"sb_{base_key}") if isinstance(state, dict) else None
-    close_reason = (sb_entry.get("close_reason") or "") if isinstance(sb_entry, dict) else ""
-    executed = bool(
-        isinstance(sb_entry, dict)
-        and sb_entry.get("order_id")
-        and not close_reason.startswith("reconcile")
-    )
-
     updated = False
     for r in log:
         if r["signal_id"] == signal_id:
             r["result"]     = result
             r["exit_price"] = exit_price
             r["exit_time"]  = now_msk().strftime("%Y-%m-%d %H:%M")
-            r["executed"]   = executed  # v0.9.36
-            if isinstance(sb_entry, dict) and sb_entry.get("order_id"):
-                r["sb_order_id"] = sb_entry.get("order_id")
             if exit_price and r.get("entry"):
                 entry = r["entry"]
                 mult  = 1 if r.get("direction") == "LONG" else -1
                 r["pnl_pct"] = round(mult * (exit_price - entry) / entry * 100, 2)
-            if not executed:
-                prev_notes = r.get("notes") or ""
-                marker = "[NOT_EXECUTED: risk-block/50002/no-order]"
-                if marker not in prev_notes:
-                    r["notes"] = (prev_notes + " " + marker).strip()
-                logger.info(
-                    "[trade_log] %s %s %s pnl=%s%% — VIRTUAL (no sb_ order)",
-                    r.get("ticker"), r.get("direction"), result,
-                    f"{r.get('pnl_pct'):+.2f}" if r.get("pnl_pct") is not None else "?",
-                )
             updated = True
             break
     if updated:
@@ -4249,42 +4104,9 @@ def save_h1_watch(watch: dict) -> None:
 
 
 def add_to_h1_watch(watch: dict, ticker: str, direction: str,
-                    levels: dict, anomaly: dict,
-                    state: dict | None = None) -> None:
-    """Добавляет тикер в watch-лист для последующей проверки H1-подтверждения.
-
-    v0.9.36: guard — если по (ticker, direction) уже открыта sb_-позиция,
-    запись не создаётся (AFKS 16.04 добавлялся 11 раз подряд после открытия).
-    """
+                    levels: dict, anomaly: dict) -> None:
+    """Добавляет тикер в watch-лист для последующей проверки H1-подтверждения."""
     key = f"{ticker}_{direction}"
-
-    # v0.9.36: не добавляем, если уже есть активная sb_-позиция
-    if isinstance(state, dict):
-        for sk, sv in state.items():
-            if not (isinstance(sv, dict) and sk.startswith("sb_")):
-                continue
-            if (sv.get("ticker") == ticker
-                    and sv.get("direction") == direction
-                    and not sv.get("closed_at")):
-                logger.debug(
-                    "h1_watch skip: %s %s — уже есть открытая sb_-позиция (%s)",
-                    ticker, direction, sk,
-                )
-                # Дополнительно: если запись в watch была — удалим (гигиена)
-                if key in watch:
-                    del watch[key]
-                return
-
-    # v0.9.36: не добавляем повторно, если запись уже есть и ещё не протухла
-    if key in watch:
-        try:
-            exp = datetime.fromisoformat(watch[key].get("expires_at", ""))
-            if datetime.now(timezone.utc) < exp:
-                logger.debug("h1_watch skip: %s %s — уже в watch-листе", ticker, direction)
-                return
-        except (ValueError, TypeError):
-            pass
-
     now_utc = datetime.now(timezone.utc)
     watch[key] = {
         "ticker":    ticker,
@@ -4948,77 +4770,6 @@ def reconcile_sandbox_state(state: dict) -> None:
         save_signals_state(state)
 
 
-# ─── v0.9.36: helpers для risk-block dedup, cooldown, daily loss brake ──────
-
-def _should_log_risk_block(ticker: str, reason_code: str) -> bool:
-    """
-    Возвращает True, если WARNING по (ticker, reason) не логировался
-    последние _RISK_BLOCK_DEDUP_MIN минут. Параллельно считает подавленные.
-    """
-    key = (ticker, reason_code)
-    now = datetime.now(timezone.utc)
-    prev = _RISK_BLOCK_SEEN.get(key)
-    if prev and (now - prev[0]) < timedelta(minutes=_RISK_BLOCK_DEDUP_MIN):
-        _RISK_BLOCK_SEEN[key] = (prev[0], prev[1] + 1)
-        return False
-    _RISK_BLOCK_SEEN[key] = (now, 0)
-    return True
-
-
-def risk_block_summary() -> str:
-    """Короткий текст для EOD: сколько дубликатов подавили за день."""
-    lines = []
-    for (ticker, reason), (_, supp) in _RISK_BLOCK_SEEN.items():
-        if supp > 0:
-            lines.append(f"  {ticker} {reason}: +{supp} suppressed")
-    return "\n".join(lines) if lines else ""
-
-
-def _is_in_cooldown(state: dict, ticker: str, direction: str,
-                    now_utc: datetime | None = None) -> tuple[bool, str]:
-    """
-    Кулдаун после target2/stop_hit того же тикера в том же направлении.
-    Возвращает (in_cooldown: bool, reason: str).
-    """
-    if now_utc is None:
-        now_utc = datetime.now(timezone.utc)
-    for k, v in state.items():
-        if not isinstance(v, dict) or k.startswith("sb_"):
-            continue
-        if v.get("ticker") != ticker or v.get("direction") != direction:
-            continue
-        hit = v.get("hit")
-        if hit not in ("target2", "stop_hit"):
-            continue
-        hit_at_str = v.get("hit_at") or v.get("closed_at") or ""
-        if not hit_at_str:
-            continue
-        try:
-            hit_at = datetime.fromisoformat(str(hit_at_str).replace("Z", "+00:00"))
-            if hit_at.tzinfo is None:
-                hit_at = hit_at.replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
-            continue
-        delta_min = (now_utc - hit_at).total_seconds() / 60
-        threshold = (COOLDOWN_AFTER_T2_MIN if hit == "target2"
-                     else COOLDOWN_AFTER_STOP_MIN)
-        if 0 <= delta_min < threshold:
-            remaining = int(threshold - delta_min)
-            return True, f"{ticker} {direction} в кулдауне ({remaining}мин) после {hit}"
-    return False, ""
-
-
-def check_daily_loss_brake(sod_equity: float | None, current_equity: float) -> bool:
-    """
-    True — если нужно блокировать новые входы до конца дня.
-    sod_equity=None (не зафиксирован) или <=0 → не блокируем.
-    """
-    if not sod_equity or sod_equity <= 0:
-        return False
-    drawdown_pct = (sod_equity - current_equity) / sod_equity * 100
-    return drawdown_pct >= MAX_DAILY_LOSS_PCT
-
-
 def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
     """
     Размещает бумажные ордера в T-Invest Sandbox для ВЫСОКОЙ и СРЕДНЕЙ уверенности.
@@ -5063,21 +4814,6 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
     except Exception as _e:
         logger.warning("sandbox equity fetch failed: %s", _e)
 
-    # ── v0.9.36: Daily loss brake (circuit breaker на день) ──────────────────
-    # Если внутри дня -MAX_DAILY_LOSS_PCT к SOD equity — блокируем новые входы.
-    try:
-        _sod = float(_equity_day_start) if _equity_day_start else None
-    except (NameError, TypeError, ValueError):
-        _sod = None
-    if check_daily_loss_brake(_sod, equity):
-        if _should_log_risk_block("ALL", "DAILY_LOSS_BRAKE"):
-            dd = (_sod - equity) / _sod * 100 if _sod else 0
-            msg = (f"🛑 Daily loss brake активен: drawdown {dd:.2f}% "
-                   f"≥ {MAX_DAILY_LOSS_PCT}% — новые входы заблокированы")
-            print(f"  {msg}")
-            logger.warning("daily_loss_brake: %s", msg)
-        return 0
-
     # v0.9.20: в понедельник риск вдвое — статистика 2 недель: 31% vs 53% winrate
     _is_monday = (datetime.now(timezone.utc) + timedelta(hours=3)).weekday() == 0  # МСК, не UTC
     _day_risk_mult = MONDAY_RISK_MULT if _is_monday else 1.0
@@ -5120,25 +4856,6 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
         direction = s["direction"]
         entry     = float(s.get("entry") or 0)
         stop      = float(s.get("stop")  or 0)
-
-        # v0.9.36: Sandbox runtime-blacklist (50002 в прошлом запросе).
-        try:
-            from tinvest_data import is_sandbox_available as _sb_avail  # type: ignore
-        except Exception:
-            _sb_avail = None
-        if _sb_avail and not _sb_avail(ticker):
-            if _should_log_risk_block(ticker, "SANDBOX_UNAVAILABLE"):
-                logger.info("sandbox-blacklist skip: %s (ещё в 24ч blacklist)", ticker)
-            continue
-
-        # v0.9.36: Cooldown после target2/stop_hit того же направления.
-        # Кейс 16.04: CBOM target2 → 27 мин → вход по той же цене → stop_hit.
-        in_cd, cd_reason = _is_in_cooldown(state, ticker, direction)
-        if in_cd:
-            if _should_log_risk_block(ticker, f"COOLDOWN_{direction}"):
-                print(f"  ⏸ Cooldown: {cd_reason}")
-                logger.info("cooldown-skip: %s", cd_reason)
-            continue
 
         # v0.9.14: Фильтр позднего входа — физики уже разогнали цену, соотношение изменилось.
         # Сравниваем цену сигнала (entry) с текущей рыночной ценой из _current_intraday.
@@ -5214,10 +4931,8 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                     f"> лимит {SANDBOX_MAX_TICKER_PCT:.0f}% от equity. "
                     f"Уже открыто: {ticker_deployed:,.0f}₽"
                 )
-                # v0.9.36: dedup — один WARNING на пару (ticker, reason) в 30 мин.
-                if _should_log_risk_block(ticker, "TICKER_PCT"):
-                    print(f"  {msg}")
-                    logger.warning("sandbox risk-block TICKER_PCT: %s", msg)
+                print(f"  {msg}")
+                logger.warning("sandbox risk-block TICKER_PCT: %s", msg)
                 continue  # v0.9.19: блок риска — не засоряем Telegram
 
             # Проверка 2: суммарный развёрнутый капитал (все открытые позиции)
@@ -5245,10 +4960,8 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                     f"> лимит {SANDBOX_MAX_TOTAL_PCT:.0f}% от equity. "
                     f"Уже открыто: {total_deployed:,.0f}₽"
                 )
-                # v0.9.36: dedup — один WARNING на пару (ticker, reason) в 30 мин.
-                if _should_log_risk_block(ticker, "TOTAL_PCT"):
-                    print(f"  {msg}")
-                    logger.warning("sandbox risk-block TOTAL_PCT: %s", msg)
+                print(f"  {msg}")
+                logger.warning("sandbox risk-block TOTAL_PCT: %s", msg)
                 continue  # v0.9.19: блок риска — не засоряем Telegram
 
         result = _tinvest.sandbox_place_order(  # type: ignore[union-attr]
@@ -5330,7 +5043,6 @@ def tg_notify_run(
                     trade_key,
                     result_map[reason],
                     s.get("current_price"),
-                    state,   # v0.9.36: передаём state для проверки sb_-брата (executed flag)
                 )
                 # v0.9.10: закрываем sandbox-позицию при стопе или тейке
                 # Только финальные события: stop_hit и target2 (target1 → trailing, ещё открыта)
@@ -5658,7 +5370,7 @@ def run_once(news_only: bool = False):
                     # ⏳ T-Invest доступен, но H1 не подтвердил — добавляем в watch
                     watch_key = f"{ticker}_{_dir_chk}"
                     if watch_key not in h1_watch:
-                        add_to_h1_watch(h1_watch, ticker, _dir_chk, levels, anomaly, state)  # v0.9.36: state для guard
+                        add_to_h1_watch(h1_watch, ticker, _dir_chk, levels, anomaly)
                         print(f"       👀 H1 нет подтверждения — {watch_key} добавлен в watch ({H1_WATCH_HOURS:.0f}ч)")
                         logger.info("%s: ДОБАВЛЕН в h1_watch, направление=%s, ×%.1f, ждём %gч",
                                     ticker, _dir_chk, anomaly.get("ratio", 0), H1_WATCH_HOURS)
@@ -5713,7 +5425,7 @@ def run_once(news_only: bool = False):
                 logger.info("%s → направление изменилось на %s, обновляем watch-ключ", w_key, new_key)
                 del h1_watch[w_key]
                 w_key = new_key
-                add_to_h1_watch(h1_watch, w_ticker, w_dir, w_levels, w_anomaly, state)  # v0.9.36
+                add_to_h1_watch(h1_watch, w_ticker, w_dir, w_levels, w_anomaly)
             # MA50_HARD_FILTER — только для mean_reversion против тренда
             if MA50_HARD_FILTER and _wma50 and w_sig_type == "mean_reversion":
                 if w_dir == "LONG" and _wp < _wma50:
