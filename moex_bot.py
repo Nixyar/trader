@@ -572,7 +572,7 @@ MIN_VOL_RUB_MAP: dict[str, int] = {
 }
 NEWS_STRENGTH_MIN    = 1
 SCAN_INTERVAL_SEC    = 300          # --watch интервал (5 мин)
-BOT_VERSION          = "v0.9.38"    # отображается в заголовке каждого скана и строке "Готово"
+BOT_VERSION          = "v0.9.38.1"  # v0.9.38.1 hotfix: NameError state в run_once add_to_h1_watch
 
 # ─── v0.9.33: Timezone helper ────────────────────────────────────────────────
 # Единая точка получения «сейчас в МСК». Использовать ВЕЗДЕ вместо now_msk().
@@ -5656,6 +5656,9 @@ def run_once(news_only: bool = False):
     if not news_only:
         # v0.9.3: загружаем watch-лист перед сканированием
         h1_watch = load_h1_watch()
+        # v0.9.38.1 hotfix: state нужен для add_to_h1_watch guard (v0.9.36)
+        # — ранее брался из scope sandbox_execute_signals и падал NameError в run_once.
+        state = load_signals_state()
         expired_keys = expire_h1_watch(h1_watch)
         if expired_keys:
             print(f"  ⏰ Watch-лист: убрано {len(expired_keys)} истёкших записей")
