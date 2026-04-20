@@ -572,7 +572,7 @@ MIN_VOL_RUB_MAP: dict[str, int] = {
 }
 NEWS_STRENGTH_MIN    = 1
 SCAN_INTERVAL_SEC    = 300          # --watch интервал (5 мин)
-BOT_VERSION          = "v0.9.36"    # отображается в заголовке каждого скана и строке "Готово"
+BOT_VERSION          = "v0.9.38"    # отображается в заголовке каждого скана и строке "Готово"
 
 # ─── v0.9.33: Timezone helper ────────────────────────────────────────────────
 # Единая точка получения «сейчас в МСК». Использовать ВЕЗДЕ вместо now_msk().
@@ -793,28 +793,27 @@ MONDAY_RISK_MULT = float(os.environ.get("MONDAY_RISK_MULT", "0.5"))  # 0.5 = 50%
 
 # Лотность (акций в 1 лоте) — синхронизирована с tinvest_data.LOT_SIZE
 # Нужна локально для calc_position_size() без зависимости от tinvest модуля
-LOT_SIZES: dict[str, int] = {
-    # v0.9.25: SBER 10→1 (MOEX изменил с 01.08.2025, официальный пресс-релиз moex.com/n92172)
-    # v0.9.25: GAZP 10→1 (подтверждено поиском, 1 акция в лоте с 2025)
-    "GAZP": 1,    "SBER": 1,    "LKOH": 1,    "ROSN": 1,    "NVTK": 1,
-    "GMKN": 1,    "YDEX": 1,    "TATN": 1,    "MGNT": 1,    "PLZL": 1,
-    "SNGS": 100,  "MTSS": 10,   "ALRS": 10,   "VTBR": 10000,"CHMF": 1,
-    "T":    1,    "PHOR": 1,    "AFKS": 100,  "NLMK": 10,
-    "SIBN": 10,   "FLOT": 10,   "RUAL": 100,  "OZON": 1,
-    "MOEX": 10,   "SMLT": 1,    "TRNFP": 1,
-    # v0.9.6 — новые тикеры
-    "ENPG": 1,    "MAGN": 10,   "AFLT": 10,   "PIKK": 1,
-    # v0.9.9 — новые тикеры
-    "AKRN": 1,    "IRAO": 100,
-    # VTBR: 10 000 акций в лоте — подтверждено (апрель 2026, MOEX TQBR)
-    # v0.9.29 — новые тикеры (лотность подтверждена через MOEX/banki.ru, апрель 2026)
-    "X5":   1,    # X5 Retail Group (после редомициляции 2024, 1 акция в лоте)
-    "HEAD": 1,    # МКПАО Хэдхантер (переехал с HHRU, 1 акция, подтверждено MOEX)
-    "POSI": 1,    # Группа Позитив — кибербезопасность, 1 акция
-    "LSRG": 1,    # ЛСР Группа — девелопер, 1 акция
-    # v0.9.34 — новые тикеры
-    "CBOM": 10,   # МКБ — акция дешёвая (~5–10 ₽), 10 акций в лоте (подтверждено MOEX)
-}
+# v0.9.38 — LOT_SIZES унифицирован с tinvest_data.LOT_SIZE
+# (до v0.9.38 были расхождения по 7 тикерам, которые приводили к открытию
+# позиций не того размера. Ревизия через MOEX ISS 17.04.2026).
+# Для sandbox sizing единственный источник правды — tinvest_data.LOT_SIZE.
+# Эта таблица импортируется оттуда же, чтобы не разъезжались.
+try:
+    from tinvest_data import LOT_SIZE as _TINVEST_LOT_SIZE  # type: ignore[import]
+    LOT_SIZES: dict[str, int] = dict(_TINVEST_LOT_SIZE)
+except Exception:
+    # Fallback если tinvest_data недоступен на импорте (циклики / первый запуск).
+    # Значения совпадают с tinvest_data.LOT_SIZE v0.9.38.
+    LOT_SIZES = {
+        "GAZP": 10, "SBER": 1,  "LKOH": 1,  "ROSN": 1,  "NVTK": 1,
+        "GMKN": 10, "YDEX": 1,  "TATN": 1,  "MGNT": 1,  "PLZL": 1,
+        "SNGS": 100,"MTSS": 10, "ALRS": 10, "VTBR": 1,  "CHMF": 1,
+        "T":    1,  "TCSG": 1,  "PHOR": 1,  "AFKS": 100,"NLMK": 10, "SIBN": 1,
+        "FLOT": 10, "RUAL": 10, "OZON": 1,  "MOEX": 10, "SMLT": 1,
+        "TRNFP":1,  "ENPG": 1,  "MAGN": 10, "AFLT": 10, "PIKK": 1,
+        "AKRN": 1,  "IRAO": 100,
+        "X5":   1,  "HEAD": 1,  "POSI": 1,  "LSRG": 1,  "CBOM": 100,
+    }
 
 BASE_URL = "https://iss.moex.com/iss"
 
@@ -5019,6 +5018,89 @@ def check_daily_loss_brake(sod_equity: float | None, current_equity: float) -> b
     return drawdown_pct >= MAX_DAILY_LOSS_PCT
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  v0.9.37 — reconcile trade_log ↔ sandbox.portfolio
+# ═══════════════════════════════════════════════════════════════════════════════
+_RECONCILE_LAST: dict[str, datetime] = {}        # "_run": last_check_utc
+RECONCILE_INTERVAL_MIN = int(os.environ.get("RECONCILE_INTERVAL_MIN", "30"))
+
+
+def reconcile_trade_log_with_sandbox(
+    state: dict,
+    portfolio: dict | None,
+    force: bool = False,
+) -> list[str]:
+    """
+    Сверяет trade_log.json (closed_today) с фактическим sandbox-портфелем.
+
+    Кейс 17.04.2026: SBER_LONG_2026-04-16 помечен `result=win_t1, executed=True`
+    в trade_log, но реально в sandbox позиция ещё открыта (31 лот). Бот
+    виртуально зафиксировал take1 без реального sell-ордера.
+
+    Функция только ЛОГИРУЕТ расхождения (не «чинит» автоматически, чтобы
+    не закрывать реальные позиции случайно). Возвращает список сообщений
+    для EOD-отчёта / ручного анализа. Дальнейший шаг (auto-sell или
+    result=None) — в v0.9.38 после сбора данных.
+
+    Rate-limited: выполняется не чаще RECONCILE_INTERVAL_MIN (default 30 мин).
+    """
+    now = datetime.now(timezone.utc)
+    last = _RECONCILE_LAST.get("_run")
+    if not force and last and (now - last).total_seconds() < RECONCILE_INTERVAL_MIN * 60:
+        return []
+
+    if not portfolio:
+        return []
+
+    open_tickers: set[str] = set()
+    for pos in (portfolio.get("positions") or []):
+        t = pos.get("ticker")
+        q = pos.get("quantity", 0) or 0
+        if t and q and t not in _CASH_TICKERS:
+            open_tickers.add(t)
+
+    # Грузим trade_log
+    try:
+        if not os.path.exists(TRADE_LOG_FILE):
+            _RECONCILE_LAST["_run"] = now
+            return []
+        with open(TRADE_LOG_FILE, "r", encoding="utf-8") as _f:
+            all_trades = __import__("json").load(_f)
+    except Exception as e:
+        logger.warning("reconcile: не удалось прочитать trade_log: %s", e)
+        return []
+
+    today = now.astimezone(timezone(timedelta(hours=3))).strftime("%Y-%m-%d")
+    mismatches: list[str] = []
+
+    for t in all_trades:
+        if not isinstance(t, dict):
+            continue
+        if not t.get("executed", True):
+            continue
+        if not t.get("result"):
+            continue
+        # exit_time / close_time "YYYY-MM-DD ..."
+        et = str(t.get("exit_time") or t.get("close_time") or "")
+        if not et.startswith(today):
+            continue
+        ticker = t.get("ticker")
+        if ticker and ticker in open_tickers:
+            sid = t.get("signal_id", "?")
+            mismatches.append(
+                f"{sid}: trade_log={t.get('result')} @ {t.get('exit_price')}, "
+                f"но в sandbox позиция открыта"
+            )
+
+    if mismatches:
+        for m in mismatches:
+            logger.error("[RECONCILE] %s", m)
+        print(f"  ⚠️ RECONCILE: найдено {len(mismatches)} расхождений trade_log ↔ sandbox")
+
+    _RECONCILE_LAST["_run"] = now
+    return mismatches
+
+
 def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
     """
     Размещает бумажные ордера в T-Invest Sandbox для ВЫСОКОЙ и СРЕДНЕЙ уверенности.
@@ -5055,13 +5137,20 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
 
     # ── Получаем реальный баланс портфеля (equity) ────────────────────────────
     equity: float = 0.0
+    _portfolio_snapshot: dict | None = None
     try:
-        portfolio = _tinvest.get_sandbox_portfolio()  # type: ignore[union-attr]
-        if portfolio and portfolio.get("total_amount_rub", 0) > 0:
-            equity = portfolio["total_amount_rub"]
+        _portfolio_snapshot = _tinvest.get_sandbox_portfolio()  # type: ignore[union-attr]
+        if _portfolio_snapshot and _portfolio_snapshot.get("total_amount_rub", 0) > 0:
+            equity = _portfolio_snapshot["total_amount_rub"]
             logger.debug("sandbox equity: %.0f ₽", equity)
     except Exception as _e:
         logger.warning("sandbox equity fetch failed: %s", _e)
+
+    # ── v0.9.37: reconcile trade_log ↔ sandbox.portfolio (rate-limited) ──────
+    try:
+        reconcile_trade_log_with_sandbox(state, _portfolio_snapshot)
+    except Exception as _re_exc:
+        logger.warning("reconcile: %s", _re_exc)
 
     # ── v0.9.36: Daily loss brake (circuit breaker на день) ──────────────────
     # Если внутри дня -MAX_DAILY_LOSS_PCT к SOD equity — блокируем новые входы.
@@ -6371,6 +6460,17 @@ def main():
     # v0.9.27: Защита от двойного запуска (--watch или разовый скан)
     if not _acquire_pid_lock():
         sys.exit(0)
+
+    # v0.9.38: проверка LOT_SIZE против MOEX ISS (single startup call).
+    # WARN логируется по каждому расхождению. Не блокирующе — бот продолжит работу,
+    # но крупные mismatches могут открыть неправильные позиции (кейс SBER 17.04).
+    try:
+        from tinvest_data import verify_lot_sizes as _verify_lots
+        _mm = _verify_lots(timeout=5.0)
+        if _mm:
+            print(f"  ⚠️  LOT_SIZE mismatches: {len(_mm)} тикер(ов) — см. лог")
+    except Exception as _e:
+        logger.warning("verify_lot_sizes skipped: %s", _e)
 
     try:
         if watch_mode:
