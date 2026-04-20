@@ -48,18 +48,23 @@ TODAY_STR   = _NOW_MSK.strftime("%Y-%m-%d")
 TODAY_LABEL = _NOW_MSK.strftime("%d.%m.%Y")
 
 # Лотность — синхронизирована с moex_bot.py (нужна для расчёта ₽ P&L)
-LOT_SIZES: dict[str, int] = {
-    "GAZP": 1,    "SBER": 1,    "LKOH": 1,    "ROSN": 1,    "NVTK": 1,
-    "GMKN": 1,    "YDEX": 1,    "TATN": 1,    "MGNT": 1,    "PLZL": 1,
-    "SNGS": 100,  "MTSS": 10,   "ALRS": 10,   "VTBR": 10000,"CHMF": 1,
-    "T":    1,    "PHOR": 1,    "AFKS": 100,  "NLMK": 10,
-    "SIBN": 10,   "FLOT": 10,   "RUAL": 100,  "OZON": 1,
-    "MOEX": 10,   "SMLT": 1,    "TRNFP": 1,
-    "ENPG": 1,    "MAGN": 10,   "AFLT": 10,   "PIKK": 1,
-    "AKRN": 1,    "IRAO": 100,
-    "X5":   1,    "HEAD": 1,    "POSI": 1,    "LSRG": 1,
-    "CBOM": 10,
-}
+# v0.9.38 — импортируем унифицированный LOT_SIZE из tinvest_data (единственный
+# источник правды, синхронизирован с MOEX ISS). До v0.9.38 этот словарь
+# расходился с sandbox-sizing на 7 тикерах.
+try:
+    from tinvest_data import LOT_SIZE as _TD_LOT
+    LOT_SIZES: dict[str, int] = dict(_TD_LOT)
+except Exception:
+    LOT_SIZES = {
+        "GAZP": 10, "SBER": 1,  "LKOH": 1,  "ROSN": 1,  "NVTK": 1,
+        "GMKN": 10, "YDEX": 1,  "TATN": 1,  "MGNT": 1,  "PLZL": 1,
+        "SNGS": 100,"MTSS": 10, "ALRS": 10, "VTBR": 1,  "CHMF": 1,
+        "T":    1,  "PHOR": 1,  "AFKS": 100,"NLMK": 10, "SIBN": 1,
+        "FLOT": 10, "RUAL": 10, "OZON": 1,  "MOEX": 10, "SMLT": 1,
+        "TRNFP":1,  "ENPG": 1,  "MAGN": 10, "AFLT": 10, "PIKK": 1,
+        "AKRN": 1,  "IRAO": 100,
+        "X5":   1,  "HEAD": 1,  "POSI": 1,  "LSRG": 1,  "CBOM": 100,
+    }
 
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
@@ -139,33 +144,57 @@ def load_today_log_lines() -> list[str]:
 
 
 # ─── Анализ сделок ────────────────────────────────────────────────────────────
+def _is_executed(t: dict) -> bool:
+    """v0.9.37: real sandbox order placed?
+    Legacy trades без поля executed считаются реальными (True).
+    """
+    return bool(t.get("executed", True))
+
+
 def trades_today(all_trades: list[dict]) -> tuple[list, list]:
-    """Возвращает (открытые_сегодня, закрытые_сегодня)."""
+    """Возвращает (открытые_сегодня, закрытые_сегодня).
+
+    v0.9.37: Обе выборки включают и executed, и phantom — фильтрация по
+    `_is_executed` выполняется выше (в day_pnl_stats / estimate_deposit_delta /
+    build_report), чтобы мы одновременно видели реальные P&L и отдельно
+    считали количество phantom-сигналов.
+    """
     opened = [t for t in all_trades if t.get("date") == TODAY_STR]
     closed = [t for t in all_trades if (t.get("exit_time") or "").startswith(TODAY_STR)]
     return opened, closed
 
 
 def day_pnl_stats(closed: list[dict]) -> dict:
-    pnls = [t["pnl_pct"] for t in closed if t.get("pnl_pct") is not None]
+    """v0.9.37: считает P&L только по реально размещённым сделкам (executed=True).
+    phantom-сигналы (FIGI missing / 50002 / risk-block) возвращаются отдельно
+    в поле `phantom` — это предотвращает фиктивные wins в отчёте (кейс 17.04.2026).
+    """
+    real    = [t for t in closed if _is_executed(t)]
+    phantom = [t for t in closed if not _is_executed(t)]
+
+    pnls = [t["pnl_pct"] for t in real if t.get("pnl_pct") is not None]
     if not pnls:
-        return {
+        base = {
             "count": 0, "wins": 0, "losses": 0, "breakevens": 0,
             "total_pnl": 0.0, "winrate": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
         }
-    wins   = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p < 0]
-    bes    = [p for p in pnls if p == 0]
-    return {
-        "count":      len(pnls),
-        "wins":       len(wins),
-        "losses":     len(losses),
-        "breakevens": len(bes),
-        "total_pnl":  round(sum(pnls), 2),
-        "winrate":    round(len(wins) / len(pnls) * 100, 1),
-        "avg_win":    round(sum(wins)   / len(wins),   2) if wins   else 0.0,
-        "avg_loss":   round(sum(losses) / len(losses), 2) if losses else 0.0,
-    }
+    else:
+        wins   = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
+        bes    = [p for p in pnls if p == 0]
+        base = {
+            "count":      len(pnls),
+            "wins":       len(wins),
+            "losses":     len(losses),
+            "breakevens": len(bes),
+            "total_pnl":  round(sum(pnls), 2),
+            "winrate":    round(len(wins) / len(pnls) * 100, 1),
+            "avg_win":    round(sum(wins)   / len(wins),   2) if wins   else 0.0,
+            "avg_loss":   round(sum(losses) / len(losses), 2) if losses else 0.0,
+        }
+    base["phantom_count"] = len(phantom)
+    base["phantom_tickers"] = sorted({t.get("ticker", "?") for t in phantom})
+    return base
 
 
 def weekly_stats(all_trades: list[dict]) -> dict:
@@ -379,8 +408,13 @@ def estimate_deposit_delta(state: dict, closed_today: list[dict], equity_sod: fl
     has_data  = False
 
     # ── Источник 1: trade_log ─────────────────────────────────────────────────
+    # v0.9.37: phantom-сделки (executed=False) игнорируем в Δ депозита — они
+    # не размещались в sandbox. Без этого фильтра кейс 17.04 дал +3566 ₽
+    # против реальных +58 ₽.
     tickers_in_tradelog: set[str] = set()
     for t in closed_today:
+        if not _is_executed(t):
+            continue
         p      = t.get("pnl_pct")
         ticker = t.get("ticker", "")
         if p is not None:
@@ -448,6 +482,8 @@ def build_report(
     parts.append(f"📊 <b>Отчёт бота за {TODAY_LABEL}</b>")
 
     # ── P&L позиций + Δ депозита ──────────────────────────────────────────────
+    # v0.9.37: в stats["count"] теперь только реально размещённые сделки
+    # (executed=True). Phantom считаются отдельно в stats["phantom_count"].
     if stats["count"]:
         total_pnl = stats["total_pnl"]
         pnl_emoji = "🟢" if total_pnl > 0 else ("🔴" if total_pnl < 0 else "⚪")
@@ -474,6 +510,18 @@ def build_report(
     elif eod_state.get("equity_day_start"):
         equity_sod = float(eod_state["equity_day_start"])
         parts.append(f"\n💼 Депозит SOD: {equity_sod:,.0f} ₽  |  сделок за день: 0")
+
+    # ── Phantom-сигналы (executed=False) ──────────────────────────────────────
+    # Не размещены в sandbox: FIGI missing / 50002 / risk-block / no-order.
+    # В P&L/WR не попадают — но показываем, чтобы было видно на что бот среагировал.
+    phantom_count = stats.get("phantom_count", 0)
+    if phantom_count:
+        phantom_tickers = stats.get("phantom_tickers") or []
+        tickers_str = ", ".join(phantom_tickers) if phantom_tickers else "?"
+        parts.append(
+            f"\n⚠️ <b>Фантомы (не размещены): {phantom_count}</b>  "
+            f"[{tickers_str}]  — проверь FIGI_MAP / sandbox blacklist"
+        )
 
     # ── Открытые сегодня ──────────────────────────────────────────────────────
     if opened:

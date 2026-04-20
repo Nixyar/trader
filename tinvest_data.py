@@ -43,18 +43,22 @@ logger = logging.getLogger(__name__)
 # плюс ~14 risk-blocks потому что подмножество сигналов по нему создавалось.
 # Solution: при первом 50002 помечаем тикер как недоступный на TTL часов.
 # После TTL пробуем снова (вдруг T-Invest добавил инструмент).
-_SANDBOX_UNAVAILABLE: dict[str, datetime] = {}   # ticker -> marked_at_utc
+_SANDBOX_UNAVAILABLE: dict[str, tuple[datetime, str]] = {}   # ticker -> (marked_at_utc, reason)
 SANDBOX_BLACKLIST_TTL_HOURS = 24
 
 
-def mark_sandbox_unavailable(ticker: str) -> None:
-    """Отметить тикер как недоступный в sandbox (50002) на TTL часов."""
+def mark_sandbox_unavailable(ticker: str, reason: str = "50002") -> None:
+    """Отметить тикер как недоступный в sandbox на TTL часов.
+
+    v0.9.36: TTL-blacklist при 50002 от T-Invest.
+    v0.9.37: reason='figi_missing' — когда FIGI_MAP не содержит тикер.
+    """
     if ticker not in _SANDBOX_UNAVAILABLE:
         logger.warning(
-            "[SANDBOX_BLACKLIST] %s → runtime-blacklist на %dч (первый 50002)",
-            ticker, SANDBOX_BLACKLIST_TTL_HOURS,
+            "[SANDBOX_BLACKLIST] %s → runtime-blacklist на %dч (reason=%s)",
+            ticker, SANDBOX_BLACKLIST_TTL_HOURS, reason,
         )
-    _SANDBOX_UNAVAILABLE[ticker] = datetime.now(timezone.utc)
+    _SANDBOX_UNAVAILABLE[ticker] = (datetime.now(timezone.utc), reason)
 
 
 def is_sandbox_available(ticker: str) -> bool:
@@ -62,7 +66,8 @@ def is_sandbox_available(ticker: str) -> bool:
     marked = _SANDBOX_UNAVAILABLE.get(ticker)
     if not marked:
         return True
-    age_h = (datetime.now(timezone.utc) - marked).total_seconds() / 3600
+    marked_at, _reason = marked
+    age_h = (datetime.now(timezone.utc) - marked_at).total_seconds() / 3600
     if age_h >= SANDBOX_BLACKLIST_TTL_HOURS:
         _SANDBOX_UNAVAILABLE.pop(ticker, None)
         logger.info("[SANDBOX_BLACKLIST] %s → TTL истёк (%dч), снимаем блок", ticker, age_h)
@@ -70,9 +75,67 @@ def is_sandbox_available(ticker: str) -> bool:
     return False
 
 
-def list_sandbox_unavailable() -> list[str]:
-    """Для диагностики / EOD-отчёта."""
-    return sorted(_SANDBOX_UNAVAILABLE.keys())
+def list_sandbox_unavailable() -> list[tuple[str, str]]:
+    """Для диагностики / EOD-отчёта. Возвращает [(ticker, reason), ...]."""
+    return sorted((t, r) for t, (_dt, r) in _SANDBOX_UNAVAILABLE.items())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  v0.9.38 — верификация LOT_SIZE против MOEX ISS
+# ══════════════════════════════════════════════════════════════════════════════
+_LOT_VERIFY_DONE: bool = False
+
+def verify_lot_sizes(timeout: float = 5.0, force: bool = False) -> list[tuple[str, int, int]]:
+    """Фетчит LOTSIZE тикеров из MOEX ISS и сверяет с LOT_SIZE.
+
+    Возвращает список (ticker, code_val, moex_val) для mismatched тикеров.
+    Вызывается при старте bot'а. WARN логируется для каждого расхождения.
+    Идемпотентна — при повторном вызове без force=True ничего не делает.
+    """
+    global _LOT_VERIFY_DONE
+    if _LOT_VERIFY_DONE and not force:
+        return []
+
+    import urllib.request as _urlreq
+    import json as _json
+
+    mismatches: list[tuple[str, int, int]] = []
+    checked = 0
+    for ticker, code_val in LOT_SIZE.items():
+        url = (f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/"
+               f"TQBR/securities/{ticker}.json?iss.meta=off")
+        try:
+            raw = _urlreq.urlopen(url, timeout=timeout).read()
+            data = _json.loads(raw)
+            cols = data["securities"]["columns"]
+            rows = data["securities"]["data"]
+            if not rows:
+                continue
+            idx = cols.index("LOTSIZE")
+            moex_val = int(rows[0][idx])
+        except Exception as _e:
+            logger.debug("verify_lot_sizes %s: %s", ticker, _e)
+            continue
+        checked += 1
+        if moex_val != code_val:
+            mismatches.append((ticker, code_val, moex_val))
+            logger.warning(
+                "[LOT_SIZE MISMATCH] %s: код=%d, MOEX ISS=%d — "
+                "обнови tinvest_data.LOT_SIZE (иначе позиция откроется "
+                "неправильного размера!)",
+                ticker, code_val, moex_val,
+            )
+
+    if mismatches:
+        logger.warning(
+            "[LOT_SIZE] проверено %d тикеров, mismatches: %d — требуется правка LOT_SIZE",
+            checked, len(mismatches),
+        )
+    else:
+        logger.info("[LOT_SIZE] проверено %d тикеров, всё синхронно с MOEX ISS ✅", checked)
+
+    _LOT_VERIFY_DONE = True
+    return mismatches
 
 # ── Fallback logging (при запуске tinvest_data.py напрямую) ───────────────────
 # Когда модуль запускается как скрипт (python tinvest_data.py --portfolio),
@@ -259,6 +322,12 @@ FIGI_MAP: dict[str, str] = {
     # Отключён — H1-свечи и цены берутся из MOEX ISS. Уточнить FIGI на tbank.ru/invest/
     # "AKRN":  "BBG004S68BH6",   # ОТКЛЮЧЕНО — неверный инструмент (v0.9.10)
     "IRAO":  "BBG004S68473",   # ИнтерРАО (электроэнергетика, экспорт электроэнергии)
+    # v0.9.37 — CBOM (МКБ) добавлен в watchlist в v0.9.34 без FIGI.
+    # 17.04.2026: 163 WARNING/день. FIGI ориентир по OpenFIGI — BBG000TY1CX1.
+    # ВАЖНО: если T-Invest вернёт 50002 NOT_FOUND на этот FIGI —
+    # закомментируй строку, runtime-blacklist (v0.9.37) сам заблокирует тикер
+    # и EOD-отчёт покажет его отдельной строкой «⚠️ FIGI требует проверки».
+    "CBOM":  "BBG000TY1CX1",   # МКБ — Московский Кредитный Банк (ПРОВЕРИТЬ!)
 }
 
 # Маппинг обратно: FIGI → тикер
@@ -267,17 +336,28 @@ TICKER_BY_FIGI: dict[str, str] = {v: k for k, v in FIGI_MAP.items()}
 # Лотность (число акций в 1 лоте). T-Invest работает в лотах, не акциях.
 # Если лот = 1 акция — можно ставить quantity=1.
 # Обновляй при изменении лотности на бирже.
+#
+# v0.9.38 — РЕВИЗИЯ через MOEX ISS (17.04.2026). Исправлено 7 несоответствий,
+# которые вели к тому, что реальные позиции отличались от задуманного sizing
+# в 10, 100 и даже 10 000 раз (кейс SBER 17.04: 31 лот открылось на 10 004₽
+# вместо планируемых ~100 000₽ из-за LOT_SIZE[SBER]=10 при биржевой 1).
+#
+# При изменении — прогнать `python3 -c "from tinvest_data import verify_lot_sizes;
+# verify_lot_sizes()"` для сверки с MOEX ISS (см. функцию ниже).
 LOT_SIZE: dict[str, int] = {
-    "GAZP": 10, "SBER": 10, "LKOH": 1,  "ROSN": 1,  "NVTK": 1,
-    "GMKN": 1,  "YDEX": 1,  "TATN": 1,  "MGNT": 1,  "PLZL": 1,
-    "SNGS": 1,  "MTSS": 10, "ALRS": 10, "VTBR": 10000,"CHMF": 1,
-    "T":    1,  "TCSG": 1,  "PHOR": 1,  "AFKS": 100,"NLMK": 10, "SIBN": 10,
+    "GAZP": 10, "SBER": 1,  "LKOH": 1,  "ROSN": 1,  "NVTK": 1,       # v0.9.38: SBER 10→1
+    "GMKN": 10, "YDEX": 1,  "TATN": 1,  "MGNT": 1,  "PLZL": 1,       # v0.9.38: GMKN 1→10
+    "SNGS": 100,"MTSS": 10, "ALRS": 10, "VTBR": 1,  "CHMF": 1,       # v0.9.38: SNGS 1→100, VTBR 10000→1
+    "T":    1,  "TCSG": 1,  "PHOR": 1,  "AFKS": 100,"NLMK": 10, "SIBN": 1,  # v0.9.38: SIBN 10→1
     "FLOT": 10, "RUAL": 10, "OZON": 1,  "MOEX": 10, "SMLT": 1,
     "TRNFP":1,
     # v0.9.6
     "ENPG": 1,  "MAGN": 10, "AFLT": 10, "PIKK": 1,
     # v0.9.9
     "AKRN": 1,  "IRAO": 100,
+    # v0.9.38 — добавлены отсутствующие (ранее падали в default=1 при sizing)
+    "X5":   1,  "HEAD": 1,  "POSI": 1,  "LSRG": 1,
+    "CBOM": 100,   # MOEX подтвердил LOTSIZE=100 (не 10 как было в moex_bot.LOT_SIZES)
 }
 
 
@@ -315,11 +395,25 @@ def is_available() -> bool:
     return _detect_sdk() is not None
 
 
+_FIGI_MISSING_LOGGED: set[str] = set()
+
 def get_figi(ticker: str) -> Optional[str]:
-    """Возвращает FIGI для тикера или None если не найден."""
+    """Возвращает FIGI для тикера или None если не найден.
+
+    v0.9.37: WARNING логируется один раз на тикер (до рестарта процесса),
+    плюс автоматический blacklist с reason='figi_missing', чтобы sandbox
+    не пытался размещать ордер и не генерил фантомы в trade_log.
+    """
     figi = FIGI_MAP.get(ticker)
     if not figi:
-        logger.warning(f"FIGI не найден для тикера {ticker}")
+        if ticker not in _FIGI_MISSING_LOGGED:
+            logger.warning(
+                "FIGI не найден для тикера %s — добавь в FIGI_MAP (tinvest_data.py). "
+                "Тикер помечен как sandbox-unavailable до рестарта.",
+                ticker,
+            )
+            _FIGI_MISSING_LOGGED.add(ticker)
+            mark_sandbox_unavailable(ticker, reason="figi_missing")
     return figi
 
 

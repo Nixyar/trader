@@ -22,6 +22,27 @@ bot.log
 trader_export_*.tar.gz
 *.tar.gz
 
+# ─── Локальная документация Claude (живёт только локально, не на сервере) ───
+# Контракт + roadmap — мой рабочий контекст между сессиями
+CHARTER.md
+ROADMAP_v1.0.md
+TICKER_UNIVERSE.md
+STATE_AND_1.0_ROADMAP.md
+# Release notes — тоже локально, сервер не должен тянуть
+CHANGELOG_v09*.md
+# Ежедневные / еженедельные / catchup отчёты
+DAILY_*.md
+WEEKLY_*.md
+CATCHUP_*.md
+v1.0_LAUNCH.md
+# Локальные метрики (v0.9.41+)
+metrics/
+
+# Бэкапы файлов перед релизами (каждый релиз создаёт *.bak_before_v09XX_*)
+*.bak
+*.bak_*
+*.bak_before_*
+
 # macOS
 .DS_Store
 .AppleDouble
