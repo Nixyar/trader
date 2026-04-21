@@ -27,6 +27,7 @@ Cron (UTC VPS):   55 15 * * 1-5 cd /path/to/trader && python daily_report.py
 Env:  TELEGRAM_TOKEN, TELEGRAM_CHAT_ID  (из .env или EnvironmentFile)
 """
 
+import html
 import json
 import os
 import sys
@@ -75,6 +76,12 @@ except Exception:
 
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
+def _strip_html_tags(text: str) -> str:
+    """v0.9.38.3: стриппер для HTML-fallback при 400-ошибке parse_mode."""
+    import re
+    return re.sub(r"</?[a-zA-Z][^>]*>", "", text)
+
+
 def tg_send(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️  TELEGRAM_TOKEN или TELEGRAM_CHAT_ID не заданы — вывод в консоль:\n")
@@ -90,8 +97,21 @@ def tg_send(text: str) -> bool:
         r.raise_for_status()
         return True
     except Exception as e:
-        print(f"Telegram error: {e}")
-        return False
+        print(f"Telegram HTML error: {e}")
+        # v0.9.38.3: fallback — повторяем без parse_mode, чисто plain text.
+        # Причина: если в логах ошибок попался `<` / `>` или битый тег, TG 400.
+        # Мы всё равно хотим доставить отчёт, пусть без форматирования.
+        try:
+            r = requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text":    _strip_html_tags(text),
+            }, timeout=15)
+            r.raise_for_status()
+            print("✅ Отчёт доставлен plain-text fallback (без HTML)")
+            return True
+        except Exception as e2:
+            print(f"Telegram plain fallback также упал: {e2}")
+            return False
 
 
 # ─── v0.9.38.2: отправка архива логов в Telegram ─────────────────────────────
@@ -661,11 +681,14 @@ def build_report(
     parts.append(f"\n{act_line}")
 
     # ── Ошибки (последние 3) ──────────────────────────────────────────────────
+    # v0.9.38.3: html.escape(short) — иначе SDK-сообщения вида
+    # "T-Invest GetCandles NOT_FOUND 50002 → <ticker>" ломают HTML parse_mode
+    # (это и было причиной 21.04 19:00 sendMessage 400).
     if log_stats["errors"]:
         parts.append(f"\n🚨 <b>Последние ошибки:</b>")
         for e in log_stats["errors"][-3:]:
             short = e[20:120] if len(e) > 20 else e
-            parts.append(f"  <code>{short}</code>")
+            parts.append(f"  <code>{html.escape(short)}</code>")
 
     # ── Подвал ────────────────────────────────────────────────────────────────
     # v0.9.38.2: подтягиваем актуальную версию из moex_bot вместо хардкода
