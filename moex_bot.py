@@ -572,7 +572,7 @@ MIN_VOL_RUB_MAP: dict[str, int] = {
 }
 NEWS_STRENGTH_MIN    = 1
 SCAN_INTERVAL_SEC    = 300          # --watch интервал (5 мин)
-BOT_VERSION          = "v0.9.38.1"  # v0.9.38.1 hotfix: NameError state в run_once add_to_h1_watch
+BOT_VERSION          = "v0.9.38.3"  # v0.9.38.3: skip-reason taxonomy + daily_report HTML escape
 
 # ─── v0.9.33: Timezone helper ────────────────────────────────────────────────
 # Единая точка получения «сейчас в МСК». Использовать ВЕЗДЕ вместо now_msk().
@@ -4675,11 +4675,12 @@ def should_send_tg(s: dict, state: dict) -> tuple[bool, str]:
                 suffix += 1
             else:
                 # Кандидат занят открытой позицией — дубль, пропускаем
+                # v0.9.38.3: явный reason для score_log (было "")
                 logger.info(
                     "duplicate_guard: %s %s уже открыт (%s) — пропускаем",
                     s.get("ticker"), s.get("direction"), candidate,
                 )
-                return False, ""
+                return False, "already_open_duplicate"
         s["_state_key"] = key   # сохраняем уникальный ключ в сигнал
 
     if key not in state:
@@ -4696,16 +4697,19 @@ def should_send_tg(s: dict, state: dict) -> tuple[bool, str]:
             if (sval.get("ticker") == ticker
                     and sval.get("direction") == direction
                     and sval.get("hit") is None):
+                # v0.9.38.3: явный reason для score_log
                 logger.info(
                     "duplicate_guard: %s %s уже открыт (%s) — пропускаем",
                     ticker, direction, skey,
                 )
-                return False, ""
+                return False, "already_open_duplicate"
         return True, "new"
 
     # v0.9.19: убрали repeat/upgrade — в Telegram шлём только ВХОД и ЗАКРЫТИЕ.
     # Повторные сигналы засоряли чат и не несли новой информации.
-    return False, ""
+    # v0.9.38.3: явный reason "repeat_after_exit" (позиция по этому ключу закрыта,
+    # повторный сигнал — не открываем заново)
+    return False, "repeat_after_exit"
 
 
 def check_stop_target_hits(synthesized: list[dict], state: dict, intraday: dict) -> list[tuple[dict, str]]:
@@ -5553,8 +5557,12 @@ def tg_notify_run(
                     log_new_signal(s, key)
                 sent += 1
         else:
-            # v0.9.27: логируем реальную причину вместо общего "should_send_tg_false"
-            _skip_reason = reason if reason else "should_send_tg_false"
+            # v0.9.27: логируем реальную причину вместо общего "should_send_tg_false".
+            # v0.9.38.3: теперь should_send_tg всегда возвращает явный reason
+            # (already_open_duplicate / repeat_after_exit / entry_cutoff / "").
+            # Пустая строка означает "скан одинаковой причины, не логируем" (оставляем ""
+            # → превратим в unknown_empty чтобы было видно что это необычный случай).
+            _skip_reason = reason if reason else "unknown_empty_reason"
             append_score_log({**_score_base, "action": "skipped", "reason": _skip_reason})
             # v0.9.27: TG-уведомление при сильном сигнале, заблокированном по времени (≥8 очков)
             if _skip_reason == "entry_cutoff" and (_score_base.get("score") or 0) >= 8:
