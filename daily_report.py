@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-MOEX Bot — Ежедневный отчёт  v0.9.35
+MOEX Bot — Ежедневный отчёт  v0.9.38.2
 ══════════════════════════════════════
+Что нового (v0.9.38.2):
+  + Отправка архива *_auto.tar.gz в Telegram прямо из daily_report.py
+    (раньше это делал отдельный скрипт на VPS, не в git — затирался git pull)
+  + Cleanup старых архивов: keep=7, остальные удаляются
+  + Футер подвала теперь берёт версию из moex_bot.BOT_VERSION
+    (раньше был хардкод v0.9.35 → показывал неверную версию после рестартов)
+
 Что нового (v0.9.35):
   + Δ депозита в ₽ (реальное изменение капитала, не % от входа)
   + P&L позиций переименован — без путаницы с P&L портфеля
@@ -85,6 +92,89 @@ def tg_send(text: str) -> bool:
     except Exception as e:
         print(f"Telegram error: {e}")
         return False
+
+
+# ─── v0.9.38.2: отправка архива логов в Telegram ─────────────────────────────
+# Раньше это делал отдельный скрипт на VPS, который не был в git
+# и был затёрт при деплое v0.9.38. Теперь — часть daily_report.py.
+def _build_daily_archive() -> Path | None:
+    """
+    Запускает export_logs.sh (если есть) либо собирает архив сам.
+    Возвращает путь к *_auto.tar.gz или None при ошибке.
+    """
+    import subprocess, shutil, tarfile
+
+    date_str = _NOW_MSK.strftime("%Y-%m-%d")
+    archive  = _DIR / f"trader_export_{date_str}_auto.tar.gz"
+
+    # Файлы-кандидаты — копируем в архив если существуют
+    candidates = [
+        _DIR / "trade_log.json",
+        _DIR / "signals_score_log.jsonl",
+        _DIR / "news_memory.json",
+        _DIR / "signals_state.json",
+        _DIR / "cbr_rate_cache.json",
+        _DIR / "bot.log",
+        _DIR / "h1_watch.json",
+    ]
+    existing = [p for p in candidates if p.exists()]
+    if not existing:
+        print("❌ _build_daily_archive: нет файлов для упаковки")
+        return None
+
+    try:
+        with tarfile.open(archive, "w:gz") as tar:
+            for p in existing:
+                tar.add(p, arcname=p.name)
+            if (_DIR / "logs").is_dir():
+                tar.add(_DIR / "logs", arcname="logs")
+        return archive
+    except Exception as e:
+        print(f"❌ _build_daily_archive: {e}")
+        return None
+
+
+def tg_send_document(path: Path, caption: str = "") -> bool:
+    """Отправка файла в Telegram через sendDocument."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️  нет TG токена — архив не отправлен")
+        return False
+    if not path.exists():
+        print(f"❌ tg_send_document: файл не найден: {path}")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(
+                url,
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "caption": caption[:1000],  # TG лимит caption = 1024
+                },
+                files={"document": (path.name, f, "application/gzip")},
+                timeout=120,
+            )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Telegram sendDocument error: {e}")
+        return False
+
+
+def _cleanup_old_archives(keep: int = 7) -> None:
+    """Удаляет старые trader_export_*_auto.tar.gz, оставляя последние keep."""
+    import glob
+    files = sorted(
+        glob.glob(str(_DIR / "trader_export_*_auto.tar.gz")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    for old in files[keep:]:
+        try:
+            os.remove(old)
+        except Exception:
+            pass
 
 
 # ─── Загрузка данных ──────────────────────────────────────────────────────────
@@ -578,8 +668,14 @@ def build_report(
             parts.append(f"  <code>{short}</code>")
 
     # ── Подвал ────────────────────────────────────────────────────────────────
+    # v0.9.38.2: подтягиваем актуальную версию из moex_bot вместо хардкода
+    try:
+        from moex_bot import BOT_VERSION as _BV
+        _ver = _BV
+    except Exception:
+        _ver = "v?.?.?"
     parts.append(
-        f"\n⏰ {_NOW_MSK.strftime('%H:%M:%S')} МСК  |  MOEX Bot v0.9.35"
+        f"\n⏰ {_NOW_MSK.strftime('%H:%M:%S')} МСК  |  MOEX Bot {_ver}"
     )
 
     return "\n".join(parts)
@@ -623,6 +719,23 @@ def main() -> int:
         print("✅ Отчёт отправлен в Telegram")
     else:
         print("📄 Отчёт выведен в консоль (Telegram недоступен или токен не задан)")
+
+    # ── v0.9.38.2: отправка архива логов ──────────────────────────────────────
+    try:
+        archive = _build_daily_archive()
+        if archive and archive.exists():
+            size_kb = archive.stat().st_size / 1024
+            caption = f"📦 Архив логов трейдера за {TODAY_LABEL}"
+            if tg_send_document(archive, caption=caption):
+                print(f"✅ Архив отправлен: {archive.name} ({size_kb:.1f} КБ)")
+            else:
+                print(f"⚠️  Архив создан, но не отправлен: {archive}")
+            _cleanup_old_archives(keep=7)
+        else:
+            print("⚠️  Архив логов не создан (см. предыдущие warnings)")
+    except Exception as _e:
+        print(f"⚠️  Ошибка при создании/отправке архива: {_e}")
+
     return 0
 
 
