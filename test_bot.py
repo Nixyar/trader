@@ -7,7 +7,9 @@ feedparser мокируется через sys.modules (не нужен для u
 
 import sys
 import os
+import glob
 import unittest
+import tempfile
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timedelta, timezone
 from statistics import mean
@@ -162,6 +164,8 @@ class TestBuildSignal(unittest.TestCase):
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-dummy-key")
 
 import moex_bot as mb
+import tinvest_data as td
+import daily_report as dr
 
 
 class TestCalcRSI(unittest.TestCase):
@@ -499,6 +503,100 @@ class TestSynthesizeSignals(unittest.TestCase):
                                 f"Score слишком низкий: {r.get('confidence_score')}")
         self.assertIn(r.get("confidence"), ["🔥🔥 ОТЛИЧНАЯ", "🔥 ВЫСОКАЯ", "🟡 СРЕДНЯЯ"])
 
+    def test_weekly_hard_block_skips_only_one_ticker(self):
+        market = [
+            self._market_signal("NVTK", "LONG"),
+            self._market_signal("SBER", "LONG"),
+        ]
+        with patch.object(mb, "get_weekly_trend") as mock_weekly, \
+             patch.object(mb, "load_news_memory", return_value={}), \
+             patch.object(mb, "get_upcoming_event", return_value=None), \
+             patch.object(mb, "get_session_quality", return_value=(0, "test session")):
+            mock_weekly.side_effect = [
+                {"trend": "bear", "weekly_change": -4.2, "ma5_weekly": 100.0, "last_close": 95.8, "candles_count": 5},
+                {"trend": "flat", "weekly_change": 0.0, "ma5_weekly": 100.0, "last_close": 100.0, "candles_count": 5},
+            ]
+            result = mb.synthesize_signals(market, [])
+
+        self.assertEqual(len(result), 1, f"Ожидали, что батч не обнулится: {result}")
+        self.assertEqual(result[0]["ticker"], "SBER")
+
+
+class TestInstrumentCapabilities(unittest.TestCase):
+
+    def test_mark_sandbox_unavailable_creates_capability_entry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            caps_file = os.path.join(tmpdir, "instrument_capabilities.json")
+            blacklist_file = os.path.join(tmpdir, "sandbox_blacklist.json")
+            with patch.object(td, "_CAPABILITIES_FILE", td._pathlib.Path(caps_file)), \
+                 patch.object(td, "_BLACKLIST_FILE", td._pathlib.Path(blacklist_file)):
+                td._INSTRUMENT_CAPABILITIES.clear()
+                td._SANDBOX_UNAVAILABLE.clear()
+
+                td.mark_sandbox_unavailable("OZON", reason="50002")
+
+                caps = td.get_instrument_capabilities("OZON")
+                self.assertFalse(caps["sandbox_order"])
+                degraded = td.list_degraded_instruments()
+                self.assertEqual(degraded[0]["ticker"], "OZON")
+                self.assertIn("sandbox_order", degraded[0]["capabilities"])
+                self.assertTrue(os.path.exists(caps_file))
+
+    def test_capability_ttl_expiry_restores_availability(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            caps_file = os.path.join(tmpdir, "instrument_capabilities.json")
+            with patch.object(td, "_CAPABILITIES_FILE", td._pathlib.Path(caps_file)):
+                td._INSTRUMENT_CAPABILITIES.clear()
+                td.mark_instrument_issue("CBOM", "has_figi", "figi_missing", ttl_hours=1)
+                self.assertFalse(td.instrument_capability_available("CBOM", "has_figi"))
+
+                expired_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+                td._INSTRUMENT_CAPABILITIES["CBOM"]["has_figi"]["expires_at"] = expired_at
+
+                self.assertTrue(td.instrument_capability_available("CBOM", "has_figi"))
+
+
+class TestDailyReportDiagnostics(unittest.TestCase):
+
+    def _market_signal(self, ticker="SBER", direction="LONG",
+                       rsi=45.0, vol_ratio=3.0, usdrub_confirm=True):
+        return {
+            "ticker": ticker, "direction": direction,
+            "entry": 300.0, "stop": 290.0,
+            "take1": 310.0, "take2": 320.0, "take3": 350.0,
+            "rr_ratio": 2.0, "volume_ratio": vol_ratio,
+            "rsi": rsi, "ma20": 295.0,
+            "usdrub_confirm": usdrub_confirm,
+            "usdrub_note": "", "imoex_note": "",
+        }
+
+    def _news_item(self, direction="LONG", tickers=None, status=""):
+        from email.utils import format_datetime
+        if tickers is None:
+            tickers = ["SBER"]
+        published = format_datetime(datetime.now(timezone.utc) - timedelta(hours=1))
+        return mb.NewsItem(
+            title     = "Сбербанк отчитался о рекордной прибыли",
+            source    = "test",
+            published = published,
+            url       = "http://example.com",
+            tickers   = tickers,
+            direction = direction,
+            strength  = 3,
+            event_type= "EARNINGS",
+            status    = status,
+        )
+
+    def test_summarize_decisions_counts_reasons(self):
+        summary = dr.summarize_decisions([
+            {"action": "skipped", "reason": "sandbox_unavailable"},
+            {"action": "skipped", "reason": "sandbox_unavailable"},
+            {"action": "blocked", "reason": "weekly_hard_block"},
+        ])
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["actions"]["skipped"], 2)
+        self.assertEqual(summary["reasons"]["sandbox_unavailable"], 2)
+
     def test_no_market_signals_returns_empty(self):
         news = [self._news_item("LONG")]
         result = mb.synthesize_signals([], news)
@@ -524,6 +622,31 @@ class TestSynthesizeSignals(unittest.TestCase):
                 result_no_news[0].get("confidence"),
                 result_with_lkoh[0].get("confidence")
             )
+
+
+class TestStateResilience(unittest.TestCase):
+
+    def test_load_signals_state_recovers_corrupt_json_with_backup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bad_path = os.path.join(tmpdir, "signals_state.json")
+            with open(bad_path, "w", encoding="utf-8") as f:
+                f.write("{broken json")
+
+            with patch.object(mb, "SIGNALS_STATE_FILE", bad_path):
+                state = mb.load_signals_state()
+
+            self.assertEqual(state, {})
+            backups = glob.glob(bad_path + ".*.corrupt")
+            self.assertTrue(backups, "Ожидали backup повреждённого state-файла")
+
+    def test_save_and_load_trade_log_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = os.path.join(tmpdir, "trade_log.json")
+            payload = [{"signal_id": "SBER_LONG_2026-04-22", "ticker": "SBER"}]
+            with patch.object(mb, "TRADE_LOG_FILE", log_path):
+                mb.save_trade_log(payload)
+                loaded = mb.load_trade_log()
+            self.assertEqual(loaded, payload)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

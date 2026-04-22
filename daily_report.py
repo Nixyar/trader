@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MOEX Bot — Ежедневный отчёт  v0.9.38.2
+MOEX Bot — Ежедневный отчёт  v0.9.38.3
 ══════════════════════════════════════
 Что нового (v0.9.38.2):
   + Отправка архива *_auto.tar.gz в Telegram прямо из daily_report.py
@@ -48,6 +48,7 @@ STATE_FILE     = _DIR / "signals_state.json"
 EOD_FILE       = _DIR / "eod_state.json"
 LOG_DIR        = _DIR / "logs"
 LOG_FILE       = _DIR / "bot.log"   # fallback если logs/ нет
+DECISION_LOG_FILE = _DIR / "signals_decision_log.jsonl"
 
 # МСК — фиксируем один раз на весь запуск (без скачков при переходе суток)
 _MSK_TZ     = pytz.timezone("Europe/Moscow")
@@ -62,6 +63,7 @@ TODAY_LABEL = _NOW_MSK.strftime("%d.%m.%Y")
 try:
     from tinvest_data import LOT_SIZE as _TD_LOT
     LOT_SIZES: dict[str, int] = dict(_TD_LOT)
+    from tinvest_data import list_degraded_instruments as _list_degraded_instruments
 except Exception:
     LOT_SIZES = {
         "GAZP": 10, "SBER": 1,  "LKOH": 1,  "ROSN": 1,  "NVTK": 1,
@@ -73,6 +75,8 @@ except Exception:
         "AKRN": 1,  "IRAO": 100,
         "X5":   1,  "HEAD": 1,  "POSI": 1,  "LSRG": 1,  "CBOM": 100,
     }
+    def _list_degraded_instruments() -> list[dict]:
+        return []
 
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
@@ -131,9 +135,13 @@ def _build_daily_archive() -> Path | None:
     candidates = [
         _DIR / "trade_log.json",
         _DIR / "signals_score_log.jsonl",
+        _DIR / "signals_decision_log.jsonl",
         _DIR / "news_memory.json",
         _DIR / "signals_state.json",
         _DIR / "cbr_rate_cache.json",
+        _DIR / "instrument_capabilities.json",
+        _DIR / "sandbox_blacklist.json",
+        _DIR / "event_calendar.json",
         _DIR / "bot.log",
         _DIR / "h1_watch.json",
     ]
@@ -251,6 +259,63 @@ def load_today_log_lines() -> list[str]:
         except Exception:
             pass
     return []
+
+
+def load_today_decision_entries() -> list[dict]:
+    if not DECISION_LOG_FILE.exists():
+        return []
+    entries: list[dict] = []
+    try:
+        with open(DECISION_LOG_FILE, encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    item = json.loads(raw)
+                except Exception:
+                    continue
+                ts = str(item.get("ts") or "")
+                if ts.startswith(TODAY_STR):
+                    entries.append(item)
+    except Exception:
+        return []
+    return entries
+
+
+def summarize_decisions(entries: list[dict]) -> dict:
+    summary = {
+        "total": len(entries),
+        "actions": {},
+        "reasons": {},
+    }
+    for item in entries:
+        action = str(item.get("action") or "unknown")
+        reason = str(item.get("reason") or "unknown")
+        summary["actions"][action] = summary["actions"].get(action, 0) + 1
+        summary["reasons"][reason] = summary["reasons"].get(reason, 0) + 1
+    return summary
+
+
+def summarize_capabilities() -> dict:
+    degraded = _list_degraded_instruments()
+    capability_counts: dict[str, int] = {}
+    rows: list[str] = []
+    for item in degraded:
+        ticker = item.get("ticker", "?")
+        caps = item.get("capabilities", {}) or {}
+        labels: list[str] = []
+        for capability, meta in caps.items():
+            capability_counts[capability] = capability_counts.get(capability, 0) + 1
+            reason = str((meta or {}).get("reason") or "")
+            labels.append(f"{capability}:{reason}" if reason else capability)
+        if labels:
+            rows.append(f"{ticker} ({', '.join(labels[:3])})")
+    return {
+        "count": len(degraded),
+        "rows": rows[:6],
+        "capability_counts": capability_counts,
+    }
 
 
 # ─── Анализ сделок ────────────────────────────────────────────────────────────
@@ -583,6 +648,8 @@ def build_report(
     stats:      dict,
     state:      dict,
     log_stats:  dict,
+    decision_stats: dict,
+    capability_stats: dict,
     eod_state:  dict,
     week:       dict,
 ) -> str:
@@ -690,13 +757,40 @@ def build_report(
             short = e[20:120] if len(e) > 20 else e
             parts.append(f"  <code>{html.escape(short)}</code>")
 
+    if capability_stats.get("count"):
+        rows = capability_stats.get("rows") or []
+        parts.append(f"\n🧩 <b>Universe health:</b> degraded инструментов {capability_stats['count']}")
+        for row in rows:
+            parts.append(f"  • {html.escape(row)}")
+        cap_counts = capability_stats.get("capability_counts") or {}
+        if cap_counts:
+            top_caps = sorted(cap_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+            parts.append("  " + "  ".join(f"{name}={count}" for name, count in top_caps))
+
+    if decision_stats.get("total"):
+        top_reasons = sorted(
+            (decision_stats.get("reasons") or {}).items(),
+            key=lambda kv: (-kv[1], kv[0]),
+        )[:5]
+        if top_reasons:
+            parts.append(f"\n🧠 <b>Причины решений:</b>")
+            parts.append("  " + "  ".join(f"{reason}={count}" for reason, count in top_reasons))
+
     # ── Подвал ────────────────────────────────────────────────────────────────
-    # v0.9.38.2: подтягиваем актуальную версию из moex_bot вместо хардкода
+    # v0.9.38.3: читаем BOT_VERSION grep'ом из файла — импорт moex_bot падает
+    # из-за тяжёлых module-level side-effects (logging, asyncio, os.environ).
+    _ver = "v?.?.?"
     try:
-        from moex_bot import BOT_VERSION as _BV
-        _ver = _BV
+        import re as _re
+        _bot_file = Path(__file__).parent / "moex_bot.py"
+        if _bot_file.exists():
+            for _line in _bot_file.read_text(encoding="utf-8").splitlines():
+                _m = _re.match(r'^BOT_VERSION\s*=\s*"([^"]+)"', _line)
+                if _m:
+                    _ver = _m.group(1)
+                    break
     except Exception:
-        _ver = "v?.?.?"
+        pass
     parts.append(
         f"\n⏰ {_NOW_MSK.strftime('%H:%M:%S')} МСК  |  MOEX Bot {_ver}"
     )
@@ -723,6 +817,9 @@ def main() -> int:
     eod_state          = load_eod_state()
     log_lines_raw      = load_today_log_lines()
     log_stats          = parse_log_stats(log_lines_raw)
+    decision_entries   = load_today_decision_entries()
+    decision_stats     = summarize_decisions(decision_entries)
+    capability_stats   = summarize_capabilities()
     opened, closed     = trades_today(all_trades)
     stats              = day_pnl_stats(closed)
     week               = weekly_stats(all_trades)
@@ -733,6 +830,8 @@ def main() -> int:
         stats     = stats,
         state     = state,
         log_stats = log_stats,
+        decision_stats = decision_stats,
+        capability_stats = capability_stats,
         eod_state = eod_state,
         week      = week,
     )

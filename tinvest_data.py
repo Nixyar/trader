@@ -38,27 +38,191 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ─── v0.9.36: Runtime blacklist для тикеров с 50002 (NOT_FOUND) ──────────────
-# Кейс 16.04.2026: OZON получал 50002 от T-Invest sandbox 3 раза за день,
-# плюс ~14 risk-blocks потому что подмножество сигналов по нему создавалось.
-# Solution: при первом 50002 помечаем тикер как недоступный на TTL часов.
-# После TTL пробуем снова (вдруг T-Invest добавил инструмент).
+# ─── v0.9.38.3: Persistent sandbox blacklist для тикеров с 50002 ──────────────
+# Кейс 16.04.2026: OZON получал 50002 от T-Invest sandbox 3 раза за день.
+# v0.9.36: runtime-blacklist (in-memory, TTL 24ч).
+# v0.9.38.3: persistent-blacklist (JSON-файл) — переживает рестарты бота.
+#   При 50002 на ордер TTL = 168ч (7 дней): инструмент, скорее всего, просто
+#   не доступен в sandbox T-Invest и завтра снова вернёт 50002.
+#   При figi_missing TTL = 24ч: FIGI мог появиться.
+import json as _json
+import pathlib as _pathlib
+
 _SANDBOX_UNAVAILABLE: dict[str, tuple[datetime, str]] = {}   # ticker -> (marked_at_utc, reason)
-SANDBOX_BLACKLIST_TTL_HOURS = 24
+SANDBOX_BLACKLIST_TTL_HOURS         = 24     # для figi_missing и прочих временных причин
+SANDBOX_BLACKLIST_TTL_HOURS_50002   = 168    # 7 дней для инструментов с 50002 (не в sandbox)
+_BLACKLIST_FILE: _pathlib.Path = _pathlib.Path(__file__).parent / "sandbox_blacklist.json"
+_CAPABILITIES_FILE: _pathlib.Path = _pathlib.Path(__file__).parent / "instrument_capabilities.json"
+_INSTRUMENT_CAPABILITIES: dict[str, dict[str, dict[str, object]]] = {}
+_DEFAULT_CAPABILITIES = {
+    "has_figi": True,
+    "h1_tinvest": True,
+    "orderbook": True,
+    "sandbox_order": True,
+}
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _save_capabilities() -> None:
+    try:
+        _CAPABILITIES_FILE.write_text(
+            _json.dumps(_INSTRUMENT_CAPABILITIES, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as _e:
+        logger.debug("instrument capabilities save error: %s", _e)
+
+
+def _load_capabilities() -> None:
+    if not _CAPABILITIES_FILE.exists():
+        return
+    try:
+        data = _json.loads(_CAPABILITIES_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            _INSTRUMENT_CAPABILITIES.update(data)
+    except Exception as _e:
+        logger.debug("instrument capabilities load error: %s", _e)
+
+
+def _capability_ttl_hours(capability: str, reason: str) -> int:
+    if capability == "has_figi":
+        return 24
+    if capability in ("h1_tinvest", "orderbook") and reason in ("50002", "known_fallback"):
+        return 168
+    if capability == "sandbox_order":
+        if reason == "50002":
+            return SANDBOX_BLACKLIST_TTL_HOURS_50002
+        if reason == "30079":
+            return 12
+    return 24
+
+
+def mark_instrument_issue(
+    ticker: str,
+    capability: str,
+    reason: str,
+    *,
+    ttl_hours: Optional[int] = None,
+    detail: str = "",
+) -> None:
+    ttl = ttl_hours if ttl_hours is not None else _capability_ttl_hours(capability, reason)
+    now = _now_utc()
+    expires_at = now + timedelta(hours=ttl)
+    caps = _INSTRUMENT_CAPABILITIES.setdefault(ticker, {})
+    prev = caps.get(capability) or {}
+    caps[capability] = {
+        "available": False,
+        "reason": reason,
+        "detail": detail,
+        "ttl_hours": ttl,
+        "updated_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+        "seen_count": int(prev.get("seen_count", 0)) + 1,
+    }
+    _save_capabilities()
+
+
+def _cleanup_capability_entry(ticker: str, capability: str) -> None:
+    caps = _INSTRUMENT_CAPABILITIES.get(ticker)
+    if not caps or capability not in caps:
+        return
+    caps.pop(capability, None)
+    if not caps:
+        _INSTRUMENT_CAPABILITIES.pop(ticker, None)
+    _save_capabilities()
+
+
+def instrument_capability_available(ticker: str, capability: str) -> bool:
+    entry = (_INSTRUMENT_CAPABILITIES.get(ticker) or {}).get(capability)
+    if not entry:
+        return True
+    expires_at = entry.get("expires_at")
+    if isinstance(expires_at, str):
+        try:
+            if _now_utc() >= datetime.fromisoformat(expires_at):
+                _cleanup_capability_entry(ticker, capability)
+                return True
+        except Exception:
+            _cleanup_capability_entry(ticker, capability)
+            return True
+    return bool(entry.get("available", False))
+
+
+def get_instrument_capabilities(ticker: str) -> dict:
+    caps = dict(_DEFAULT_CAPABILITIES)
+    active = _INSTRUMENT_CAPABILITIES.get(ticker) or {}
+    for capability in _DEFAULT_CAPABILITIES:
+        caps[capability] = instrument_capability_available(ticker, capability)
+    caps["degraded"] = {k: v for k, v in active.items() if not instrument_capability_available(ticker, k)}
+    return caps
+
+
+def list_degraded_instruments() -> list[dict]:
+    result: list[dict] = []
+    for ticker in sorted(list(_INSTRUMENT_CAPABILITIES)):
+        caps = _INSTRUMENT_CAPABILITIES.get(ticker) or {}
+        active_caps: dict[str, dict[str, object]] = {}
+        for capability, meta in list(caps.items()):
+            if instrument_capability_available(ticker, capability):
+                continue
+            active_caps[capability] = meta
+        if active_caps:
+            result.append({"ticker": ticker, "capabilities": active_caps})
+    return result
+
+
+def _save_blacklist() -> None:
+    """Сохраняем blacklist в файл (переживает рестарты)."""
+    try:
+        data = {
+            ticker: [marked_at.isoformat(), reason]
+            for ticker, (marked_at, reason) in _SANDBOX_UNAVAILABLE.items()
+        }
+        _BLACKLIST_FILE.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as _e:
+        logger.debug("sandbox blacklist save error: %s", _e)
+
+
+def _load_blacklist() -> None:
+    """Загружаем blacklist из файла при старте модуля."""
+    if not _BLACKLIST_FILE.exists():
+        return
+    try:
+        data = _json.loads(_BLACKLIST_FILE.read_text(encoding="utf-8"))
+        for ticker, (ts_str, reason) in data.items():
+            marked_at = datetime.fromisoformat(ts_str)
+            _SANDBOX_UNAVAILABLE[ticker] = (marked_at, reason)
+        if _SANDBOX_UNAVAILABLE:
+            logger.debug(
+                "sandbox blacklist loaded: %d тикеров из %s",
+                len(_SANDBOX_UNAVAILABLE), _BLACKLIST_FILE.name,
+            )
+    except Exception as _e:
+        logger.debug("sandbox blacklist load error: %s", _e)
+
+_load_blacklist()  # загружаем сразу при импорте модуля
+_load_capabilities()
 
 
 def mark_sandbox_unavailable(ticker: str, reason: str = "50002") -> None:
-    """Отметить тикер как недоступный в sandbox на TTL часов.
+    """Отметить тикер как недоступный в sandbox.
 
     v0.9.36: TTL-blacklist при 50002 от T-Invest.
     v0.9.37: reason='figi_missing' — когда FIGI_MAP не содержит тикер.
+    v0.9.38.3: persistent — сохраняется в файл, переживает рестарты.
     """
+    ttl = SANDBOX_BLACKLIST_TTL_HOURS_50002 if reason == "50002" else SANDBOX_BLACKLIST_TTL_HOURS
     if ticker not in _SANDBOX_UNAVAILABLE:
         logger.warning(
-            "[SANDBOX_BLACKLIST] %s → runtime-blacklist на %dч (reason=%s)",
-            ticker, SANDBOX_BLACKLIST_TTL_HOURS, reason,
+            "[SANDBOX_BLACKLIST] %s → blacklist на %dч (reason=%s) [persistent]",
+            ticker, ttl, reason,
         )
-    _SANDBOX_UNAVAILABLE[ticker] = (datetime.now(timezone.utc), reason)
+    _SANDBOX_UNAVAILABLE[ticker] = (_now_utc(), reason)
+    mark_instrument_issue(ticker, "sandbox_order", reason, ttl_hours=ttl, detail="sandbox blacklist")
+    _save_blacklist()
 
 
 def is_sandbox_available(ticker: str) -> bool:
@@ -66,10 +230,12 @@ def is_sandbox_available(ticker: str) -> bool:
     marked = _SANDBOX_UNAVAILABLE.get(ticker)
     if not marked:
         return True
-    marked_at, _reason = marked
-    age_h = (datetime.now(timezone.utc) - marked_at).total_seconds() / 3600
-    if age_h >= SANDBOX_BLACKLIST_TTL_HOURS:
+    marked_at, reason = marked
+    ttl = SANDBOX_BLACKLIST_TTL_HOURS_50002 if reason == "50002" else SANDBOX_BLACKLIST_TTL_HOURS
+    age_h = (_now_utc() - marked_at).total_seconds() / 3600
+    if age_h >= ttl:
         _SANDBOX_UNAVAILABLE.pop(ticker, None)
+        _save_blacklist()
         logger.info("[SANDBOX_BLACKLIST] %s → TTL истёк (%dч), снимаем блок", ticker, age_h)
         return True
     return False
@@ -414,6 +580,7 @@ def get_figi(ticker: str) -> Optional[str]:
             )
             _FIGI_MISSING_LOGGED.add(ticker)
             mark_sandbox_unavailable(ticker, reason="figi_missing")
+            mark_instrument_issue(ticker, "has_figi", "figi_missing", detail="FIGI_MAP lookup failed")
     return figi
 
 
@@ -495,6 +662,10 @@ def get_orderbook(ticker: str, depth: int = 10) -> Optional[dict]:
     if not is_available():
         return None
 
+    if not instrument_capability_available(ticker, "orderbook"):
+        logger.debug("get_orderbook(%s): capability disabled → skip", ticker)
+        return None
+
     figi = get_figi(ticker)
     if not figi:
         logger.debug(f"get_orderbook({ticker}): FIGI не найден")
@@ -532,7 +703,17 @@ def get_orderbook(ticker: str, depth: int = 10) -> Optional[dict]:
         }
 
     except Exception as e:
-        logger.debug(f"get_orderbook({ticker}): {e}")
+        err_str = str(e)
+        if "50002" in err_str:
+            mark_instrument_issue(
+                ticker,
+                "orderbook",
+                "50002",
+                detail="T-Invest orderbook returned NOT_FOUND",
+            )
+            logger.debug("get_orderbook(%s): NOT_FOUND 50002 → capability cooldown", ticker)
+        else:
+            logger.debug(f"get_orderbook({ticker}): {e}")
         return None
 
 
@@ -595,6 +776,13 @@ _TINVEST_CANDLES_SKIP: set[str] = {
     "SMLT",   # BBG006HBB564 — NOT_FOUND v0.9.35
     "SIBN",   # BBG004FWGS36 — NOT_FOUND (упоминался в комментариях)
     "PIKK",   # BBG004730ZL5 — NOT_FOUND (упоминался в комментариях)
+    # v0.9.38.3: подтверждённые 50002 на ORDER PLACEMENT в sandbox (не только свечи)
+    # Эти инструменты физически отсутствуют в T-Invest sandbox — попытка ордера
+    # даёт 50002 NOT_FOUND. Сигналы генерируются, но sandbox-ордер не размещается.
+    # H1 свечи приходят через MOEX ISS fallback (поэтому CANDLES_SKIP нужен для тишины).
+    "CHMF",   # подтверждён 50002 на sandbox_place_order (22.04.2026)
+    "VTBR",   # подтверждён 50002 на sandbox_place_order (22.04.2026)
+    "OZON",   # подтверждён 50002 на sandbox_place_order (апрель 2026)
 }
 
 
@@ -612,8 +800,19 @@ def get_h1_candles(ticker: str, days: int = 5) -> list[dict]:
     if not is_available():
         return []
 
+    if not instrument_capability_available(ticker, "h1_tinvest"):
+        logger.debug("get_h1_candles(%s): capability disabled → MOEX ISS fallback", ticker)
+        return []
+
     # v0.9.35: быстрый выход для тикеров с известным NOT_FOUND в T-Invest
     if ticker in _TINVEST_CANDLES_SKIP:
+        mark_instrument_issue(
+            ticker,
+            "h1_tinvest",
+            "known_fallback",
+            ttl_hours=168,
+            detail="Ticker is on static T-Invest H1 fallback list",
+        )
         logger.debug("get_h1_candles(%s): в списке CANDLES_SKIP → MOEX ISS fallback", ticker)
         return []
 
@@ -656,6 +855,12 @@ def get_h1_candles(ticker: str, days: int = 5) -> list[dict]:
         # 50002 = "Instrument not found" — нет в T-Invest (неизвестный тикер)
         # Добавь тикер в _TINVEST_CANDLES_SKIP чтобы избежать этой ошибки в будущем
         if "50002" in err_str:
+            mark_instrument_issue(
+                ticker,
+                "h1_tinvest",
+                "50002",
+                detail="T-Invest H1 candles returned NOT_FOUND",
+            )
             logger.warning(
                 "T-Invest get_h1_candles(%s): NOT_FOUND 50002 → MOEX ISS fallback "
                 "(добавь '%s' в _TINVEST_CANDLES_SKIP для тишины)", ticker, ticker
@@ -838,6 +1043,10 @@ def sandbox_place_order(
         logger.warning("T-Invest недоступен (нет токена или SDK)")
         return None
 
+    if not is_sandbox_available(ticker):
+        logger.info("[SANDBOX] %s skip: capability cooldown still active", ticker)
+        return None
+
     figi = get_figi(ticker)
     if not figi:
         return None
@@ -893,6 +1102,12 @@ def sandbox_place_order(
             logger.warning(
                 f"[SANDBOX] {ticker} недоступен для торговли (30079 — "
                 f"инструмент может быть временно закрыт или требует квалинвестора)"
+            )
+            mark_instrument_issue(
+                ticker,
+                "sandbox_order",
+                "30079",
+                detail="Instrument unavailable for trading in sandbox",
             )
         elif "50002" in err_str:
             logger.warning(
