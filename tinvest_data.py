@@ -38,27 +38,69 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ─── v0.9.36: Runtime blacklist для тикеров с 50002 (NOT_FOUND) ──────────────
-# Кейс 16.04.2026: OZON получал 50002 от T-Invest sandbox 3 раза за день,
-# плюс ~14 risk-blocks потому что подмножество сигналов по нему создавалось.
-# Solution: при первом 50002 помечаем тикер как недоступный на TTL часов.
-# После TTL пробуем снова (вдруг T-Invest добавил инструмент).
+# ─── v0.9.38.3: Persistent sandbox blacklist для тикеров с 50002 ──────────────
+# Кейс 16.04.2026: OZON получал 50002 от T-Invest sandbox 3 раза за день.
+# v0.9.36: runtime-blacklist (in-memory, TTL 24ч).
+# v0.9.38.3: persistent-blacklist (JSON-файл) — переживает рестарты бота.
+#   При 50002 на ордер TTL = 168ч (7 дней): инструмент, скорее всего, просто
+#   не доступен в sandbox T-Invest и завтра снова вернёт 50002.
+#   При figi_missing TTL = 24ч: FIGI мог появиться.
+import json as _json
+import pathlib as _pathlib
+
 _SANDBOX_UNAVAILABLE: dict[str, tuple[datetime, str]] = {}   # ticker -> (marked_at_utc, reason)
-SANDBOX_BLACKLIST_TTL_HOURS = 24
+SANDBOX_BLACKLIST_TTL_HOURS         = 24     # для figi_missing и прочих временных причин
+SANDBOX_BLACKLIST_TTL_HOURS_50002   = 168    # 7 дней для инструментов с 50002 (не в sandbox)
+_BLACKLIST_FILE: _pathlib.Path = _pathlib.Path(__file__).parent / "sandbox_blacklist.json"
+
+
+def _save_blacklist() -> None:
+    """Сохраняем blacklist в файл (переживает рестарты)."""
+    try:
+        data = {
+            ticker: [marked_at.isoformat(), reason]
+            for ticker, (marked_at, reason) in _SANDBOX_UNAVAILABLE.items()
+        }
+        _BLACKLIST_FILE.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as _e:
+        logger.debug("sandbox blacklist save error: %s", _e)
+
+
+def _load_blacklist() -> None:
+    """Загружаем blacklist из файла при старте модуля."""
+    if not _BLACKLIST_FILE.exists():
+        return
+    try:
+        data = _json.loads(_BLACKLIST_FILE.read_text(encoding="utf-8"))
+        for ticker, (ts_str, reason) in data.items():
+            marked_at = datetime.fromisoformat(ts_str)
+            _SANDBOX_UNAVAILABLE[ticker] = (marked_at, reason)
+        if _SANDBOX_UNAVAILABLE:
+            logger.debug(
+                "sandbox blacklist loaded: %d тикеров из %s",
+                len(_SANDBOX_UNAVAILABLE), _BLACKLIST_FILE.name,
+            )
+    except Exception as _e:
+        logger.debug("sandbox blacklist load error: %s", _e)
+
+_load_blacklist()  # загружаем сразу при импорте модуля
 
 
 def mark_sandbox_unavailable(ticker: str, reason: str = "50002") -> None:
-    """Отметить тикер как недоступный в sandbox на TTL часов.
+    """Отметить тикер как недоступный в sandbox.
 
     v0.9.36: TTL-blacklist при 50002 от T-Invest.
     v0.9.37: reason='figi_missing' — когда FIGI_MAP не содержит тикер.
+    v0.9.38.3: persistent — сохраняется в файл, переживает рестарты.
     """
+    ttl = SANDBOX_BLACKLIST_TTL_HOURS_50002 if reason == "50002" else SANDBOX_BLACKLIST_TTL_HOURS
     if ticker not in _SANDBOX_UNAVAILABLE:
         logger.warning(
-            "[SANDBOX_BLACKLIST] %s → runtime-blacklist на %dч (reason=%s)",
-            ticker, SANDBOX_BLACKLIST_TTL_HOURS, reason,
+            "[SANDBOX_BLACKLIST] %s → blacklist на %dч (reason=%s) [persistent]",
+            ticker, ttl, reason,
         )
     _SANDBOX_UNAVAILABLE[ticker] = (datetime.now(timezone.utc), reason)
+    _save_blacklist()
 
 
 def is_sandbox_available(ticker: str) -> bool:
@@ -66,10 +108,12 @@ def is_sandbox_available(ticker: str) -> bool:
     marked = _SANDBOX_UNAVAILABLE.get(ticker)
     if not marked:
         return True
-    marked_at, _reason = marked
+    marked_at, reason = marked
+    ttl = SANDBOX_BLACKLIST_TTL_HOURS_50002 if reason == "50002" else SANDBOX_BLACKLIST_TTL_HOURS
     age_h = (datetime.now(timezone.utc) - marked_at).total_seconds() / 3600
-    if age_h >= SANDBOX_BLACKLIST_TTL_HOURS:
+    if age_h >= ttl:
         _SANDBOX_UNAVAILABLE.pop(ticker, None)
+        _save_blacklist()
         logger.info("[SANDBOX_BLACKLIST] %s → TTL истёк (%dч), снимаем блок", ticker, age_h)
         return True
     return False
@@ -595,6 +639,13 @@ _TINVEST_CANDLES_SKIP: set[str] = {
     "SMLT",   # BBG006HBB564 — NOT_FOUND v0.9.35
     "SIBN",   # BBG004FWGS36 — NOT_FOUND (упоминался в комментариях)
     "PIKK",   # BBG004730ZL5 — NOT_FOUND (упоминался в комментариях)
+    # v0.9.38.3: подтверждённые 50002 на ORDER PLACEMENT в sandbox (не только свечи)
+    # Эти инструменты физически отсутствуют в T-Invest sandbox — попытка ордера
+    # даёт 50002 NOT_FOUND. Сигналы генерируются, но sandbox-ордер не размещается.
+    # H1 свечи приходят через MOEX ISS fallback (поэтому CANDLES_SKIP нужен для тишины).
+    "CHMF",   # подтверждён 50002 на sandbox_place_order (22.04.2026)
+    "VTBR",   # подтверждён 50002 на sandbox_place_order (22.04.2026)
+    "OZON",   # подтверждён 50002 на sandbox_place_order (апрель 2026)
 }
 
 

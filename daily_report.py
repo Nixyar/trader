@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MOEX Bot — Ежедневный отчёт  v0.9.38.2
+MOEX Bot — Ежедневный отчёт  v0.9.38.3
 ══════════════════════════════════════
 Что нового (v0.9.38.2):
   + Отправка архива *_auto.tar.gz в Telegram прямо из daily_report.py
@@ -691,12 +691,20 @@ def build_report(
             parts.append(f"  <code>{html.escape(short)}</code>")
 
     # ── Подвал ────────────────────────────────────────────────────────────────
-    # v0.9.38.2: подтягиваем актуальную версию из moex_bot вместо хардкода
+    # v0.9.38.3: читаем BOT_VERSION grep'ом из файла — импорт moex_bot падает
+    # из-за тяжёлых module-level side-effects (logging, asyncio, os.environ).
+    _ver = "v?.?.?"
     try:
-        from moex_bot import BOT_VERSION as _BV
-        _ver = _BV
+        import re as _re
+        _bot_file = Path(__file__).parent / "moex_bot.py"
+        if _bot_file.exists():
+            for _line in _bot_file.read_text(encoding="utf-8").splitlines():
+                _m = _re.match(r'^BOT_VERSION\s*=\s*"([^"]+)"', _line)
+                if _m:
+                    _ver = _m.group(1)
+                    break
     except Exception:
-        _ver = "v?.?.?"
+        pass
     parts.append(
         f"\n⏰ {_NOW_MSK.strftime('%H:%M:%S')} МСК  |  MOEX Bot {_ver}"
     )
