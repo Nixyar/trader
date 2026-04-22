@@ -395,16 +395,18 @@ import sys
 import time
 import os
 import json
-import ssl
 import hashlib
 import html as _html
 import urllib.request
 import logging
 import logging.handlers
+import shutil
+import tempfile
 from datetime import datetime, timedelta, timezone
 from statistics import mean
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─── Логирование ──────────────────────────────────────────────────────────────
 # Пишем в logs/bot.log (RotatingFileHandler: 5 МБ × 3 файла = до 15 МБ истории)
@@ -572,7 +574,8 @@ MIN_VOL_RUB_MAP: dict[str, int] = {
 }
 NEWS_STRENGTH_MIN    = 1
 SCAN_INTERVAL_SEC    = 300          # --watch интервал (5 мин)
-BOT_VERSION          = "v0.9.38.3"  # v0.9.38.3: skip-reason taxonomy + daily_report HTML escape
+BOT_VERSION          = "v0.9.39.0"  # v0.9.39.0: hardening release (atomic state, canonical sessions, ranking cleanup)
+SIGNAL_SCHEMA_VERSION = "0.9.39"
 
 # ─── v0.9.33: Timezone helper ────────────────────────────────────────────────
 # Единая точка получения «сейчас в МСК». Использовать ВЕЗДЕ вместо now_msk().
@@ -582,7 +585,7 @@ _MSK_TZ = _pytz.timezone("Europe/Moscow")
 
 def now_msk() -> "datetime":
     """Текущее время в часовом поясе МСК (UTC+3), timezone-aware."""
-    return datetime.now(_MSK_TZ)
+    return datetime.now(timezone.utc).astimezone(_MSK_TZ)
 AI_MAX_NEWS          = int(os.environ.get("AI_MAX_NEWS", "10"))  # новостей за один AI-вызов
 CACHE_TTL_HOURS      = 24
 CACHE_FILE           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "news_cache.json")
@@ -816,6 +819,160 @@ except Exception:
     }
 
 BASE_URL = "https://iss.moex.com/iss"
+EVENT_CALENDAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "event_calendar.json")
+DECISION_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signals_decision_log.jsonl")
+
+_JSON_BACKUP_SUFFIX = ".corrupt"
+
+
+def _json_default(default):
+    if isinstance(default, dict):
+        return {}
+    if isinstance(default, list):
+        return []
+    return default
+
+
+def _backup_corrupt_json(path: str, raw_text: str = "") -> None:
+    """Сохраняем повреждённый JSON рядом с файлом, чтобы не терять диагностику."""
+    try:
+        if os.path.exists(path):
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = f"{path}.{stamp}{_JSON_BACKUP_SUFFIX}"
+            shutil.copy2(path, backup)
+        elif raw_text:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = f"{path}.{stamp}{_JSON_BACKUP_SUFFIX}"
+            with open(backup, "w", encoding="utf-8") as f:
+                f.write(raw_text)
+    except Exception as e:
+        logger.warning("backup_corrupt_json(%s): %s", path, e)
+
+
+def load_json_file(path: str, default, label: str) -> object:
+    """Безопасная загрузка JSON c quarantine повреждённого содержимого."""
+    if not os.path.exists(path):
+        return _json_default(default)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        logger.warning("%s: файл повреждён (%s) — сохраняем backup и восстанавливаем default", label, e)
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw_text = f.read()
+        except Exception:
+            raw_text = ""
+        _backup_corrupt_json(path, raw_text)
+        append_decision_log({
+            "action": "recovered",
+            "reason": "state_corrupt_recovered",
+            "path": os.path.basename(path),
+            "label": label,
+        })
+        return _json_default(default)
+    except FileNotFoundError:
+        return _json_default(default)
+    except Exception as e:
+        logger.warning("%s: не удалось прочитать (%s) — используем default", label, e)
+        return _json_default(default)
+
+
+def save_json_file_atomic(path: str, payload, label: str) -> None:
+    """Атомарная запись JSON во временный файл с заменой целевого."""
+    dir_name = os.path.dirname(path) or "."
+    os.makedirs(dir_name, exist_ok=True)
+    fd = None
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=dir_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        fd = None
+        os.replace(tmp_path, path)
+        tmp_path = None
+    except Exception as e:
+        logger.error("%s: не удалось сохранить (%s)", label, e)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def append_decision_log(entry: dict) -> None:
+    """Structured decision journal для анализа причин торговли/пропуска."""
+    try:
+        payload = dict(entry)
+        payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
+        with open(DECISION_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("append_decision_log: %s", e)
+
+
+def _normalize_news_text(text: str) -> str:
+    text = _html.unescape(text or "").lower().replace("ё", "е")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[^0-9a-zа-я%./:+-]+", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _signal_meta(signal: dict) -> dict:
+    return {
+        "signal_version": SIGNAL_SCHEMA_VERSION,
+        "decision_reasons": list(signal.get("decision_reasons", [])),
+        "data_quality_flags": list(signal.get("data_quality_flags", [])),
+        "news_mode": signal.get("news_mode", "none"),
+    }
+
+
+def _session_window(now: datetime | None = None) -> tuple[bool, int, str]:
+    """Канонический календарь MOEX для всех подсистем.
+
+    Правила этого релиза:
+    - открыта: 09:50–18:50 МСК
+    - пауза:   18:51–18:59 МСК
+    - вечерка в эту минорную версию НЕ используется как торговое окно
+    """
+    now = now or now_msk()
+    wd = now.weekday()
+    if wd >= 5:
+        days_to_mon = 7 - wd
+        open_mon = now.replace(hour=9, minute=50, second=0, microsecond=0) + timedelta(days=days_to_mon)
+        return False, max(0, int((open_mon - now).total_seconds())), "weekend"
+
+    t = now.time()
+    main_open = now.replace(hour=9, minute=50, second=0, microsecond=0)
+    main_close = now.replace(hour=18, minute=50, second=0, microsecond=0)
+    evening_open = now.replace(hour=19, minute=0, second=0, microsecond=0)
+
+    if main_open.time() <= t <= main_close.time():
+        return True, 0, "main"
+    if t < main_open.time():
+        return False, max(0, int((main_open - now).total_seconds())), "preopen"
+    if main_close.time() < t < evening_open.time():
+        return False, max(0, int((evening_open - now).total_seconds())), "pause"
+
+    base = (now + timedelta(days=1)).replace(hour=9, minute=50, second=0, microsecond=0)
+    while base.weekday() >= 5:
+        base += timedelta(days=1)
+    return False, max(0, int((base - now).total_seconds())), "afterhours"
+
+
+def _load_event_calendar() -> list[dict]:
+    events = load_json_file(EVENT_CALENDAR_FILE, [], "load_event_calendar")
+    if isinstance(events, list):
+        return events
+    logger.warning("load_event_calendar: неверный формат, используем пустой список")
+    return []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -823,15 +980,9 @@ BASE_URL = "https://iss.moex.com/iss"
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_moex_open() -> bool:
-    """MOEX фондовый рынок: основная сессия 09:50–19:00 по Москве, Пн–Пт.
-    v0.9.25: исправлено 18:50 → 19:00 (официальное расписание moex.com)
-    """
-    now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
-    if now_msk.weekday() >= 5:   # Сб=5, Вс=6
-        return False
-    start = now_msk.replace(hour=9,  minute=50, second=0, microsecond=0)
-    end   = now_msk.replace(hour=19, minute=0,  second=0, microsecond=0)
-    return start <= now_msk <= end
+    """True если сейчас открыт канонический торговый интервал этой версии."""
+    is_open, _, _ = _session_window()
+    return is_open
 
 
 _CBR_RATE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cbr_rate_cache.json")
@@ -1391,11 +1542,20 @@ def get_intraday_price(ticker: str) -> dict:
         last_price = candles[-1]["close"]
         change_pct = (last_price - open_price) / open_price * 100
         vwap       = calc_vwap(candles)
+        volumes = [float(c.get("value") or 0) for c in candles]
+        recent_window = max(1, min(6, len(volumes)))
+        avg_hourly_volume = round(sum(volumes) / len(volumes), 2) if volumes else 0.0
+        current_window_volume = round(sum(volumes[-recent_window:]), 2) if volumes else 0.0
+        last_begin = candles[-1].get("begin") or ""
         return {
             "open":       round(open_price, 2),
             "last":       round(last_price, 2),
             "change_pct": round(change_pct, 2),
             "vwap":       vwap,
+            "candle_count": len(candles),
+            "last_begin": last_begin,
+            "volume": current_window_volume,
+            "avg_hourly_volume": avg_hourly_volume,
         }
     except Exception as e:
         logger.warning("get_intraday_price(%s): %s", ticker, e)
@@ -1492,8 +1652,8 @@ def get_session_quality() -> tuple[float, str]:
     Возвращает (score_bonus, label) — bonus добавляется к score сигнала.
     Основано на статистике МОСБИРЖА: наибольший объём 10:30–12:00 и 14:00–17:00.
     """
-    now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
-    h, m = now_msk.hour, now_msk.minute
+    current = now_msk()
+    h, m = current.hour, current.minute
     t = h + m / 60.0  # дробное время в часах
 
     if 10.5 <= t < 12.0:
@@ -1506,6 +1666,8 @@ def get_session_quality() -> tuple[float, str]:
         return 0, "12:00–14:00 🟡 обед"     # обеденный флэт
     elif 17.0 <= t < 18.5:
         return 0, "17:00–18:30 🟡 закрытие" # предзакрытие, тренды теряют силу
+    elif is_moex_open():
+        return 0, "внутри сессии"
     else:
         return 0, "вне сессии"
 
@@ -1906,6 +2068,8 @@ def build_market_signal(
     """
     if not anomaly.get("anomaly"):
         return None
+    decision_reasons: list[str] = []
+    data_quality_flags: list[str] = []
     price      = levels.get("last_close")
     support    = levels.get("support")
     resistance = levels.get("resistance")
@@ -1919,12 +2083,30 @@ def build_market_signal(
     # Уточняем цену входа по intraday (точнее daily close)
     if intraday and intraday.get("last"):
         price = intraday["last"]
+        decision_reasons.append("intraday_price_used")
+    else:
+        data_quality_flags.append("intraday_missing")
 
     # v0.9.36: Sanity-guard против абсурдных entry (кейс OZON 16.04: 4368 vs 548).
+    original_price = price
     price = _validate_entry(ticker, price, intraday.get("last") if intraday else None)
+    if original_price != price:
+        data_quality_flags.append("invalid_price")
+        decision_reasons.append("invalid_price_guard")
+
+    if intraday and intraday.get("last_begin"):
+        try:
+            last_begin = datetime.fromisoformat(str(intraday["last_begin"]).replace("Z", "+00:00"))
+            last_begin_msk = last_begin.astimezone(_MSK_TZ)
+            if is_moex_open() and (now_msk() - last_begin_msk) > timedelta(minutes=30):
+                data_quality_flags.append("stale_intraday")
+                decision_reasons.append("stale_intraday")
+        except ValueError:
+            data_quality_flags.append("intraday_timestamp_invalid")
 
     # v0.9.4: умное определение направления с учётом MA50-тренда
     direction, signal_type = determine_direction(price, levels)
+    decision_reasons.append(f"signal_type:{signal_type}")
 
     # RSI подтверждение: для momentum — расширенный диапазон (тренд может держать RSI высоко)
     rsi_confirm = True
@@ -1955,9 +2137,11 @@ def build_market_signal(
             if direction == "LONG"  and ma50_trend == "bearish":
                 ma50_against = True
                 ma50_note    = f"MA50 {ma50:.1f} — тренд нисходящий, LONG против тренда ⚠️"
+                decision_reasons.append("ma50_against")
             elif direction == "SHORT" and ma50_trend == "bullish":
                 ma50_against = True
                 ma50_note    = f"MA50 {ma50:.1f} — тренд восходящий, SHORT против тренда ⚠️"
+                decision_reasons.append("ma50_against")
             elif direction == "LONG"  and ma50_trend == "bullish":
                 ma50_note    = f"MA50 {ma50:.1f} — тренд восходящий, LONG по тренду ✅"
             elif direction == "SHORT" and ma50_trend == "bearish":
@@ -2359,6 +2543,9 @@ def build_market_signal(
         "obv_bull_div":  levels.get("obv_bull_div"),  # True = OBV↑ цена↓ → скрытое накопление
         "obv_bear_div":  levels.get("obv_bear_div"),  # True = OBV↓ цена↑ → скрытое распределение
         "ma_crossover":  levels.get("ma_crossover"),  # "golden_cross" | "death_cross" | None
+        "decision_reasons": decision_reasons,
+        "data_quality_flags": data_quality_flags,
+        "news_mode": "none",
     }
 
 
@@ -2587,22 +2774,12 @@ def _match_roots(text: str, roots: list[str]) -> int:
 
 
 def load_cache() -> dict:
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.warning("load_cache: повреждён или не читается (%s), начинаем заново", e)
-            return {}
-    return {}
+    data = load_json_file(CACHE_FILE, {}, "load_cache")
+    return data if isinstance(data, dict) else {}
 
 
 def save_cache(cache: dict):
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error("save_cache: не удалось сохранить (%s)", e)
+    save_json_file_atomic(CACHE_FILE, cache, "save_cache")
 
 
 def clean_cache(cache: dict) -> dict:
@@ -2629,11 +2806,7 @@ def is_relevant(item: NewsItem) -> bool:
     return any(kw in text for kw in _ALL_FILTER_WORDS)
 
 
-def fetch_news(cache: dict) -> list[NewsItem]:
-    """Парсим RSS, возвращаем только НОВЫЕ (не в кэше) элементы."""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode    = ssl.CERT_NONE
+def _fetch_news_source(source: str, url: str) -> tuple[str, list[dict], Exception | None]:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -2641,30 +2814,63 @@ def fetch_news(cache: dict) -> list[NewsItem]:
             "Chrome/120.0.0.0 Safari/537.36"
         )
     }
-    new_items = []
-    now_iso   = now_msk().isoformat()
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+        feed = feedparser.parse(raw)
+        entries: list[dict] = []
+        for entry in feed.entries[:30]:
+            title = _normalize_news_text(entry.get("title", ""))
+            if not title:
+                continue
+            summary = _normalize_news_text(entry.get("summary", entry.get("description", "")))[:300]
+            entries.append({
+                "title": title,
+                "summary": summary,
+                "published": entry.get("published", ""),
+                "url": entry.get("link", ""),
+            })
+        return source, entries, None
+    except Exception as e:
+        return source, [], e
 
-    for source, url in RSS_FEEDS.items():
+
+def fetch_news(cache: dict) -> list[NewsItem]:
+    """Парсим RSS, возвращаем только НОВЫЕ элементы. Источники читаем параллельно."""
+    new_items: list[NewsItem] = []
+    now_iso = now_msk().isoformat()
+    max_workers = min(4, max(1, len(RSS_FEEDS)))
+
+    for source in RSS_FEEDS:
         print(f"  📡 {source}...", end=" ", flush=True)
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
-                raw = resp.read()
-            feed    = feedparser.parse(raw)
-            count   = skipped = 0
-            for entry in feed.entries[:30]:
-                title   = entry.get("title", "").strip()
-                summary = re.sub(
-                    r"<[^>]+>",
-                    "",
-                    entry.get("summary", entry.get("description", "")),
-                ).strip()[:300]
-                if not title:
-                    continue
+    print()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {
+            pool.submit(_fetch_news_source, source, url): source
+            for source, url in RSS_FEEDS.items()
+        }
+        for future in as_completed(future_map):
+            source = future_map[future]
+            try:
+                source, entries, error = future.result()
+            except Exception as e:
+                source, entries, error = source, [], e
+
+            if error is not None:
+                print(f"    {source}: ❌ {error}")
+                logger.error("fetch_news(%s): %s", source, error)
+                continue
+
+            count = skipped = 0
+            for entry in entries:
                 item = NewsItem(
-                    title=title, source=source, summary=summary,
-                    published=entry.get("published", ""),
-                    url=entry.get("link", ""),
+                    title=entry["title"],
+                    source=source,
+                    summary=entry["summary"],
+                    published=entry["published"],
+                    url=entry["url"],
                 )
                 key = news_key(item)
                 if key in cache:
@@ -2673,16 +2879,13 @@ def fetch_news(cache: dict) -> list[NewsItem]:
                 cache[key] = now_iso
                 new_items.append(item)
                 count += 1
-            print(f"✅ {count} новых, {skipped} в кэше")
-        except Exception as e:
-            print(f"❌ {e}")
-            logger.error("fetch_news(%s): %s", source, e)
+            print(f"    {source}: ✅ {count} новых, {skipped} в кэше")
 
     return new_items
 
 
 def analyze_by_keywords(item: NewsItem) -> NewsItem:
-    text    = (item.title + " " + item.summary).lower()
+    text = _normalize_news_text(item.title + " " + item.summary)
     matched = set()
     for ticker, keywords in TICKER_MAP.items():
         for kw in keywords:
@@ -2931,6 +3134,7 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
     """
     synthesized = []
     session_bonus, session_label = get_session_quality()
+    news_memory = load_news_memory()
 
     for ms in market_signals:
         ticker   = ms["ticker"]
@@ -2940,6 +3144,11 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
         score    = 0
         score_breakdown = []
         patterns = []
+        decision_reasons = list(ms.get("decision_reasons", []))
+        data_quality_flags = list(ms.get("data_quality_flags", []))
+        news_mode = "none"
+        if related:
+            news_mode = "ai" if any(n.analyzed_by == "ai" for n in related) else "keywords"
 
         # ── 1. Объём (0–4) ────────────────────────────────────────────────────
         vol_ratio = ms.get("volume_ratio", 0)
@@ -3156,7 +3365,14 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
                         append_score_log({"ticker": ticker, "direction": direction,
                                           "action": "blocked", "reason": "weekly_hard_block",
                                           "weekly_change": w_change, "score": None})
-                        return []  # пустой список = нет сигналов для этого тикера
+                        append_decision_log({
+                            "action": "blocked",
+                            "reason": "weekly_hard_block",
+                            "ticker": ticker,
+                            "direction": direction,
+                            "weekly_change": w_change,
+                        })
+                        continue
             else:  # flat — нейтрально
                 weekly_note = f"📅 Нед{w_change:+.1f}% — боковик"
             ms["weekly_aligned"] = weekly_aligned
@@ -3168,8 +3384,7 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
         # ── 14. News memory trend (v0.9.19) ────────────────────────────────────
         # Накопленный новостной сентимент за несколько дней.
         # Улучшение фона → бонус "buy the rumor"; ухудшение → штраф.
-        _nm = load_news_memory()
-        _nm_trend, _nm_days = get_news_trend(ticker, _nm)
+        _nm_trend, _nm_days = get_news_trend(ticker, news_memory)
         nm_pts = 0
         if _nm_trend == "improving" and ms["direction"] == "LONG":
             nm_pts = 2
@@ -3336,11 +3551,32 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
             score_breakdown.append(f"DeathCross={cross_pts}")
         score += cross_pts
 
+        conflict_penalty = 0
+        if ms.get("ma50_against") and ms.get("imoex_confirm") is False:
+            conflict_penalty -= 1
+            decision_reasons.append("trend_context_conflict")
+        if ms.get("vwap_confirm") is False and ms.get("orderbook_confirm") is False:
+            conflict_penalty -= 1
+            decision_reasons.append("intraday_confirmation_conflict")
+        if "stale_intraday" in data_quality_flags:
+            conflict_penalty -= 1
+            decision_reasons.append("stale_intraday")
+        if conflict_penalty:
+            score += conflict_penalty
+            score_breakdown.append(f"Conflicts={conflict_penalty}")
+
         score = max(0, score)  # score не может быть отрицательным
         confidence = _score_to_confidence(score)
-        pattern    = "  ".join(patterns) if patterns else "📊 Только объём"
+        pattern    = patterns[0] if patterns else "📊 Только объём"
+        pattern_details = "  ".join(patterns)
 
         top_news = sorted(related, key=lambda n: n.strength, reverse=True)[:2]
+        if not related:
+            decision_reasons.append("news_absent")
+        elif opposing and not agreeing:
+            decision_reasons.append("news_conflict")
+        elif agreeing:
+            decision_reasons.append("news_agreement")
 
         synthesized.append({
             **ms,
@@ -3349,9 +3585,14 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
             "score_breakdown":  "  ".join(score_breakdown),
             "session_label":    session_label,
             "pattern":          pattern,
+            "pattern_details":  pattern_details,
             "news_agree":       len(agreeing),
             "news_oppose":      len(opposing),
             "top_news":         top_news,
+            "signal_version":   SIGNAL_SCHEMA_VERSION,
+            "decision_reasons": sorted(set(decision_reasons)),
+            "data_quality_flags": sorted(set(data_quality_flags)),
+            "news_mode":        news_mode,
         })
 
     return synthesized
@@ -3951,23 +4192,13 @@ def tg_format_close(s: dict, reason: str, equity: float, state: dict) -> str:
 
 def load_trade_log() -> list:
     """Загружает trade_log.json. Возвращает [] если файл не существует."""
-    try:
-        with open(TRADE_LOG_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return []
-    except json.JSONDecodeError as e:
-        logger.warning("load_trade_log: файл повреждён (%s), сбрасываем", e)
-        return []
+    data = load_json_file(TRADE_LOG_FILE, [], "load_trade_log")
+    return data if isinstance(data, list) else []
 
 
 def save_trade_log(log: list) -> None:
     """Сохраняет trade_log.json."""
-    try:
-        with open(TRADE_LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(log, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error("save_trade_log: не удалось сохранить (%s)", e)
+    save_json_file_atomic(TRADE_LOG_FILE, log, "save_trade_log")
 
 
 def append_score_log(entry: dict) -> None:
@@ -3979,8 +4210,19 @@ def append_score_log(entry: dict) -> None:
     """
     try:
         entry.setdefault("ts", now_msk().strftime("%Y-%m-%d %H:%M"))
+        entry.setdefault("signal_version", SIGNAL_SCHEMA_VERSION)
         with open(SCORE_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        append_decision_log({
+            "action": entry.get("action"),
+            "reason": entry.get("reason"),
+            "ticker": entry.get("ticker"),
+            "direction": entry.get("direction"),
+            "score": entry.get("score"),
+            "confidence": entry.get("confidence"),
+            "signal_id": entry.get("signal_id"),
+            "signal_version": entry.get("signal_version"),
+        })
     except Exception as e:
         logger.warning("append_score_log: %s", e)
 
@@ -3996,6 +4238,7 @@ def log_new_signal(s: dict, signal_id: str) -> None:
         return
     record = {
         "signal_id":       signal_id,
+        "signal_version":  s.get("signal_version", SIGNAL_SCHEMA_VERSION),
         "ticker":          s.get("ticker"),
         "direction":       s.get("direction"),
         "confidence":      s.get("confidence"),
@@ -4020,6 +4263,9 @@ def log_new_signal(s: dict, signal_id: str) -> None:
         "pattern":         s.get("pattern", ""),
         "date":            now_msk().strftime("%Y-%m-%d"),
         "time":            now_msk().strftime("%H:%M"),
+        "decision_reasons": s.get("decision_reasons", []),
+        "data_quality_flags": s.get("data_quality_flags", []),
+        "news_mode":       s.get("news_mode", "none"),
         "result":          None,   # "win_t1","win_t2","loss","be" — заполнится позже
         "exit_price":      None,
         "exit_time":       None,
@@ -4229,22 +4475,12 @@ def print_trade_log_summary() -> None:
 
 def load_h1_watch() -> dict:
     """Загружает watch-лист тикеров, ожидающих H1-подтверждения."""
-    try:
-        with open(H1_WATCH_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError as e:
-        logger.warning("load_h1_watch: файл повреждён (%s), сбрасываем", e)
-        return {}
+    data = load_json_file(H1_WATCH_FILE, {}, "load_h1_watch")
+    return data if isinstance(data, dict) else {}
 
 
 def save_h1_watch(watch: dict) -> None:
-    try:
-        with open(H1_WATCH_FILE, "w", encoding="utf-8") as f:
-            json.dump(watch, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error("save_h1_watch: не удалось сохранить (%s)", e)
+    save_json_file_atomic(H1_WATCH_FILE, watch, "save_h1_watch")
 
 
 def add_to_h1_watch(watch: dict, ticker: str, direction: str,
@@ -4439,21 +4675,12 @@ NEWS_TREND_MIN_DAYS = 2  # сколько дней подряд нужно дл�
 
 def load_news_memory() -> dict:
     """Загружает news_memory.json. Формат: {ticker: {date: {score, count}}}"""
-    try:
-        with open(NEWS_MEMORY_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError:
-        return {}
+    data = load_json_file(NEWS_MEMORY_FILE, {}, "load_news_memory")
+    return data if isinstance(data, dict) else {}
 
 
 def save_news_memory(memory: dict) -> None:
-    try:
-        with open(NEWS_MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(memory, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning("save_news_memory: %s", e)
+    save_json_file_atomic(NEWS_MEMORY_FILE, memory, "save_news_memory")
 
 
 def update_news_memory(news_signals: list, memory: dict) -> dict:
@@ -4529,54 +4756,10 @@ def get_news_trend(ticker: str, memory: dict) -> tuple[str, int]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  EVENT CALENDAR (v0.9.19) — плановые события MOEX
-#  Бот заходит ДО события, а не после — опережает реактивных алгоботов.
+#  EVENT CALENDAR — конфигурационный слой, загружается из event_calendar.json
 # ══════════════════════════════════════════════════════════════════════════════
 
-EVENT_CALENDAR: list[dict] = [
-    # Формат: date (YYYY-MM-DD), event (описание), tickers (список), bias (long/short/neutral)
-    # ── ЦБ РФ заседания 2026 ──────────────────────────────────────────────────
-    # v0.9.21: Официальный календарь ЦБ РФ 2026 (источник: cbr.ru, проверено 30.03.2026).
-    # Тренд: снижение ставки (21%→15.5%→15%) → позитив для банков и застройщиков.
-    # Опорные заседания (со среднесрочным прогнозом): апрель, июль, октябрь, декабрь.
-    # v0.9.29: расширен список тикеров — добавлены X5, HEAD, POSI, LSRG как бенефициары снижения ставки
-    {"date": "2026-04-24", "event": "ЦБ РФ: заседание по ставке (опорное, ожидается снижение)",
-     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK", "LSRG", "OZON", "X5", "MGNT"], "bias": "long"},
-    {"date": "2026-06-19", "event": "ЦБ РФ: заседание по ставке",
-     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK", "LSRG", "OZON", "X5", "MGNT"], "bias": "long"},
-    {"date": "2026-07-24", "event": "ЦБ РФ: заседание по ставке (опорное)",
-     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK", "LSRG", "OZON", "X5", "MGNT"], "bias": "long"},
-    {"date": "2026-09-11", "event": "ЦБ РФ: заседание по ставке",
-     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK", "LSRG", "OZON", "X5", "MGNT"], "bias": "long"},
-    {"date": "2026-10-23", "event": "ЦБ РФ: заседание по ставке (опорное)",
-     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK", "LSRG", "OZON", "X5", "MGNT"], "bias": "long"},
-    {"date": "2026-12-18", "event": "ЦБ РФ: заседание по ставке (опорное)",
-     "tickers": ["SBER", "VTBR", "T", "SMLT", "PIKK", "LSRG", "OZON", "X5", "MGNT"], "bias": "long"},
-    # ── Дивидендные отсечки 2026 (проверено по investmint.ru, banki.ru, livetrader.ru 01.04.2026) ──
-    # bias=short: за 2-5 дней до отсечки акции обычно продают (дивидендный гэп вниз после).
-    # bias=long:  за 5-10 дней до отсечки — накопление, рост к дивиденду.
-    # SBER: прогноз отсечки ~18 июля 2026, дивиденд ~38₽/акц (источник: investmint.ru)
-    {"date": "2026-07-16", "event": "Сбербанк: дивидендная отсечка (прогноз ~38₽, Т+1 → купить до 16.07)",
-     "tickers": ["SBER"], "bias": "short"},
-    # LKOH: отсечка 03.06.2026, дивиденд ~570₽ (источник: banki.ru, livetrader.ru)
-    {"date": "2026-06-03", "event": "Лукойл: дивидендная отсечка (~570₽/акц)",
-     "tickers": ["LKOH"], "bias": "short"},
-    # MTSS: прогноз отсечки ~07.07.2026, дивиденд ~35₽ (дивполитика: ≥35₽/год)
-    {"date": "2026-07-07", "event": "МТС: дивидендная отсечка (прогноз ~35₽/акц)",
-     "tickers": ["MTSS"], "bias": "short"},
-    # GMKN: прогноз отсечки ~15.06.2026, дивиденд ~8.66₽ (источник: banki.ru)
-    {"date": "2026-06-15", "event": "Норникель: дивидендная отсечка (прогноз ~8.66₽/акц)",
-     "tickers": ["GMKN"], "bias": "short"},
-    # GAZP: дивидендов не было несколько лет, прогноз неопределённый (0₽ за 2024г)
-    # Убрана из-за неопределённости — добавить когда будет официальное решение.
-    # ROSN: отсечка за 2П2024 уже прошла (янв 2026). Следующая ориентировочно дек 2026.
-    {"date": "2026-12-10", "event": "Роснефть: дивидендная отсечка (ориентир 2П2026)",
-     "tickers": ["ROSN"], "bias": "short"},
-    # LSRG: дивиденд ~78-100₽, отсечка ожидается 29 апреля – 2 мая 2026.
-    # v0.9.25: добавлено, источник: investmint.ru, bcs.ru/dividends
-    {"date": "2026-04-29", "event": "ЛСР: дивидендная отсечка (прогноз ~78-100₽/акц)",
-     "tickers": ["LSRG"], "bias": "short"},
-]
+EVENT_CALENDAR: list[dict] = _load_event_calendar()
 
 
 def get_upcoming_event(ticker: str, hours_ahead: int = 48) -> dict | None:
@@ -4599,22 +4782,12 @@ def get_upcoming_event(ticker: str, hours_ahead: int = 48) -> dict | None:
 
 
 def load_signals_state() -> dict:
-    try:
-        with open(SIGNALS_STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError as e:
-        logger.warning("load_signals_state: файл повреждён (%s), сбрасываем", e)
-        return {}
+    data = load_json_file(SIGNALS_STATE_FILE, {}, "load_signals_state")
+    return data if isinstance(data, dict) else {}
 
 
 def save_signals_state(state: dict):
-    try:
-        with open(SIGNALS_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error("save_signals_state: не удалось сохранить (%s)", e)
+    save_json_file_atomic(SIGNALS_STATE_FILE, state, "save_signals_state")
 
 
 def signal_key(s: dict) -> str:
@@ -4659,7 +4832,7 @@ def should_send_tg(s: dict, state: dict) -> tuple[bool, str]:
                 "entry_cutoff: %s %s заблокирован (%d МСК ≥ %d)",
                 s.get("ticker"), direction, msk_hour, _cutoff,
             )
-            return False, "entry_cutoff"
+            return False, "session_cutoff"
 
     # v0.9.10: если базовый ключ занят закрытым сигналом — ищем свободный суффикс
     key = base_key
@@ -4680,7 +4853,7 @@ def should_send_tg(s: dict, state: dict) -> tuple[bool, str]:
                     "duplicate_guard: %s %s уже открыт (%s) — пропускаем",
                     s.get("ticker"), s.get("direction"), candidate,
                 )
-                return False, "already_open_duplicate"
+                return False, "duplicate_signal"
         s["_state_key"] = key   # сохраняем уникальный ключ в сигнал
 
     if key not in state:
@@ -4702,7 +4875,7 @@ def should_send_tg(s: dict, state: dict) -> tuple[bool, str]:
                     "duplicate_guard: %s %s уже открыт (%s) — пропускаем",
                     ticker, direction, skey,
                 )
-                return False, "already_open_duplicate"
+                return False, "duplicate_signal"
         return True, "new"
 
     # v0.9.19: убрали repeat/upgrade — в Telegram шлём только ВХОД и ЗАКРЫТИЕ.
@@ -5213,6 +5386,39 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
         direction = s["direction"]
         entry     = float(s.get("entry") or 0)
         stop      = float(s.get("stop")  or 0)
+        quality_flags = set(s.get("data_quality_flags", []))
+        decision_reasons = set(s.get("decision_reasons", []))
+
+        if "invalid_price" in quality_flags:
+            append_score_log({
+                "ticker": ticker,
+                "direction": direction,
+                "score": s.get("confidence_score"),
+                "confidence": confidence,
+                "action": "skipped",
+                "reason": "invalid_price",
+            })
+            continue
+        if "stale_intraday" in quality_flags and (s.get("confidence_score") or 0) < 10:
+            append_score_log({
+                "ticker": ticker,
+                "direction": direction,
+                "score": s.get("confidence_score"),
+                "confidence": confidence,
+                "action": "skipped",
+                "reason": "stale_intraday",
+            })
+            continue
+        if "intraday_confirmation_conflict" in decision_reasons and (s.get("confidence_score") or 0) < 9:
+            append_score_log({
+                "ticker": ticker,
+                "direction": direction,
+                "score": s.get("confidence_score"),
+                "confidence": confidence,
+                "action": "skipped",
+                "reason": "quality_gate_conflict",
+            })
+            continue
 
         # v0.9.36: Sandbox runtime-blacklist (50002 в прошлом запросе).
         try:
@@ -5220,6 +5426,14 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
         except Exception:
             _sb_avail = None
         if _sb_avail and not _sb_avail(ticker):
+            append_score_log({
+                "ticker": ticker,
+                "direction": direction,
+                "score": s.get("confidence_score"),
+                "confidence": confidence,
+                "action": "skipped",
+                "reason": "sandbox_unavailable",
+            })
             if _should_log_risk_block(ticker, "SANDBOX_UNAVAILABLE"):
                 logger.info("sandbox-blacklist skip: %s (ещё в 24ч blacklist)", ticker)
             continue
@@ -5370,6 +5584,8 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                 "lots":         result.get("lots"),
                 "equity_at_open": round(equity, 0) if equity else None,
                 "opened_at":    datetime.now(timezone.utc).isoformat(),
+                "base_signal_key": s.get("_state_key") or key,
+                **_signal_meta(s),
             }
             dir_emoji  = "🟢" if direction == "LONG" else "🔴"
             exec_price = safe_price or entry
@@ -5517,7 +5733,7 @@ def tg_notify_run(
             "weekly_change":   s.get("weekly_change"),
         }
         if too_hot or _is_weekend:
-            _reason = "portfolio_heat" if too_hot else "weekend"
+            _reason = "portfolio_heat" if too_hot else "session_closed"
             append_score_log({**_score_base, "action": "skipped", "reason": _reason})
             continue  # не открываем новые позиции при перегреве или в выходные
         do_send, reason = should_send_tg(s, state)
@@ -5549,6 +5765,7 @@ def tg_notify_run(
                     "first_seen": state.get(key, {}).get("first_seen", now),
                     "last_sent":  now,
                     "sent_count": state.get(key, {}).get("sent_count", 0) + 1,
+                    **_signal_meta(s),
                 }
                 label = {"new": "НОВЫЙ", "upgrade": "РОСТ УВЕРЕН.", "repeat": "ПОВТОР"}.get(reason, reason)
                 print(f"  📲 Telegram [{label}]: {s['ticker']} {s['direction']}")
@@ -5559,13 +5776,13 @@ def tg_notify_run(
         else:
             # v0.9.27: логируем реальную причину вместо общего "should_send_tg_false".
             # v0.9.38.3: теперь should_send_tg всегда возвращает явный reason
-            # (already_open_duplicate / repeat_after_exit / entry_cutoff / "").
+            # (duplicate_signal / repeat_after_exit / session_cutoff / "").
             # Пустая строка означает "скан одинаковой причины, не логируем" (оставляем ""
             # → превратим в unknown_empty чтобы было видно что это необычный случай).
             _skip_reason = reason if reason else "unknown_empty_reason"
             append_score_log({**_score_base, "action": "skipped", "reason": _skip_reason})
             # v0.9.27: TG-уведомление при сильном сигнале, заблокированном по времени (≥8 очков)
-            if _skip_reason == "entry_cutoff" and (_score_base.get("score") or 0) >= 8:
+            if _skip_reason == "session_cutoff" and (_score_base.get("score") or 0) >= 8:
                 _d_emoji = "🟢" if s.get("direction") == "LONG" else "🔴"
                 _vol_str = f"×{s.get('volume_ratio', '?')}" if s.get("volume_ratio") else ""
                 _blocked_tg = (
@@ -5603,6 +5820,14 @@ def tg_notify_run(
             # Порог: AI-сигналы от strength 2+, keyword — от 3 (AI точнее)
             _min_str = 2 if n.analyzed_by == "ai" else 3
             if n.strength < _min_str:
+                append_decision_log({
+                    "action": "skipped",
+                    "reason": "news_only_low_confidence",
+                    "ticker": ",".join(n.tickers[:4]),
+                    "direction": n.direction,
+                    "news_mode": n.analyzed_by or "keywords",
+                    "strength": n.strength,
+                })
                 continue
             # Дедупликация
             _nk = "ntg_" + hashlib.md5(n.title.encode()).hexdigest()[:12]
@@ -5615,6 +5840,8 @@ def tg_notify_run(
                     "title":     n.title[:80],
                     "tickers":   n.tickers,
                     "direction": n.direction,
+                    "signal_version": SIGNAL_SCHEMA_VERSION,
+                    "news_mode": n.analyzed_by or "keywords",
                 }
                 sent += 1
                 logger.info(
@@ -5912,8 +6139,18 @@ def run_once(news_only: bool = False):
                 news_only_tickers.add(t)
     if news_only_tickers:
         print(f"\n  📈 Intraday новостных тикеров ({len(news_only_tickers)})...", end=" ", flush=True)
-        for ticker in sorted(news_only_tickers):
-            intraday_data[ticker] = get_intraday_price(ticker)
+        with ThreadPoolExecutor(max_workers=min(6, len(news_only_tickers))) as pool:
+            future_map = {
+                pool.submit(get_intraday_price, ticker): ticker
+                for ticker in sorted(news_only_tickers)
+            }
+            for future in as_completed(future_map):
+                ticker = future_map[future]
+                try:
+                    intraday_data[ticker] = future.result()
+                except Exception as e:
+                    logger.warning("news intraday fetch %s: %s", ticker, e)
+                    intraday_data[ticker] = {}
         print("✅")
     for n in news_signals:
         n.status = assess_news_status(n, intraday_data)
@@ -6017,48 +6254,10 @@ def clear_bot_log() -> None:
 def _moex_is_open() -> tuple:
     """
     Возвращает (is_open: bool, seconds_until_open: int).
-    MOEX основная сессия: 09:50–18:55 МСК пн–пт.
-    Вечерняя сессия:      19:00–23:50 МСК пн–пт.
-    Выходные — биржа не торгует.
-    Буфер старта: 09:45 (5 мин до открытия) — бот успевает скачать данные.
+    Использует канонический торговый календарь минорной версии.
     """
-    import pytz
-    msk = pytz.timezone("Europe/Moscow")
-    now = datetime.now(msk)
-    wd  = now.weekday()          # 0=пн … 6=вс
-    if wd >= 5:                  # сб, вс
-        # До открытия пн 09:45
-        days_to_mon = 7 - wd    # сб→2, вс→1
-        open_mon = now.replace(hour=9, minute=45, second=0, microsecond=0)
-        open_mon += __import__("datetime").timedelta(days=days_to_mon)
-        return False, max(0, int((open_mon - now).total_seconds()))
-
-    t = now.time()
-    import datetime as _dt
-    MAIN_OPEN   = _dt.time(9,  45)
-    MAIN_CLOSE  = _dt.time(18, 55)
-    EVE_OPEN    = _dt.time(19,  0)
-    EVE_CLOSE   = _dt.time(23, 50)
-
-    if MAIN_OPEN <= t <= MAIN_CLOSE or EVE_OPEN <= t <= EVE_CLOSE:
-        return True, 0
-
-    # До следующего открытия
-    if t < MAIN_OPEN:
-        target = now.replace(hour=9, minute=45, second=0, microsecond=0)
-    elif MAIN_CLOSE < t < EVE_OPEN:
-        # перерыв 18:55–19:00 — очень короткий, считаем «открытым через минуты»
-        target = now.replace(hour=19, minute=0, second=0, microsecond=0)
-    else:
-        # после 23:50 — завтра 09:45 (или пн, если пятница)
-        base = now + __import__("datetime").timedelta(days=1)
-        if base.weekday() >= 5:
-            # перепрыгиваем на пн
-            skip = 7 - base.weekday()
-            base = base + __import__("datetime").timedelta(days=skip)
-        target = base.replace(hour=9, minute=45, second=0, microsecond=0)
-
-    return False, max(0, int((target - now).total_seconds()))
+    is_open, seconds_until_open, _phase = _session_window()
+    return is_open, seconds_until_open
 
 
 # ─── v0.9.30: Score-log rotation ────────────────────────────────────────────
@@ -6157,9 +6356,8 @@ def _load_eod_state() -> None:
     """Загружает сохранённое состояние EOD из файла (нужно при рестарте бота)."""
     global _equity_day_start, _eod_sent_date, _sod_loaded_date
     try:
-        if os.path.exists(_EOD_FILE):
-            with open(_EOD_FILE, "r") as f:
-                d = __import__("json").load(f)
+        d = load_json_file(_EOD_FILE, {}, "_load_eod_state")
+        if isinstance(d, dict):
             _equity_day_start  = float(d.get("equity_day_start", 0))
             _eod_sent_date     = d.get("eod_sent_date", "")
             _sod_loaded_date   = d.get("sod_loaded_date", "")
@@ -6169,12 +6367,11 @@ def _load_eod_state() -> None:
 
 def _save_eod_state() -> None:
     try:
-        with open(_EOD_FILE, "w") as f:
-            __import__("json").dump({
-                "equity_day_start": _equity_day_start,
-                "eod_sent_date":    _eod_sent_date,
-                "sod_loaded_date":  _sod_loaded_date,
-            }, f)
+        save_json_file_atomic(_EOD_FILE, {
+            "equity_day_start": _equity_day_start,
+            "eod_sent_date":    _eod_sent_date,
+            "sod_loaded_date":  _sod_loaded_date,
+        }, "_save_eod_state")
     except Exception:
         pass
 
