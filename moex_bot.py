@@ -1352,17 +1352,31 @@ def get_candles(ticker: str, days: int = 21) -> list[dict]:
         f"{BASE_URL}/engines/stock/markets/shares/boards/TQBR"
         f"/securities/{ticker}/candles.json?from={date_from}&interval=24"
     )
-    try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        cols   = data["candles"]["columns"]
-        candles = [dict(zip(cols, row)) for row in data["candles"]["data"]]
-        return candles[-days:] if len(candles) >= days else candles
-    except Exception as e:
-        print(f"    [!] {ticker}: {e}")
-        logger.error("get_candles(%s): %s", ticker, e)
-        return []
+    last_error = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, timeout=10 + attempt * 5)
+            r.raise_for_status()
+            data = r.json()
+            cols   = data["candles"]["columns"]
+            candles = [dict(zip(cols, row)) for row in data["candles"]["data"]]
+            if attempt:
+                logger.info("get_candles(%s): recovered after retry=%d", ticker, attempt)
+            return candles[-days:] if len(candles) >= days else candles
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < 2:
+                logger.warning("get_candles(%s): transient network error, retry %d/2: %s", ticker, attempt + 1, e)
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            break
+        except Exception as e:
+            print(f"    [!] {ticker}: {e}")
+            logger.error("get_candles(%s): %s", ticker, e)
+            return []
+    print(f"    [!] {ticker}: {last_error}")
+    logger.error("get_candles(%s): %s", ticker, last_error)
+    return []
 
 
 def get_h1_candles_moex(ticker: str, days: int = 5) -> list[dict]:
@@ -4266,6 +4280,7 @@ def log_new_signal(s: dict, signal_id: str) -> None:
         "decision_reasons": s.get("decision_reasons", []),
         "data_quality_flags": s.get("data_quality_flags", []),
         "news_mode":       s.get("news_mode", "none"),
+        "execution_status": "signaled",
         "result":          None,   # "win_t1","win_t2","loss","be" — заполнится позже
         "exit_price":      None,
         "exit_time":       None,
@@ -4274,6 +4289,33 @@ def log_new_signal(s: dict, signal_id: str) -> None:
     }
     log.append(record)
     save_trade_log(log)
+
+
+def update_trade_execution_status(
+    signal_id: str,
+    execution_status: str,
+    *,
+    state: dict | None = None,
+    sb_order_id: str | None = None,
+    note: str = "",
+) -> None:
+    """Канонический execution-truth marker для trade_log."""
+    log = load_trade_log()
+    updated = False
+    for r in log:
+        if r.get("signal_id") != signal_id:
+            continue
+        r["execution_status"] = execution_status
+        if sb_order_id:
+            r["sb_order_id"] = sb_order_id
+        if note:
+            prev = r.get("notes") or ""
+            if note not in prev:
+                r["notes"] = (prev + " " + note).strip()
+        updated = True
+        break
+    if updated:
+        save_trade_log(log)
 
 
 def update_trade_result(signal_id: str, result: str, exit_price: float | None = None,
@@ -4317,6 +4359,8 @@ def update_trade_result(signal_id: str, result: str, exit_price: float | None = 
             r["exit_price"] = exit_price
             r["exit_time"]  = now_msk().strftime("%Y-%m-%d %H:%M")
             r["executed"]   = executed  # v0.9.36
+            if executed:
+                r["execution_status"] = "closed"
             if isinstance(sb_entry, dict) and sb_entry.get("order_id"):
                 r["sb_order_id"] = sb_entry.get("order_id")
             if exit_price and r.get("entry"):
@@ -4328,6 +4372,7 @@ def update_trade_result(signal_id: str, result: str, exit_price: float | None = 
                 marker = "[NOT_EXECUTED: risk-block/50002/no-order]"
                 if marker not in prev_notes:
                     r["notes"] = (prev_notes + " " + marker).strip()
+                r["execution_status"] = "virtual"
                 logger.info(
                     "[trade_log] %s %s %s pnl=%s%% — VIRTUAL (no sb_ order)",
                     r.get("ticker"), r.get("direction"), result,
@@ -5022,6 +5067,22 @@ def check_stop_target_hits(synthesized: list[dict], state: dict, intraday: dict)
 # Тикеры денежных позиций (кэш) — их исключаем из сравнения с sb_-ключами
 _CASH_TICKERS = {"RUB000UTSTOM", "RUB000", "USD000UTSTOM", "EUR000UTSTOM"}
 
+
+def _find_open_signal_candidates(state: dict, ticker: str, direction: str) -> list[str]:
+    """Открытые базовые сигналы того же тикера/направления без финального закрытия."""
+    result: list[str] = []
+    for key, val in state.items():
+        if not isinstance(val, dict):
+            continue
+        if key.startswith(("sb_", "news_", "ntg_")):
+            continue
+        if val.get("ticker") != ticker or val.get("direction") != direction:
+            continue
+        if val.get("hit") in ("target2", "stop_hit"):
+            continue
+        result.append(key)
+    return sorted(result)
+
 def reconcile_sandbox_state(state: dict) -> None:
     """
     v0.9.34: Синхронизирует signals_state.json с реальным портфелем T-Invest.
@@ -5076,9 +5137,17 @@ def reconcile_sandbox_state(state: dict) -> None:
 
             state[key]["closed_at"]    = datetime.now(timezone.utc).isoformat()
             state[key]["close_reason"] = "reconcile_ghost"
+            state[key]["execution_status"] = "ghost_closed"
             if ghost_price:
                 state[key]["close_price"] = ghost_price
             changed = True
+            base_signal_key = val.get("base_signal_key") or (key[3:] if key.startswith("sb_") else None)
+            if base_signal_key:
+                update_trade_execution_status(
+                    base_signal_key,
+                    "ghost_closed",
+                    note="[RECONCILE_GHOST]",
+                )
             msg = (f"🔄 [reconcile] Ghost-позиция {key} ({ticker}) — "
                    f"нет в портфеле → закрываем в state (ghost)")
             print(msg)
@@ -5096,10 +5165,27 @@ def reconcile_sandbox_state(state: dict) -> None:
 
     for ticker, pos in real_positions.items():
         if ticker in tracked_tickers:
+            for key, val in state.items():
+                if (
+                    key.startswith("sb_")
+                    and not val.get("closed_at")
+                    and val.get("ticker") == ticker
+                    and not val.get("order_id")
+                ):
+                    qty = pos.get("quantity", 0)
+                    val["direction"] = "LONG" if qty > 0 else "SHORT"
+                    val["lots"] = int(abs(qty))
+                    val["entry"] = pos.get("avg_price", val.get("entry", 0))
+                    val["price"] = pos.get("curr_price", val.get("price", 0))
+                    val["execution_status"] = val.get("reconcile_status", "orphan")
+                    val["reconcile_seen_at"] = datetime.now(timezone.utc).isoformat()
+                    changed = True
             continue
         qty = pos.get("quantity", 0)
         direction = "LONG" if qty > 0 else "SHORT"
-        orphan_key = f"sb_{ticker}_orphan"
+        candidates = _find_open_signal_candidates(state, ticker, direction)
+        linked_signal_key = candidates[0] if len(candidates) == 1 else None
+        orphan_key = f"sb_{linked_signal_key}" if linked_signal_key else f"sb_{ticker}_orphan"
         if orphan_key not in state:
             state[orphan_key] = {
                 "ticker":     ticker,
@@ -5109,13 +5195,37 @@ def reconcile_sandbox_state(state: dict) -> None:
                 "price":      pos.get("curr_price", 0),
                 "lots":       int(abs(qty)),
                 "opened_at":  datetime.now(timezone.utc).isoformat(),
-                "note":       "reconcile_orphan — позиция без записи в state",
+                "note":       (
+                    f"reconcile_orphan — связана с {linked_signal_key}"
+                    if linked_signal_key else
+                    "reconcile_orphan — позиция без записи в state"
+                ),
+                "reconcile_status": "linked_orphan" if linked_signal_key else "orphan",
+                "execution_status": "linked_orphan" if linked_signal_key else "orphan",
+                "base_signal_key": linked_signal_key,
+                "reconcile_seen_at": datetime.now(timezone.utc).isoformat(),
             }
             changed = True
-            msg = (f"🔄 [reconcile] Orphan-позиция {ticker} ({direction} ×{abs(qty):.0f}) — "
-                   f"нет в state → создана запись-заглушка")
+            if linked_signal_key:
+                update_trade_execution_status(
+                    linked_signal_key,
+                    "linked_orphan",
+                    note="[RECONCILE_LINKED_ORPHAN]",
+                )
+            msg = (
+                f"🔄 [reconcile] Orphan-позиция {ticker} ({direction} ×{abs(qty):.0f}) — "
+                f"{'связана с ' + linked_signal_key if linked_signal_key else 'нет в state → создана запись-заглушка'}"
+            )
             print(msg)
             logger.info(msg)
+            append_decision_log({
+                "action": "reconciled",
+                "reason": "reconcile_orphan",
+                "ticker": ticker,
+                "direction": direction,
+                "state_key": orphan_key,
+                "base_signal_key": linked_signal_key,
+            })
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 tg_send(f"⚠️ *Reconcile*: найдена неизвестная позиция `{ticker}` "
                         f"({direction} ×{abs(qty):.0f}) — добавлена в state как orphan.")
@@ -5585,8 +5695,14 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                 "equity_at_open": round(equity, 0) if equity else None,
                 "opened_at":    datetime.now(timezone.utc).isoformat(),
                 "base_signal_key": s.get("_state_key") or key,
+                "execution_status": "filled",
                 **_signal_meta(s),
             }
+            update_trade_execution_status(
+                s.get("_state_key") or key,
+                "filled",
+                sb_order_id=result.get("order_id"),
+            )
             dir_emoji  = "🟢" if direction == "LONG" else "🔴"
             exec_price = safe_price or entry
             exec_lots  = result.get("lots", lots)
@@ -5665,6 +5781,7 @@ def tg_notify_run(
                                 state[sb_key]["closed_at"] = datetime.now(timezone.utc).isoformat()
                                 state[sb_key]["close_reason"] = reason
                                 state[sb_key]["close_price"] = close_result.get("price")
+                                state[sb_key]["execution_status"] = "closed"
                                 if close_result.get("price"):
                                     s["current_price"] = close_result["price"]
                                 save_signals_state(state)
@@ -6467,7 +6584,7 @@ def send_eod_report() -> None:
         sign           = "+" if day_change >= 0 else ""
         equity_line    = (
             f"💼 Портфель: {equity_now:,.0f} ₽  "
-            f"({sign}{day_change:+,.0f} ₽  {sign}{day_change_pct:.2f}% за день)"
+            f"({sign}{day_change:,.0f} ₽  {sign}{day_change_pct:.2f}% за день)"
         )
     elif equity_now > 0:
         equity_line = f"💼 Портфель: {equity_now:,.0f} ₽"

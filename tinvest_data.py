@@ -206,6 +206,67 @@ def _load_blacklist() -> None:
 _load_blacklist()  # загружаем сразу при импорте модуля
 _load_capabilities()
 
+# ─── v0.9.38.4: InstrumentUID кэш (замена устаревших FIGI) ───────────────────
+# T-Invest с ~2026 мигрирует с FIGI на InstrumentUID.
+# При 50002 бот делает FindInstrument → получает uid → retry с instrument_id=uid.
+# Кэш сохраняется в файл — повторный поиск не нужен после первого успеха.
+_UID_CACHE: dict[str, str] = {}
+_UID_CACHE_FILE: _pathlib.Path = _pathlib.Path(__file__).parent / "instrument_uid_cache.json"
+
+
+def _load_uid_cache() -> None:
+    if not _UID_CACHE_FILE.exists():
+        return
+    try:
+        data = _json.loads(_UID_CACHE_FILE.read_text(encoding="utf-8"))
+        _UID_CACHE.update(data)
+        if _UID_CACHE:
+            logger.debug("UID cache loaded: %d тикеров из %s", len(_UID_CACHE), _UID_CACHE_FILE.name)
+    except Exception as _e:
+        logger.debug("UID cache load error: %s", _e)
+
+
+def _save_uid_cache() -> None:
+    try:
+        _UID_CACHE_FILE.write_text(_json.dumps(_UID_CACHE, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as _e:
+        logger.debug("UID cache save error: %s", _e)
+
+
+def find_and_cache_uid(ticker: str) -> Optional[str]:
+    """Ищет InstrumentUID через FindInstrument и кэширует в файл.
+
+    Используется как fallback когда FIGI даёт 50002 NOT_FOUND.
+    T-Invest мигрирует с FIGI на UID — новый стандарт идентификации.
+    После первого успешного поиска uid кэшируется — повторных API-вызовов нет.
+    """
+    if ticker in _UID_CACHE:
+        return _UID_CACHE[ticker]
+    if not is_available():
+        return None
+    try:
+        Client = _sdk_import("Client")
+        with Client(_get_token()) as client:
+            resp = client.instruments.find_instrument(query=ticker)
+        for inst in resp.instruments:
+            if getattr(inst, "ticker", "") == ticker:
+                uid = getattr(inst, "uid", None)
+                if uid:
+                    _UID_CACHE[ticker] = uid
+                    _save_uid_cache()
+                    logger.info(
+                        "[UID] %s → uid=%s (FIGI=%s) — кэшировано",
+                        ticker, uid, getattr(inst, "figi", "?"),
+                    )
+                    return uid
+        logger.warning("[UID] %s: инструмент не найден через FindInstrument", ticker)
+    except Exception as _ue:
+        logger.debug("[UID] find_and_cache_uid(%s): %s", ticker, _ue)
+    return None
+
+
+_load_uid_cache()
+
 
 def mark_sandbox_unavailable(ticker: str, reason: str = "50002") -> None:
     """Отметить тикер как недоступный в sandbox.
@@ -668,22 +729,29 @@ def get_orderbook(ticker: str, depth: int = 10) -> Optional[dict]:
 
     figi = get_figi(ticker)
     if not figi:
-        logger.debug(f"get_orderbook({ticker}): FIGI не найден")
+        logger.debug("get_orderbook(%s): FIGI не найден", ticker)
         return None
+
+    # v0.9.38.4: если UID уже закэширован — используем instrument_id
+    _uid = _UID_CACHE.get(ticker)
+
+    def _fetch_ob(client: object) -> object:
+        if _uid:
+            return client.market_data.get_order_book(instrument_id=_uid, depth=depth)
+        return client.market_data.get_order_book(figi=figi, depth=depth)
 
     try:
         Client = _sdk_import("Client")
 
         with Client(_get_token()) as client:
-            ob = client.market_data.get_order_book(figi=figi, depth=depth)
+            ob = _fetch_ob(client)
 
-        bids = ob.bids  # list[Order(price: Quotation, quantity: int)]
+        bids = ob.bids
         asks = ob.asks
 
         if not bids and not asks:
             return None
 
-        # quantity в стакане — в лотах (целое число, не Quotation)
         bid_vol = sum(int(b.quantity) for b in bids)
         ask_vol = sum(int(a.quantity) for a in asks)
         total   = bid_vol + ask_vol
@@ -705,15 +773,35 @@ def get_orderbook(ticker: str, depth: int = 10) -> Optional[dict]:
     except Exception as e:
         err_str = str(e)
         if "50002" in err_str:
-            mark_instrument_issue(
-                ticker,
-                "orderbook",
-                "50002",
-                detail="T-Invest orderbook returned NOT_FOUND",
-            )
+            if not _uid:
+                # v0.9.38.4: пробуем найти UID и повторить
+                uid = find_and_cache_uid(ticker)
+                if uid:
+                    try:
+                        Client2 = _sdk_import("Client")
+                        with Client2(_get_token()) as client2:
+                            ob2 = client2.market_data.get_order_book(instrument_id=uid, depth=depth)
+                        bids2, asks2 = ob2.bids, ob2.asks
+                        if not bids2 and not asks2:
+                            return None
+                        bv = sum(int(b.quantity) for b in bids2)
+                        av = sum(int(a.quantity) for a in asks2)
+                        tot = bv + av
+                        imb = round((bv - av) / tot, 3) if tot > 0 else 0.0
+                        bb = _proto_to_float(bids2[0].price) if bids2 else 0.0
+                        ba = _proto_to_float(asks2[0].price) if asks2 else 0.0
+                        return {
+                            "bid_volume": bv, "ask_volume": av, "imbalance": imb,
+                            "spread": round(ba - bb, 4) if (bb and ba) else 0.0,
+                            "best_bid": round(bb, 4), "best_ask": round(ba, 4),
+                        }
+                    except Exception:
+                        pass
+            mark_instrument_issue(ticker, "orderbook", "50002",
+                                  detail="T-Invest orderbook returned NOT_FOUND")
             logger.debug("get_orderbook(%s): NOT_FOUND 50002 → capability cooldown", ticker)
         else:
-            logger.debug(f"get_orderbook({ticker}): {e}")
+            logger.debug("get_orderbook(%s): %s", ticker, e)
         return None
 
 
@@ -774,15 +862,12 @@ def get_candles_tinvest(ticker: str, days: int = 21) -> list[dict]:
 _TINVEST_CANDLES_SKIP: set[str] = {
     "FLOT",   # BBG000NF0ZQ4 — NOT_FOUND v0.9.6
     "SMLT",   # BBG006HBB564 — NOT_FOUND v0.9.35
-    "SIBN",   # BBG004FWGS36 — NOT_FOUND (упоминался в комментариях)
-    "PIKK",   # BBG004730ZL5 — NOT_FOUND (упоминался в комментариях)
-    # v0.9.38.3: подтверждённые 50002 на ORDER PLACEMENT в sandbox (не только свечи)
-    # Эти инструменты физически отсутствуют в T-Invest sandbox — попытка ордера
-    # даёт 50002 NOT_FOUND. Сигналы генерируются, но sandbox-ордер не размещается.
-    # H1 свечи приходят через MOEX ISS fallback (поэтому CANDLES_SKIP нужен для тишины).
-    "CHMF",   # подтверждён 50002 на sandbox_place_order (22.04.2026)
-    "VTBR",   # подтверждён 50002 на sandbox_place_order (22.04.2026)
-    "OZON",   # подтверждён 50002 на sandbox_place_order (апрель 2026)
+    "SIBN",   # BBG004FWGS36 — NOT_FOUND
+    "PIKK",   # BBG004730ZL5 — NOT_FOUND
+    # v0.9.38.4: CBOM добавлен — BBG000TY1CX1 стабильно даёт 50002 на H1 свечах
+    # (~200 ERROR/день в логах). Сигналы CBOM работают через MOEX ISS fallback.
+    # Ордера CBOM идут через UID-retry (find_and_cache_uid). Только свечи — skip.
+    "CBOM",   # BBG000TY1CX1 — NOT_FOUND на GetCandles, 23.04.2026
 }
 
 
@@ -1051,11 +1136,37 @@ def sandbox_place_order(
     if not figi:
         return None
 
+    # v0.9.38.4: проверяем UID-кэш — если уже есть, сразу используем instrument_id
+    # (FIGI устарел для ряда тикеров, T-Invest возвращает 50002 даже при верном FIGI)
+    _uid_override = _UID_CACHE.get(ticker)
+
+    def _do_order(client, order_dir, order_type_cls) -> object:
+        import uuid as _uuid
+        order_id = str(_uuid.uuid4())
+        if _uid_override:
+            # UID уже известен — используем instrument_id напрямую
+            return client.sandbox.post_sandbox_order(
+                instrument_id=_uid_override,
+                quantity=quantity,
+                direction=order_dir,
+                account_id=acc_id,
+                order_type=order_type_cls.ORDER_TYPE_MARKET,
+                order_id=order_id,
+            )
+        else:
+            return client.sandbox.post_sandbox_order(
+                figi=figi,
+                quantity=quantity,
+                direction=order_dir,
+                account_id=acc_id,
+                order_type=order_type_cls.ORDER_TYPE_MARKET,
+                order_id=order_id,
+            )
+
     try:
         Client, OrderDirection, OrderType = _sdk_import(
             "Client", "OrderDirection", "OrderType"
         )
-        import uuid
 
         order_dir = (
             OrderDirection.ORDER_DIRECTION_BUY
@@ -1064,14 +1175,7 @@ def sandbox_place_order(
         )
 
         with Client(_get_token()) as client:
-            resp = client.sandbox.post_sandbox_order(
-                figi=figi,
-                quantity=quantity,
-                direction=order_dir,
-                account_id=acc_id,
-                order_type=OrderType.ORDER_TYPE_MARKET,
-                order_id=str(uuid.uuid4()),
-            )
+            resp = _do_order(client, order_dir, OrderType)
             exec_price = (
                 _proto_to_float(resp.executed_order_price)
                 if resp.executed_order_price
@@ -1089,19 +1193,20 @@ def sandbox_place_order(
             "shares":    quantity * LOT_SIZE.get(ticker, 1),
         }
         logger.info(
-            f"[SANDBOX] {direction} {ticker} ×{quantity}л "
-            f"→ {resp.order_id}  статус={resp.execution_report_status}"
+            "[SANDBOX] %s %s ×%dл → %s  статус=%s%s",
+            direction, ticker, quantity, resp.order_id,
+            resp.execution_report_status,
+            " [via UID]" if _uid_override else "",
         )
         return result
 
     except Exception as e:
         err_str = str(e)
         # Код 30079 = "Instrument is not available for trading" (временно/квалинвестор).
-        # Это штатная ситуация для sandbox — логируем как WARNING, не ERROR.
         if "30079" in err_str:
             logger.warning(
-                f"[SANDBOX] {ticker} недоступен для торговли (30079 — "
-                f"инструмент может быть временно закрыт или требует квалинвестора)"
+                "[SANDBOX] %s недоступен для торговли (30079 — временно закрыт или квалинвестор)",
+                ticker,
             )
             mark_instrument_issue(
                 ticker,
@@ -1110,14 +1215,78 @@ def sandbox_place_order(
                 detail="Instrument unavailable for trading in sandbox",
             )
         elif "50002" in err_str:
-            logger.warning(
-                f"[SANDBOX] {ticker} не найден в T-Invest (50002) — "
-                f"инструмент недоступен в sandbox, ордер пропущен"
-            )
-            # v0.9.36: помечаем в runtime-blacklist до рестарта / TTL
-            mark_sandbox_unavailable(ticker)
+            # v0.9.38.4: FIGI устарел → ищем UID через FindInstrument и делаем retry
+            if not _uid_override:
+                logger.warning(
+                    "[SANDBOX] %s → 50002 (FIGI устарел). Ищем InstrumentUID...", ticker
+                )
+                uid = find_and_cache_uid(ticker)
+                if uid:
+                    # Retry с instrument_id=uid
+                    try:
+                        Client2, OrderDirection2, OrderType2 = _sdk_import(
+                            "Client", "OrderDirection", "OrderType"
+                        )
+                        import uuid as _uuid2
+                        order_dir2 = (
+                            OrderDirection2.ORDER_DIRECTION_BUY
+                            if direction == "LONG"
+                            else OrderDirection2.ORDER_DIRECTION_SELL
+                        )
+                        with Client2(_get_token()) as client2:
+                            resp2 = client2.sandbox.post_sandbox_order(
+                                instrument_id=uid,
+                                quantity=quantity,
+                                direction=order_dir2,
+                                account_id=acc_id,
+                                order_type=OrderType2.ORDER_TYPE_MARKET,
+                                order_id=str(_uuid2.uuid4()),
+                            )
+                            exec_price2 = (
+                                _proto_to_float(resp2.executed_order_price)
+                                if resp2.executed_order_price
+                                else None
+                            )
+                        # Retry успешен — снимаем блокировки если были
+                        _SANDBOX_UNAVAILABLE.pop(ticker, None)
+                        _save_blacklist()
+                        logger.info(
+                            "[SANDBOX] %s %s ×%dл → %s [via UID retry — FIGI устарел, UID закэширован]",
+                            direction, ticker, quantity, resp2.order_id,
+                        )
+                        return {
+                            "order_id":  resp2.order_id,
+                            "status":    str(resp2.execution_report_status),
+                            "direction": direction,
+                            "ticker":    ticker,
+                            "quantity":  quantity,
+                            "price":     exec_price2,
+                            "lots":      quantity,
+                            "shares":    quantity * LOT_SIZE.get(ticker, 1),
+                        }
+                    except Exception as e2:
+                        logger.warning(
+                            "[SANDBOX] %s retry с UID тоже не прошёл: %s — добавляем в blacklist",
+                            ticker, e2,
+                        )
+                        mark_sandbox_unavailable(ticker)
+                else:
+                    # FindInstrument не нашёл — инструмент действительно недоступен
+                    logger.warning(
+                        "[SANDBOX] %s: UID не найден — инструмент недоступен в T-Invest sandbox",
+                        ticker,
+                    )
+                    mark_sandbox_unavailable(ticker)
+            else:
+                # UID уже был, но тоже вернул 50002 — странно, сбрасываем кэш
+                logger.warning(
+                    "[SANDBOX] %s: 50002 даже с UID=%s — сбрасываем UID кэш", ticker, _uid_override
+                )
+                _UID_CACHE.pop(ticker, None)
+                _save_uid_cache()
+                mark_sandbox_unavailable(ticker)
         else:
-            logger.error(f"sandbox_place_order({ticker}): {e}")
+            logger.error("sandbox_place_order(%s): %s", ticker, e)
         return None
 
 

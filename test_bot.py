@@ -597,6 +597,105 @@ class TestDailyReportDiagnostics(unittest.TestCase):
         self.assertEqual(summary["actions"]["skipped"], 2)
         self.assertEqual(summary["reasons"]["sandbox_unavailable"], 2)
 
+    def test_portfolio_mismatch_summary_detects_orphan(self):
+        lines, count = dr.portfolio_mismatch_summary({
+            "sb_SBER_orphan": {
+                "ticker": "SBER",
+                "direction": "LONG",
+                "lots": 28,
+                "price": 324.53,
+                "note": "reconcile_orphan — позиция без записи в state",
+            },
+            "sb_AFLT_SHORT_2026-04-20": {
+                "ticker": "AFLT",
+                "direction": "SHORT",
+                "order_id": "abc",
+                "lots": 100,
+                "price": 49.96,
+            },
+        })
+        self.assertEqual(count, 1)
+        self.assertIn("SBER LONG", lines[0])
+        self.assertIn("[orphan]", lines[0])
+
+    def test_signal_state_gap_summary_detects_open_signal_without_sb(self):
+        lines, count = dr.signal_state_gap_summary({
+            "CBOM_LONG_2026-04-21": {
+                "ticker": "CBOM",
+                "direction": "LONG",
+                "entry": 6.56,
+                "hit": None,
+            },
+            "sb_AFLT_SHORT_2026-04-20": {
+                "ticker": "AFLT",
+                "direction": "SHORT",
+                "order_id": "abc",
+                "base_signal_key": "AFLT_SHORT_2026-04-20",
+            },
+            "AFLT_SHORT_2026-04-20": {
+                "ticker": "AFLT",
+                "direction": "SHORT",
+                "entry": 49.96,
+                "hit": None,
+            },
+        })
+        self.assertEqual(count, 1)
+        self.assertIn("CBOM LONG", lines[0])
+        self.assertIn("[signal_without_sb]", lines[0])
+
+    def test_execution_truth_summary_counts_links_and_gaps(self):
+        truth = dr.execution_truth_summary(
+            {
+                "SBER_LONG_2026-04-23": {"ticker": "SBER", "direction": "LONG", "hit": None},
+                "CBOM_LONG_2026-04-21": {"ticker": "CBOM", "direction": "LONG", "hit": None},
+                "sb_SBER_LONG_2026-04-23": {
+                    "ticker": "SBER",
+                    "order_id": "ord1",
+                    "base_signal_key": "SBER_LONG_2026-04-23",
+                },
+                "sb_VTBR_orphan": {
+                    "ticker": "VTBR",
+                    "direction": "LONG",
+                    "order_id": None,
+                },
+            },
+            [
+                {"signal_id": "SBER_LONG_2026-04-23", "execution_status": "filled"},
+                {"signal_id": "CBOM_LONG_2026-04-21", "execution_status": "signaled"},
+            ],
+        )
+        self.assertEqual(truth["sb_open"], 2)
+        self.assertEqual(truth["sb_orphan"], 1)
+        self.assertEqual(truth["base_open"], 2)
+        self.assertEqual(truth["base_with_sb"], 1)
+        self.assertEqual(truth["base_without_sb"], 1)
+
+    def test_strategy_results_aggregate_by_pattern(self):
+        summary = dr.summarize_strategy_results([
+            {"pattern": "⚡ SELL THE NEWS", "executed": True, "pnl_pct": 1.2},
+            {"pattern": "⚡ SELL THE NEWS", "executed": True, "pnl_pct": -0.7},
+            {"pattern": "BREAKOUT", "executed": False, "pnl_pct": None},
+        ])
+        rows = {row["pattern"]: row for row in summary["patterns"]}
+        self.assertEqual(rows["⚡ SELL THE NEWS"]["signals"], 2)
+        self.assertEqual(rows["⚡ SELL THE NEWS"]["closed"], 2)
+        self.assertEqual(rows["⚡ SELL THE NEWS"]["winrate"], 50.0)
+        self.assertEqual(rows["BREAKOUT"]["executed"], 0)
+
+    def test_network_and_uid_summaries_parse_log_lines(self):
+        lines = [
+            "2026-04-23 12:00:00 [WARNING] moex_bot: get_candles(SBER): transient network error, retry 1/2: timeout",
+            "2026-04-23 12:01:00 [ERROR] moex_bot: get_candles(SBER): Max retries exceeded",
+            "2026-04-23 12:02:00 [INFO] tinvest_data: [UID] CBOM → uid=abc123 (FIGI=old) — кэшировано",
+            "2026-04-23 12:03:00 [INFO] tinvest_data: [SANDBOX] LONG CBOM ×1л → xyz [via UID retry — FIGI устарел, UID закэширован]",
+        ]
+        net = dr.summarize_network_resilience(lines)
+        uid = dr.summarize_uid_fallback(lines)
+        self.assertEqual(net["moex_request_retry"], 1)
+        self.assertEqual(net["moex_request_failed"], 1)
+        self.assertEqual(uid["uid_cache_success"], 1)
+        self.assertEqual(uid["uid_retry_success"], 1)
+
     def test_no_market_signals_returns_empty(self):
         news = [self._news_item("LONG")]
         result = mb.synthesize_signals([], news)
@@ -647,6 +746,57 @@ class TestStateResilience(unittest.TestCase):
                 mb.save_trade_log(payload)
                 loaded = mb.load_trade_log()
             self.assertEqual(loaded, payload)
+
+
+class TestMoexNetworkRetry(unittest.TestCase):
+
+    def test_get_candles_recovers_after_transient_error(self):
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "candles": {
+                "columns": ["open", "close", "high", "low", "value", "begin"],
+                "data": [[100.0, 101.0, 102.0, 99.0, 1_000_000.0, "2026-04-23T10:00:00+03:00"]],
+            }
+        }
+        with patch("moex_bot.requests.get", side_effect=[
+            mb.requests.exceptions.ConnectTimeout("timeout"),
+            response,
+        ]), patch("moex_bot.time.sleep"):
+            candles = mb.get_candles("SBER", days=1)
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(candles[0]["close"], 101.0)
+
+
+class TestReconcileLinking(unittest.TestCase):
+
+    def test_reconcile_links_orphan_to_single_open_signal(self):
+        state = {
+            "SBER_LONG_2026-04-23": {
+                "ticker": "SBER",
+                "direction": "LONG",
+                "entry": 320.0,
+                "hit": None,
+            }
+        }
+        portfolio = {
+            "positions": [
+                {"ticker": "SBER", "quantity": 28, "avg_price": 322.72, "curr_price": 324.53}
+            ]
+        }
+        fake_tinvest = MagicMock()
+        fake_tinvest.get_sandbox_portfolio.return_value = portfolio
+
+        with patch.object(mb, "SANDBOX_AUTO_ORDER", True), \
+             patch.object(mb, "_tinvest_available", return_value=True), \
+             patch.object(mb, "_tinvest", fake_tinvest), \
+             patch.object(mb, "save_signals_state"), \
+             patch.object(mb, "append_decision_log"):
+            mb.reconcile_sandbox_state(state)
+
+        self.assertIn("sb_SBER_LONG_2026-04-23", state)
+        self.assertEqual(state["sb_SBER_LONG_2026-04-23"]["base_signal_key"], "SBER_LONG_2026-04-23")
+        self.assertEqual(state["sb_SBER_LONG_2026-04-23"]["reconcile_status"], "linked_orphan")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
