@@ -55,6 +55,7 @@ _MSK_TZ     = pytz.timezone("Europe/Moscow")
 _NOW_MSK    = datetime.now(_MSK_TZ)
 TODAY_STR   = _NOW_MSK.strftime("%Y-%m-%d")
 TODAY_LABEL = _NOW_MSK.strftime("%d.%m.%Y")
+DAILY_DIAGNOSTICS_FILE = _DIR / f"daily_diagnostics_{TODAY_STR}.json"
 
 # Лотность — синхронизирована с moex_bot.py (нужна для расчёта ₽ P&L)
 # v0.9.38 — импортируем унифицированный LOT_SIZE из tinvest_data (единственный
@@ -136,6 +137,7 @@ def _build_daily_archive() -> Path | None:
         _DIR / "trade_log.json",
         _DIR / "signals_score_log.jsonl",
         _DIR / "signals_decision_log.jsonl",
+        _DIR / f"daily_diagnostics_{date_str}.json",
         _DIR / "news_memory.json",
         _DIR / "signals_state.json",
         _DIR / "cbr_rate_cache.json",
@@ -318,6 +320,148 @@ def summarize_capabilities() -> dict:
     }
 
 
+def summarize_strategy_results(all_trades: list[dict]) -> dict:
+    strategies: dict[str, dict[str, float | int]] = {}
+    for t in all_trades:
+        pattern = str(t.get("pattern") or "UNSPECIFIED")
+        rec = strategies.setdefault(pattern, {
+            "signals": 0,
+            "executed": 0,
+            "closed": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pnl": 0.0,
+            "avg_pnl": 0.0,
+            "winrate": 0.0,
+        })
+        rec["signals"] += 1
+        if _is_executed(t):
+            rec["executed"] += 1
+        pnl = t.get("pnl_pct")
+        if pnl is not None:
+            rec["closed"] += 1
+            rec["total_pnl"] += float(pnl)
+            if float(pnl) > 0:
+                rec["wins"] += 1
+            elif float(pnl) < 0:
+                rec["losses"] += 1
+
+    for rec in strategies.values():
+        closed = int(rec["closed"])
+        wins = int(rec["wins"])
+        total_pnl = float(rec["total_pnl"])
+        rec["avg_pnl"] = round(total_pnl / closed, 2) if closed else 0.0
+        rec["total_pnl"] = round(total_pnl, 2)
+        rec["winrate"] = round(wins / closed * 100, 1) if closed else 0.0
+
+    top = sorted(
+        (
+            {"pattern": pattern, **stats}
+            for pattern, stats in strategies.items()
+        ),
+        key=lambda item: (-int(item["signals"]), item["pattern"]),
+    )
+    return {"patterns": top}
+
+
+def summarize_uid_fallback(lines: list[str]) -> dict:
+    stats = {
+        "uid_cache_success": 0,
+        "uid_find_failed": 0,
+        "uid_retry_success": 0,
+        "uid_retry_failed": 0,
+        "tickers": {},
+    }
+    for line in lines:
+        ticker = None
+        if "[UID]" in line and "→ uid=" in line:
+            stats["uid_cache_success"] += 1
+        if "[UID]" in line and "инструмент не найден через FindInstrument" in line:
+            stats["uid_find_failed"] += 1
+        if "[via UID retry" in line:
+            stats["uid_retry_success"] += 1
+        if "retry с UID тоже не прошёл" in line:
+            stats["uid_retry_failed"] += 1
+        for known in ("SBER", "GAZP", "OZON", "CBOM", "SMLT", "VTBR", "CHMF", "AFLT", "AFKS", "MOEX"):
+            if known in line:
+                ticker = known
+                break
+        if ticker and ("UID" in line or "via UID" in line):
+            stats["tickers"][ticker] = stats["tickers"].get(ticker, 0) + 1
+    return stats
+
+
+def summarize_network_resilience(lines: list[str]) -> dict:
+    stats = {
+        "moex_request_retry": 0,
+        "moex_request_failed": 0,
+        "endpoints": {},
+    }
+    for line in lines:
+        if "transient network error, retry" in line:
+            stats["moex_request_retry"] += 1
+            endpoint = "get_candles"
+            stats["endpoints"][endpoint] = stats["endpoints"].get(endpoint, 0) + 1
+        if "Max retries exceeded" in line or "Read timed out" in line or "ConnectTimeoutError" in line:
+            stats["moex_request_failed"] += 1
+            endpoint = "get_candles" if "get_candles(" in line else "unknown"
+            stats["endpoints"][endpoint] = stats["endpoints"].get(endpoint, 0) + 1
+    return stats
+
+
+def summarize_reconcile_health(state: dict, decision_entries: list[dict]) -> dict:
+    stats = {
+        "ghost_closed": 0,
+        "linked_orphan": 0,
+        "orphan": 0,
+        "signal_without_sb": 0,
+    }
+    mismatch_lines, mismatch_count = portfolio_mismatch_summary(state)
+    gap_lines, gap_count = signal_state_gap_summary(state)
+    stats["signal_without_sb"] = gap_count
+    for key, val in state.items():
+        if not key.startswith("sb_") or not isinstance(val, dict):
+            continue
+        if val.get("close_reason") == "reconcile_ghost":
+            stats["ghost_closed"] += 1
+        status = str(val.get("reconcile_status") or val.get("execution_status") or "")
+        if status == "linked_orphan":
+            stats["linked_orphan"] += 1
+        elif status == "orphan" or ("orphan" in key.lower() and not val.get("closed_at")):
+            stats["orphan"] += 1
+    stats["open_mismatch_rows"] = mismatch_lines[:8]
+    stats["gap_rows"] = gap_lines[:8]
+    stats["reconcile_events_today"] = sum(1 for e in decision_entries if str(e.get("reason")) == "reconcile_orphan")
+    return stats
+
+
+def build_daily_diagnostics(
+    all_trades: list[dict],
+    state: dict,
+    log_lines: list[str],
+    decision_entries: list[dict],
+) -> dict:
+    return {
+        "date": TODAY_STR,
+        "generated_at": _NOW_MSK.isoformat(),
+        "strategy_results": summarize_strategy_results(all_trades),
+        "reason_codes": summarize_decisions(decision_entries),
+        "uid_fallback": summarize_uid_fallback(log_lines),
+        "network_resilience": summarize_network_resilience(log_lines),
+        "reconcile_health": summarize_reconcile_health(state, decision_entries),
+    }
+
+
+def save_daily_diagnostics(payload: dict) -> None:
+    try:
+        DAILY_DIAGNOSTICS_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"⚠️  save_daily_diagnostics: {e}")
+
+
 # ─── Анализ сделок ────────────────────────────────────────────────────────────
 def _is_executed(t: dict) -> bool:
     """v0.9.37: real sandbox order placed?
@@ -489,6 +633,122 @@ def open_positions_summary(state: dict) -> tuple[list[str], int, float]:
     return lines, len(rows), total_deployed
 
 
+def portfolio_mismatch_summary(state: dict) -> tuple[list[str], int]:
+    """
+    Показывает открытые sb_-записи, которые не выглядят как нормальные исполняемые позиции.
+    Сейчас это в первую очередь orphan-записи reconcile, из-за которых внешняя сводка
+    и локальный отчёт могут показывать разное число открытых позиций.
+    """
+    rows: list[str] = []
+    for key, val in state.items():
+        if not key.startswith("sb_") or not isinstance(val, dict):
+            continue
+        if val.get("closed_at"):
+            continue
+        if val.get("order_id"):
+            continue
+        ticker = val.get("ticker", key.replace("sb_", "").split("_")[0])
+        direction = val.get("direction", "?")
+        lots = int(abs(val.get("lots", 0) or 0))
+        note = str(val.get("note") or "")
+        reason = "orphan" if "orphan" in key.lower() or "orphan" in note.lower() else "untracked"
+        price = float(val.get("price") or val.get("entry") or 0)
+        qty_str = f" × {lots}л" if lots else ""
+        px_str = f" @ {price:.1f}" if price else ""
+        rows.append(f"  ⚠️{ticker} {direction}{qty_str}{px_str}  [{reason}]")
+
+    if not rows:
+        return [], 0
+    rows.sort()
+    return rows, len(rows)
+
+
+def signal_state_gap_summary(state: dict) -> tuple[list[str], int]:
+    """
+    Базовые сигналы, которые выглядят открытыми, но не имеют живой sb_-позиции.
+    Это отдельный класс проблемы от orphan: идея сигнала в state есть, а подтверждения
+    реального исполнения нет.
+    """
+    open_sb_keys: set[str] = set()
+    open_sb_base_keys: set[str] = set()
+    for key, val in state.items():
+        if not key.startswith("sb_") or not isinstance(val, dict):
+            continue
+        if val.get("closed_at"):
+            continue
+        open_sb_keys.add(key[3:])
+        base_signal_key = val.get("base_signal_key")
+        if base_signal_key:
+            open_sb_base_keys.add(str(base_signal_key))
+
+    rows: list[str] = []
+    for key, val in state.items():
+        if not isinstance(val, dict):
+            continue
+        if key.startswith(("sb_", "news_", "ntg_")):
+            continue
+        if val.get("hit") in ("target2", "stop_hit"):
+            continue
+        if key in open_sb_keys or key in open_sb_base_keys:
+            continue
+        ticker = val.get("ticker", key.split("_")[0])
+        direction = val.get("direction", "?")
+        entry = float(val.get("entry") or 0)
+        entry_str = f" @ {entry:.1f}" if entry else ""
+        rows.append(f"  ⚠️{ticker} {direction}{entry_str}  [signal_without_sb]")
+
+    if not rows:
+        return [], 0
+    rows.sort()
+    return rows, len(rows)
+
+
+def execution_truth_summary(state: dict, trades: list[dict]) -> dict:
+    sb_open = 0
+    sb_orphan = 0
+    base_open = 0
+    base_with_sb = 0
+    trade_status: dict[str, int] = {}
+
+    open_sb_base_keys: set[str] = set()
+    for key, val in state.items():
+        if not isinstance(val, dict):
+            continue
+        if key.startswith("sb_") and not val.get("closed_at"):
+            sb_open += 1
+            if not val.get("order_id"):
+                sb_orphan += 1
+            base_signal_key = val.get("base_signal_key")
+            if base_signal_key:
+                open_sb_base_keys.add(str(base_signal_key))
+            else:
+                open_sb_base_keys.add(key[3:])
+
+    for key, val in state.items():
+        if not isinstance(val, dict):
+            continue
+        if key.startswith(("sb_", "news_", "ntg_")):
+            continue
+        if val.get("hit") in ("target2", "stop_hit"):
+            continue
+        base_open += 1
+        if key in open_sb_base_keys:
+            base_with_sb += 1
+
+    for t in trades:
+        status = str(t.get("execution_status") or ("filled" if t.get("executed") else "signaled"))
+        trade_status[status] = trade_status.get(status, 0) + 1
+
+    return {
+        "sb_open": sb_open,
+        "sb_orphan": sb_orphan,
+        "base_open": base_open,
+        "base_with_sb": base_with_sb,
+        "base_without_sb": max(0, base_open - base_with_sb),
+        "trade_status": trade_status,
+    }
+
+
 # ─── Форматирование сделок ────────────────────────────────────────────────────
 def format_trade_closed(t: dict) -> str:
     """Закрытая сделка: вход → выход, P&L, проскальзывание стопа если было."""
@@ -645,6 +905,7 @@ def estimate_deposit_delta(state: dict, closed_today: list[dict], equity_sod: fl
 def build_report(
     opened:     list[dict],
     closed:     list[dict],
+    all_trades: list[dict],
     stats:      dict,
     state:      dict,
     log_stats:  dict,
@@ -654,6 +915,7 @@ def build_report(
     week:       dict,
 ) -> str:
     parts: list[str] = []
+    truth = execution_truth_summary(state, all_trades)
 
     # ── Заголовок ─────────────────────────────────────────────────────────────
     parts.append(f"📊 <b>Отчёт бота за {TODAY_LABEL}</b>")
@@ -719,6 +981,28 @@ def build_report(
         header += f"  ~{deployed_rub/1000:.0f}k₽ задействовано"
     parts.append(f"\n{header}:")
     parts.extend(pos_lines)
+
+    mismatch_lines, mismatch_count = portfolio_mismatch_summary(state)
+    if mismatch_count:
+        parts.append(f"\n⚠️ <b>Portfolio mismatch ({mismatch_count})</b>:")
+        parts.extend(mismatch_lines)
+        parts.append("  Проверь reconcile/orphan и сверку sandbox-портфеля с local state")
+
+    signal_gap_lines, signal_gap_count = signal_state_gap_summary(state)
+    if signal_gap_count:
+        parts.append(f"\n🧷 <b>Signal/state gaps ({signal_gap_count})</b>:")
+        parts.extend(signal_gap_lines[:8])
+        parts.append("  Есть открытый сигнал в state, но нет живой sb_-позиции")
+
+    parts.append(
+        f"\n🧭 <b>Execution truth:</b> sb_open={truth['sb_open']}  "
+        f"orphan={truth['sb_orphan']}  base_open={truth['base_open']}  "
+        f"linked={truth['base_with_sb']}  gaps={truth['base_without_sb']}"
+    )
+    trade_status = truth.get("trade_status") or {}
+    if trade_status:
+        top_status = sorted(trade_status.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+        parts.append("  " + "  ".join(f"{name}={count}" for name, count in top_status))
 
     # ── Неделя ────────────────────────────────────────────────────────────────
     if week and week.get("count"):
@@ -820,6 +1104,8 @@ def main() -> int:
     decision_entries   = load_today_decision_entries()
     decision_stats     = summarize_decisions(decision_entries)
     capability_stats   = summarize_capabilities()
+    diagnostics        = build_daily_diagnostics(all_trades, state, log_lines_raw, decision_entries)
+    save_daily_diagnostics(diagnostics)
     opened, closed     = trades_today(all_trades)
     stats              = day_pnl_stats(closed)
     week               = weekly_stats(all_trades)
@@ -827,6 +1113,7 @@ def main() -> int:
     report = build_report(
         opened    = opened,
         closed    = closed,
+        all_trades = all_trades,
         stats     = stats,
         state     = state,
         log_stats = log_stats,
