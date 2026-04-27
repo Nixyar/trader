@@ -56,6 +56,14 @@ _NOW_MSK    = datetime.now(_MSK_TZ)
 TODAY_STR   = _NOW_MSK.strftime("%Y-%m-%d")
 TODAY_LABEL = _NOW_MSK.strftime("%d.%m.%Y")
 DAILY_DIAGNOSTICS_FILE = _DIR / f"daily_diagnostics_{TODAY_STR}.json"
+_INSTRUMENT_ALIASES = {
+    "BBG00F6NKQX3": "SMLT",
+}
+
+
+def _normalize_ticker(ticker: str | None) -> str:
+    value = str(ticker or "")
+    return _INSTRUMENT_ALIASES.get(value, value)
 
 # Лотность — синхронизирована с moex_bot.py (нужна для расчёта ₽ P&L)
 # v0.9.38 — импортируем унифицированный LOT_SIZE из tinvest_data (единственный
@@ -142,6 +150,7 @@ def _build_daily_archive() -> Path | None:
         _DIR / "signals_state.json",
         _DIR / "cbr_rate_cache.json",
         _DIR / "instrument_capabilities.json",
+        _DIR / "instrument_uid_cache.json",
         _DIR / "sandbox_blacklist.json",
         _DIR / "event_calendar.json",
         _DIR / "bot.log",
@@ -335,10 +344,13 @@ def summarize_strategy_results(all_trades: list[dict]) -> dict:
             "winrate": 0.0,
         })
         rec["signals"] += 1
-        if _is_executed(t):
+        executed = _is_executed(t)
+        if executed:
             rec["executed"] += 1
+        else:
+            rec["virtual"] = int(rec.get("virtual", 0)) + 1
         pnl = t.get("pnl_pct")
-        if pnl is not None:
+        if executed and pnl is not None:
             rec["closed"] += 1
             rec["total_pnl"] += float(pnl)
             if float(pnl) > 0:
@@ -467,7 +479,13 @@ def _is_executed(t: dict) -> bool:
     """v0.9.37: real sandbox order placed?
     Legacy trades без поля executed считаются реальными (True).
     """
-    return bool(t.get("executed", True))
+    status = str(t.get("execution_status") or "")
+    if status in {"virtual", "ghost_closed", "rejected"}:
+        return False
+    executed = t.get("executed", True)
+    if executed is False:
+        return False
+    return True
 
 
 def trades_today(all_trades: list[dict]) -> tuple[list, list]:
@@ -523,6 +541,7 @@ def weekly_stats(all_trades: list[dict]) -> dict:
         t for t in all_trades
         if t.get("exit_time") and t["exit_time"] >= cutoff
         and t.get("pnl_pct") is not None
+        and _is_executed(t)
     ]
     if not recent:
         return {}
@@ -578,7 +597,7 @@ def open_positions_summary(state: dict) -> tuple[list[str], int, float]:
     total_deployed: float = 0.0
 
     for key, val in rows:
-        ticker    = val.get("ticker", key.replace("sb_", "").split("_")[0])
+        ticker    = _normalize_ticker(val.get("ticker", key.replace("sb_", "").split("_")[0]))
         direction = val.get("direction", "?")
         price     = float(val.get("price") or val.get("entry") or 0)
         lots      = int(val.get("lots", 1))
@@ -647,7 +666,7 @@ def portfolio_mismatch_summary(state: dict) -> tuple[list[str], int]:
             continue
         if val.get("order_id"):
             continue
-        ticker = val.get("ticker", key.replace("sb_", "").split("_")[0])
+        ticker = _normalize_ticker(val.get("ticker", key.replace("sb_", "").split("_")[0]))
         direction = val.get("direction", "?")
         lots = int(abs(val.get("lots", 0) or 0))
         note = str(val.get("note") or "")
@@ -671,12 +690,17 @@ def signal_state_gap_summary(state: dict) -> tuple[list[str], int]:
     """
     open_sb_keys: set[str] = set()
     open_sb_base_keys: set[str] = set()
+    open_sb_ticker_dirs: set[tuple[str, str]] = set()
     for key, val in state.items():
         if not key.startswith("sb_") or not isinstance(val, dict):
             continue
         if val.get("closed_at"):
             continue
         open_sb_keys.add(key[3:])
+        open_sb_ticker_dirs.add((
+            _normalize_ticker(val.get("ticker", key.replace("sb_", "").split("_")[0])),
+            str(val.get("direction", "")),
+        ))
         base_signal_key = val.get("base_signal_key")
         if base_signal_key:
             open_sb_base_keys.add(str(base_signal_key))
@@ -691,8 +715,10 @@ def signal_state_gap_summary(state: dict) -> tuple[list[str], int]:
             continue
         if key in open_sb_keys or key in open_sb_base_keys:
             continue
-        ticker = val.get("ticker", key.split("_")[0])
-        direction = val.get("direction", "?")
+        ticker = _normalize_ticker(val.get("ticker", key.split("_")[0]))
+        direction = str(val.get("direction", "?"))
+        if (ticker, direction) in open_sb_ticker_dirs:
+            continue
         entry = float(val.get("entry") or 0)
         entry_str = f" @ {entry:.1f}" if entry else ""
         rows.append(f"  ⚠️{ticker} {direction}{entry_str}  [signal_without_sb]")
@@ -711,6 +737,7 @@ def execution_truth_summary(state: dict, trades: list[dict]) -> dict:
     trade_status: dict[str, int] = {}
 
     open_sb_base_keys: set[str] = set()
+    open_sb_ticker_dirs: set[tuple[str, str]] = set()
     for key, val in state.items():
         if not isinstance(val, dict):
             continue
@@ -718,6 +745,10 @@ def execution_truth_summary(state: dict, trades: list[dict]) -> dict:
             sb_open += 1
             if not val.get("order_id"):
                 sb_orphan += 1
+            open_sb_ticker_dirs.add((
+                _normalize_ticker(val.get("ticker", key.replace("sb_", "").split("_")[0])),
+                str(val.get("direction", "")),
+            ))
             base_signal_key = val.get("base_signal_key")
             if base_signal_key:
                 open_sb_base_keys.add(str(base_signal_key))
@@ -732,7 +763,11 @@ def execution_truth_summary(state: dict, trades: list[dict]) -> dict:
         if val.get("hit") in ("target2", "stop_hit"):
             continue
         base_open += 1
-        if key in open_sb_base_keys:
+        ticker_dir = (
+            _normalize_ticker(val.get("ticker", key.split("_")[0])),
+            str(val.get("direction", "")),
+        )
+        if key in open_sb_base_keys or ticker_dir in open_sb_ticker_dirs:
             base_with_sb += 1
 
     for t in trades:
@@ -752,7 +787,7 @@ def execution_truth_summary(state: dict, trades: list[dict]) -> dict:
 # ─── Форматирование сделок ────────────────────────────────────────────────────
 def format_trade_closed(t: dict) -> str:
     """Закрытая сделка: вход → выход, P&L, проскальзывание стопа если было."""
-    ticker    = t.get("ticker", "?")
+    ticker    = _normalize_ticker(t.get("ticker", "?"))
     dirn      = t.get("direction", "?")
     entry     = float(t.get("entry", 0))
     stop      = float(t.get("stop", 0))
@@ -788,12 +823,13 @@ def format_trade_closed(t: dict) -> str:
         conf_tag = " [🟡]"
 
     exit_str = f" → {exit_p:.2f}" if exit_p else ""
-    return f"  {res_icon}{arrow} {ticker} {dirn}  @ {entry:.1f}{exit_str}{pnl_str}{slip_str}{conf_tag}"
+    exec_tag = "" if _is_executed(t) else " [phantom]"
+    return f"  {res_icon}{arrow} {ticker} {dirn}  @ {entry:.1f}{exit_str}{pnl_str}{slip_str}{conf_tag}{exec_tag}"
 
 
 def format_trade_opened(t: dict) -> str:
     """Открытая сегодня сделка (может быть ещё открыта или уже закрыта)."""
-    ticker      = t.get("ticker", "?")
+    ticker      = _normalize_ticker(t.get("ticker", "?"))
     dirn        = t.get("direction", "?")
     entry       = float(t.get("entry", 0))
     pnl         = t.get("pnl_pct")
@@ -814,6 +850,7 @@ def format_trade_opened(t: dict) -> str:
         res_icon = "➖"
 
     pnl_str = f"  {'+' if (pnl or 0) > 0 else ''}{pnl:.2f}%" if pnl is not None else "  открыта"
+    exec_tag = "" if _is_executed(t) else "  [phantom]"
 
     # Предупреждения
     flags = []
@@ -823,7 +860,7 @@ def format_trade_opened(t: dict) -> str:
         flags.append("VWAP✗")
 
     flag_str = "  [" + " | ".join(flags) + "]" if flags else ""
-    return f"  {res_icon}{arrow} {ticker} {dirn}  @ {entry:.1f}{pnl_str}{flag_str}"
+    return f"  {res_icon}{arrow} {ticker} {dirn}  @ {entry:.1f}{pnl_str}{flag_str}{exec_tag}"
 
 
 # ─── Δ депозита ───────────────────────────────────────────────────────────────
@@ -964,7 +1001,12 @@ def build_report(
 
     # ── Открытые сегодня ──────────────────────────────────────────────────────
     if opened:
-        parts.append(f"\n📥 <b>Открыто сегодня ({len(opened)}):</b>")
+        opened_real = [t for t in opened if _is_executed(t)]
+        opened_phantom = [t for t in opened if not _is_executed(t)]
+        title = f"\n📥 <b>Открыто сегодня ({len(opened)}):</b>"
+        if opened_phantom:
+            title += f"  real={len(opened_real)} phantom={len(opened_phantom)}"
+        parts.append(title)
         for t in opened:
             parts.append(format_trade_opened(t))
 
