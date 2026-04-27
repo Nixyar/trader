@@ -212,6 +212,10 @@ _load_capabilities()
 # Кэш сохраняется в файл — повторный поиск не нужен после первого успеха.
 _UID_CACHE: dict[str, str] = {}
 _UID_CACHE_FILE: _pathlib.Path = _pathlib.Path(__file__).parent / "instrument_uid_cache.json"
+_INSTRUMENT_CODE_TICKER_CACHE: dict[str, str] = {}
+_INSTRUMENT_CODE_ALIASES: dict[str, str] = {
+    "BBG00F6NKQX3": "SMLT",
+}
 
 
 def _load_uid_cache() -> None:
@@ -263,6 +267,42 @@ def find_and_cache_uid(ticker: str) -> Optional[str]:
     except Exception as _ue:
         logger.debug("[UID] find_and_cache_uid(%s): %s", ticker, _ue)
     return None
+
+
+def resolve_ticker_from_code(code: str) -> str:
+    """Пытается превратить FIGI/UID/сырой код из portfolio API в биржевой тикер."""
+    if not code:
+        return code
+    if code in _INSTRUMENT_CODE_ALIASES:
+        return _INSTRUMENT_CODE_ALIASES[code]
+    if code in TICKER_BY_FIGI:
+        return TICKER_BY_FIGI[code]
+    if code in _INSTRUMENT_CODE_TICKER_CACHE:
+        return _INSTRUMENT_CODE_TICKER_CACHE[code]
+    for ticker, uid in _UID_CACHE.items():
+        if uid == code:
+            _INSTRUMENT_CODE_TICKER_CACHE[code] = ticker
+            return ticker
+    if not is_available():
+        return code
+    try:
+        Client = _sdk_import("Client")
+        with Client(_get_token()) as client:
+            resp = client.instruments.find_instrument(query=code)
+        for inst in resp.instruments:
+            ticker = getattr(inst, "ticker", "") or ""
+            figi = getattr(inst, "figi", "") or ""
+            uid = getattr(inst, "uid", "") or ""
+            if ticker and code in {figi, uid, getattr(inst, "instrument_uid", "") or ""}:
+                _INSTRUMENT_CODE_TICKER_CACHE[code] = ticker
+                if uid:
+                    _UID_CACHE.setdefault(ticker, uid)
+                    _save_uid_cache()
+                logger.info("[INSTRUMENT_RESOLVE] %s → %s", code, ticker)
+                return ticker
+    except Exception as _e:
+        logger.debug("resolve_ticker_from_code(%s): %s", code, _e)
+    return code
 
 
 _load_uid_cache()
@@ -1064,7 +1104,7 @@ def get_sandbox_portfolio(account_id: str = "") -> Optional[dict]:
 
         positions = []
         for pos in portfolio.positions:
-            ticker = TICKER_BY_FIGI.get(pos.figi, pos.figi)
+            ticker = resolve_ticker_from_code(getattr(pos, "figi", "") or "")
             qty    = _proto_to_float(pos.quantity)
             avg    = _proto_to_float(pos.average_position_price)
             curr   = _proto_to_float(pos.current_price)

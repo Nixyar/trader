@@ -555,6 +555,14 @@ class TestInstrumentCapabilities(unittest.TestCase):
 
                 self.assertTrue(td.instrument_capability_available("CBOM", "has_figi"))
 
+    def test_resolve_ticker_from_uid_cache(self):
+        with patch.dict(td._UID_CACHE, {"SMLT": "BBG00F6NKQX3"}, clear=True):
+            ticker = td.resolve_ticker_from_code("BBG00F6NKQX3")
+        self.assertEqual(ticker, "SMLT")
+
+    def test_resolve_ticker_from_static_alias(self):
+        self.assertEqual(td.resolve_ticker_from_code("BBG00F6NKQX3"), "SMLT")
+
 
 class TestDailyReportDiagnostics(unittest.TestCase):
 
@@ -675,12 +683,15 @@ class TestDailyReportDiagnostics(unittest.TestCase):
             {"pattern": "⚡ SELL THE NEWS", "executed": True, "pnl_pct": 1.2},
             {"pattern": "⚡ SELL THE NEWS", "executed": True, "pnl_pct": -0.7},
             {"pattern": "BREAKOUT", "executed": False, "pnl_pct": None},
+            {"pattern": "BREAKOUT", "execution_status": "virtual", "pnl_pct": 5.0},
         ])
         rows = {row["pattern"]: row for row in summary["patterns"]}
         self.assertEqual(rows["⚡ SELL THE NEWS"]["signals"], 2)
         self.assertEqual(rows["⚡ SELL THE NEWS"]["closed"], 2)
         self.assertEqual(rows["⚡ SELL THE NEWS"]["winrate"], 50.0)
         self.assertEqual(rows["BREAKOUT"]["executed"], 0)
+        self.assertEqual(rows["BREAKOUT"]["closed"], 0)
+        self.assertEqual(rows["BREAKOUT"]["total_pnl"], 0.0)
 
     def test_network_and_uid_summaries_parse_log_lines(self):
         lines = [
@@ -695,6 +706,50 @@ class TestDailyReportDiagnostics(unittest.TestCase):
         self.assertEqual(net["moex_request_failed"], 1)
         self.assertEqual(uid["uid_cache_success"], 1)
         self.assertEqual(uid["uid_retry_success"], 1)
+
+    def test_format_trade_opened_marks_phantom(self):
+        line = dr.format_trade_opened({
+            "ticker": "SMLT",
+            "direction": "SHORT",
+            "entry": 632.6,
+            "result": None,
+            "pnl_pct": None,
+            "executed": False,
+        })
+        self.assertIn("[phantom]", line)
+
+    def test_format_trade_closed_marks_phantom(self):
+        line = dr.format_trade_closed({
+            "ticker": "CHMF",
+            "direction": "SHORT",
+            "entry": 801.4,
+            "exit_price": 795.0,
+            "pnl_pct": 0.8,
+            "result": "win_t2",
+            "execution_status": "virtual",
+        })
+        self.assertIn("[phantom]", line)
+
+    def test_is_executed_treats_none_as_legacy_real(self):
+        self.assertTrue(dr._is_executed({"executed": None}))
+        self.assertFalse(dr._is_executed({"execution_status": "virtual", "executed": True}))
+
+    def test_signal_gap_uses_instrument_alias(self):
+        lines, count = dr.signal_state_gap_summary({
+            "SMLT_SHORT_2026-04-24_v2": {
+                "ticker": "SMLT",
+                "direction": "SHORT",
+                "entry": 632.6,
+                "hit": None,
+            },
+            "sb_BBG00F6NKQX3_orphan": {
+                "ticker": "BBG00F6NKQX3",
+                "direction": "SHORT",
+                "lots": 156,
+                "price": 616.6,
+            },
+        })
+        self.assertEqual(count, 0, lines)
 
     def test_no_market_signals_returns_empty(self):
         news = [self._news_item("LONG")]

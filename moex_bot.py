@@ -5310,6 +5310,7 @@ def check_daily_loss_brake(sod_equity: float | None, current_equity: float) -> b
 # ═══════════════════════════════════════════════════════════════════════════════
 _RECONCILE_LAST: dict[str, datetime] = {}        # "_run": last_check_utc
 RECONCILE_INTERVAL_MIN = int(os.environ.get("RECONCILE_INTERVAL_MIN", "30"))
+_RECONCILE_MISMATCH_SEEN: dict[str, datetime] = {}
 
 
 def reconcile_trade_log_with_sandbox(
@@ -5381,7 +5382,10 @@ def reconcile_trade_log_with_sandbox(
 
     if mismatches:
         for m in mismatches:
-            logger.error("[RECONCILE] %s", m)
+            prev = _RECONCILE_MISMATCH_SEEN.get(m)
+            if not prev or (now - prev).total_seconds() >= RECONCILE_INTERVAL_MIN * 60:
+                logger.warning("[RECONCILE] %s", m)
+                _RECONCILE_MISMATCH_SEEN[m] = now
         print(f"  ⚠️ RECONCILE: найдено {len(mismatches)} расхождений trade_log ↔ sandbox")
 
     _RECONCILE_LAST["_run"] = now
