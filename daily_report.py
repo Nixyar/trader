@@ -311,19 +311,21 @@ def summarize_decisions(entries: list[dict]) -> dict:
 def summarize_capabilities() -> dict:
     degraded = _list_degraded_instruments()
     capability_counts: dict[str, int] = {}
+    grouped: dict[str, set[str]] = {}
     rows: list[str] = []
     for item in degraded:
-        ticker = item.get("ticker", "?")
+        ticker = _normalize_ticker(item.get("ticker", "?"))
         caps = item.get("capabilities", {}) or {}
-        labels: list[str] = []
         for capability, meta in caps.items():
             capability_counts[capability] = capability_counts.get(capability, 0) + 1
             reason = str((meta or {}).get("reason") or "")
-            labels.append(f"{capability}:{reason}" if reason else capability)
+            label = f"{capability}:{reason}" if reason else capability
+            grouped.setdefault(ticker, set()).add(label)
+    for ticker, labels in grouped.items():
         if labels:
-            rows.append(f"{ticker} ({', '.join(labels[:3])})")
+            rows.append(f"{ticker} ({', '.join(sorted(labels)[:3])})")
     return {
-        "count": len(degraded),
+        "count": len(grouped),
         "rows": rows[:6],
         "capability_counts": capability_counts,
     }

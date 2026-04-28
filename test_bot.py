@@ -555,6 +555,51 @@ class TestInstrumentCapabilities(unittest.TestCase):
 
                 self.assertTrue(td.instrument_capability_available("CBOM", "has_figi"))
 
+    def test_api_forbidden_sandbox_order_marks_long_capability_block(self):
+        class FakeClient:
+            def __init__(self, token):
+                self.sandbox = self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post_sandbox_order(self, **kwargs):
+                raise Exception("INVALID_ARGUMENT 30052: Instrument forbidden for trading by API")
+
+        class FakeOrderDirection:
+            ORDER_DIRECTION_BUY = "BUY"
+            ORDER_DIRECTION_SELL = "SELL"
+
+        class FakeOrderType:
+            ORDER_TYPE_MARKET = "MARKET"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            caps_file = os.path.join(tmpdir, "instrument_capabilities.json")
+            blacklist_file = os.path.join(tmpdir, "sandbox_blacklist.json")
+            with patch.object(td, "_CAPABILITIES_FILE", td._pathlib.Path(caps_file)), \
+                 patch.object(td, "_BLACKLIST_FILE", td._pathlib.Path(blacklist_file)), \
+                 patch.object(td, "_get_account_id", return_value="sandbox-account"), \
+                 patch.object(td, "is_available", return_value=True), \
+                 patch.object(td, "get_figi", return_value="BBG000000000"), \
+                 patch.object(td, "_get_token", return_value="token"), \
+                 patch.object(td, "_sdk_import", return_value=(FakeClient, FakeOrderDirection, FakeOrderType)), \
+                 patch.object(td, "find_and_cache_uid") as mock_find_uid:
+                td._INSTRUMENT_CAPABILITIES.clear()
+                td._SANDBOX_UNAVAILABLE.clear()
+                td._UID_CACHE.clear()
+
+                result = td.sandbox_place_order("YDEX", "SHORT", quantity=1)
+
+                self.assertIsNone(result)
+                self.assertFalse(td.is_sandbox_available("YDEX"))
+                caps = td._INSTRUMENT_CAPABILITIES["YDEX"]["sandbox_order"]
+                self.assertEqual(caps["reason"], "api_forbidden_30052")
+                self.assertEqual(caps["ttl_hours"], td.SANDBOX_BLACKLIST_TTL_HOURS_50002)
+                mock_find_uid.assert_not_called()
+
     def test_resolve_ticker_from_uid_cache(self):
         with patch.dict(td._UID_CACHE, {"SMLT": "BBG00F6NKQX3"}, clear=True):
             ticker = td.resolve_ticker_from_code("BBG00F6NKQX3")
@@ -604,6 +649,28 @@ class TestDailyReportDiagnostics(unittest.TestCase):
         self.assertEqual(summary["total"], 3)
         self.assertEqual(summary["actions"]["skipped"], 2)
         self.assertEqual(summary["reasons"]["sandbox_unavailable"], 2)
+
+    def test_summarize_capabilities_groups_instrument_aliases(self):
+        with patch.object(dr, "_list_degraded_instruments", return_value=[
+            {
+                "ticker": "BBG00F6NKQX3",
+                "capabilities": {
+                    "sandbox_order": {"reason": "figi_missing"},
+                    "has_figi": {"reason": "figi_missing"},
+                },
+            },
+            {
+                "ticker": "SMLT",
+                "capabilities": {
+                    "h1_tinvest": {"reason": "known_fallback"},
+                },
+            },
+        ]):
+            summary = dr.summarize_capabilities()
+
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(len(summary["rows"]), 1)
+        self.assertIn("SMLT", summary["rows"][0])
 
     def test_portfolio_mismatch_summary_detects_orphan(self):
         lines, count = dr.portfolio_mismatch_summary({

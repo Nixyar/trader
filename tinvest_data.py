@@ -51,6 +51,7 @@ import pathlib as _pathlib
 _SANDBOX_UNAVAILABLE: dict[str, tuple[datetime, str]] = {}   # ticker -> (marked_at_utc, reason)
 SANDBOX_BLACKLIST_TTL_HOURS         = 24     # для figi_missing и прочих временных причин
 SANDBOX_BLACKLIST_TTL_HOURS_50002   = 168    # 7 дней для инструментов с 50002 (не в sandbox)
+_SANDBOX_LONG_BLOCK_REASONS = {"50002", "api_forbidden_30052"}
 _BLACKLIST_FILE: _pathlib.Path = _pathlib.Path(__file__).parent / "sandbox_blacklist.json"
 _CAPABILITIES_FILE: _pathlib.Path = _pathlib.Path(__file__).parent / "instrument_capabilities.json"
 _INSTRUMENT_CAPABILITIES: dict[str, dict[str, dict[str, object]]] = {}
@@ -93,7 +94,7 @@ def _capability_ttl_hours(capability: str, reason: str) -> int:
     if capability in ("h1_tinvest", "orderbook") and reason in ("50002", "known_fallback"):
         return 168
     if capability == "sandbox_order":
-        if reason == "50002":
+        if reason in _SANDBOX_LONG_BLOCK_REASONS:
             return SANDBOX_BLACKLIST_TTL_HOURS_50002
         if reason == "30079":
             return 12
@@ -315,7 +316,7 @@ def mark_sandbox_unavailable(ticker: str, reason: str = "50002") -> None:
     v0.9.37: reason='figi_missing' — когда FIGI_MAP не содержит тикер.
     v0.9.38.3: persistent — сохраняется в файл, переживает рестарты.
     """
-    ttl = SANDBOX_BLACKLIST_TTL_HOURS_50002 if reason == "50002" else SANDBOX_BLACKLIST_TTL_HOURS
+    ttl = SANDBOX_BLACKLIST_TTL_HOURS_50002 if reason in _SANDBOX_LONG_BLOCK_REASONS else SANDBOX_BLACKLIST_TTL_HOURS
     if ticker not in _SANDBOX_UNAVAILABLE:
         logger.warning(
             "[SANDBOX_BLACKLIST] %s → blacklist на %dч (reason=%s) [persistent]",
@@ -332,7 +333,7 @@ def is_sandbox_available(ticker: str) -> bool:
     if not marked:
         return True
     marked_at, reason = marked
-    ttl = SANDBOX_BLACKLIST_TTL_HOURS_50002 if reason == "50002" else SANDBOX_BLACKLIST_TTL_HOURS
+    ttl = SANDBOX_BLACKLIST_TTL_HOURS_50002 if reason in _SANDBOX_LONG_BLOCK_REASONS else SANDBOX_BLACKLIST_TTL_HOURS
     age_h = (_now_utc() - marked_at).total_seconds() / 3600
     if age_h >= ttl:
         _SANDBOX_UNAVAILABLE.pop(ticker, None)
@@ -1254,6 +1255,12 @@ def sandbox_place_order(
                 "30079",
                 detail="Instrument unavailable for trading in sandbox",
             )
+        elif "30052" in err_str or "Instrument forbidden for trading by API" in err_str:
+            logger.warning(
+                "[SANDBOX] %s запрещён для торговли через API/sandbox (30052) — ставим долгий cooldown",
+                ticker,
+            )
+            mark_sandbox_unavailable(ticker, reason="api_forbidden_30052")
         elif "50002" in err_str:
             # v0.9.38.4: FIGI устарел → ищем UID через FindInstrument и делаем retry
             if not _uid_override:
