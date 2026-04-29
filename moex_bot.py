@@ -470,6 +470,40 @@ TICKERS = [
     "CBOM",                                     # МКБ: событийные всплески (оферты, реорганизация)
 ]
 
+def _csv_env_list(name: str) -> list[str]:
+    raw = os.environ.get(name, "")
+    return [x.strip().upper() for x in raw.split(",") if x.strip()]
+
+
+for _extra_ticker in _csv_env_list("EXTRA_TICKERS"):
+    if _extra_ticker not in TICKERS:
+        TICKERS.append(_extra_ticker)
+
+_DEFAULT_TIER_1 = {
+    "GAZP", "SBER", "LKOH", "ROSN", "NVTK", "GMKN", "YDEX", "TATN", "MGNT",
+    "PLZL", "SNGS", "MTSS", "ALRS", "VTBR", "CHMF", "PHOR", "NLMK", "RUAL",
+    "OZON", "MOEX", "TRNFP", "MAGN", "AFLT", "IRAO",
+}
+_DEFAULT_TIER_2 = {
+    "T", "AFKS", "SIBN", "FLOT", "SMLT", "ENPG", "PIKK", "AKRN", "X5",
+    "HEAD", "POSI", "LSRG", "CBOM",
+}
+TIER_1_TICKERS = (_DEFAULT_TIER_1 | set(_csv_env_list("TIER_1_TICKERS"))) - set(_csv_env_list("TIER_3_TICKERS"))
+TIER_2_TICKERS = (_DEFAULT_TIER_2 | set(_csv_env_list("TIER_2_TICKERS"))) - TIER_1_TICKERS - set(_csv_env_list("TIER_3_TICKERS"))
+TIER_3_TICKERS = set(_csv_env_list("TIER_3_TICKERS")) | {t for t in TICKERS if t not in TIER_1_TICKERS and t not in TIER_2_TICKERS}
+TIER2_MIN_SCORE = int(os.environ.get("TIER2_MIN_SCORE", "9"))
+
+
+def ticker_tier(ticker: str | None) -> str:
+    """Tier model: tier_3 is radar/watch-only unless explicitly promoted."""
+    t = str(ticker or "").upper()
+    if t in TIER_1_TICKERS:
+        return "tier_1"
+    if t in TIER_2_TICKERS:
+        return "tier_2"
+    return "tier_3"
+
+
 RSS_FEEDS = {
     # РБК убран: стабильно таймаутит (rate-limit / блокировка ботов).
     # При желании вернуть — раскомментируй и проверь.
@@ -479,7 +513,18 @@ RSS_FEEDS = {
     # v0.9.7: ТАСС и Прайм — быстрые корпоративные новости (дивиденды, отчёты, сделки)
     "ТАСС":  "https://tass.ru/rss/v2.xml",
     "Прайм": "https://1prime.ru/rss",
+    # Биржевые/финансовые ленты. Если источник недоступен, fetch_news безопасно
+    # деградирует: ошибка попадёт в лог, остальные источники продолжат работу.
+    "MOEX":  "https://www.moex.com/export/news.aspx?lang=ru",
+    "Finam": "https://www.finam.ru/analysis/conews/rsspoint/",
 }
+
+for _extra_feed in os.environ.get("EXTRA_RSS_FEEDS", "").split(","):
+    if not _extra_feed.strip() or "=" not in _extra_feed:
+        continue
+    _name, _url = _extra_feed.split("=", 1)
+    if _name.strip() and _url.strip():
+        RSS_FEEDS[_name.strip()] = _url.strip()
 
 # Тикеры по принадлежности к экспорту — важно для USDRUB
 EXPORTER_TICKERS = {
@@ -678,6 +723,9 @@ TRADE_LOG_FILE = os.path.join(
 SCORE_LOG_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "signals_score_log.jsonl"
 )
+OPPORTUNITY_LOG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "opportunity_log.jsonl"
+)
 # v0.9.27: PID-файл для защиты от запуска двух экземпляров одновременно
 PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moex_bot.pid")
 # Минимальный интервал повторной отправки одного сигнала (часов)
@@ -821,6 +869,8 @@ except Exception:
 BASE_URL = "https://iss.moex.com/iss"
 EVENT_CALENDAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "event_calendar.json")
 DECISION_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signals_decision_log.jsonl")
+STATE_MIGRATIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state_migrations.json")
+STATE_MIGRATION_VERSION = "2026-04-29-execution-contract-v1"
 
 _JSON_BACKUP_SUFFIX = ".corrupt"
 
@@ -2820,7 +2870,7 @@ def is_relevant(item: NewsItem) -> bool:
     return any(kw in text for kw in _ALL_FILTER_WORDS)
 
 
-def _fetch_news_source(source: str, url: str) -> tuple[str, list[dict], Exception | None]:
+def _fetch_news_source(source: str, url: str, limit: int = 30) -> tuple[str, list[dict], Exception | None]:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -2834,7 +2884,7 @@ def _fetch_news_source(source: str, url: str) -> tuple[str, list[dict], Exceptio
             raw = resp.read()
         feed = feedparser.parse(raw)
         entries: list[dict] = []
-        for entry in feed.entries[:30]:
+        for entry in feed.entries[:limit]:
             title = _normalize_news_text(entry.get("title", ""))
             if not title:
                 continue
@@ -2854,7 +2904,8 @@ def fetch_news(cache: dict) -> list[NewsItem]:
     """Парсим RSS, возвращаем только НОВЫЕ элементы. Источники читаем параллельно."""
     new_items: list[NewsItem] = []
     now_iso = now_msk().isoformat()
-    max_workers = min(4, max(1, len(RSS_FEEDS)))
+    max_workers = min(int(os.environ.get("NEWS_MAX_WORKERS", "8")), max(1, len(RSS_FEEDS)))
+    entries_per_feed = int(os.environ.get("NEWS_ENTRIES_PER_FEED", "30"))
 
     for source in RSS_FEEDS:
         print(f"  📡 {source}...", end=" ", flush=True)
@@ -2862,7 +2913,7 @@ def fetch_news(cache: dict) -> list[NewsItem]:
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         future_map = {
-            pool.submit(_fetch_news_source, source, url): source
+            pool.submit(_fetch_news_source, source, url, entries_per_feed): source
             for source, url in RSS_FEEDS.items()
         }
         for future in as_completed(future_map):
@@ -4215,6 +4266,139 @@ def save_trade_log(log: list) -> None:
     save_json_file_atomic(TRADE_LOG_FILE, log, "save_trade_log")
 
 
+def _backup_runtime_json(path: str, migration_id: str) -> str | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        backup_dir = os.path.join(os.path.dirname(path), "state_backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = os.path.join(
+            backup_dir,
+            f"{os.path.basename(path)}.{migration_id}.{stamp}.bak",
+        )
+        shutil.copy2(path, backup)
+        return backup
+    except Exception as e:
+        logger.warning("state_migration backup failed for %s: %s", path, e)
+        return None
+
+
+def _state_has_open_sb_for_base(state: dict, base_key: str, base_val: dict) -> bool:
+    exact = state.get(f"sb_{base_key}")
+    if isinstance(exact, dict) and not exact.get("closed_at") and exact.get("order_id"):
+        return True
+    ticker = base_val.get("ticker")
+    direction = base_val.get("direction")
+    for key, val in state.items():
+        if not str(key).startswith("sb_") or not isinstance(val, dict):
+            continue
+        if val.get("closed_at") or not val.get("order_id"):
+            continue
+        if val.get("base_signal_key") == base_key:
+            return True
+        if ticker and direction and val.get("ticker") == ticker and val.get("direction") == direction:
+            return True
+    return False
+
+
+def run_state_migrations(force: bool = False) -> dict:
+    """One-shot cleanup for pre execution-contract runtime JSON files.
+
+    Keeps broker/sandbox position records, archives everything before changing it,
+    and removes ambiguous legacy signal/trade rows from active files.
+    """
+    if os.environ.get("DISABLE_STATE_MIGRATIONS", "").lower() == "true":
+        return {"skipped": "disabled"}
+
+    migrations = load_json_file(STATE_MIGRATIONS_FILE, {}, "load_state_migrations")
+    if not isinstance(migrations, dict):
+        migrations = {}
+    if migrations.get(STATE_MIGRATION_VERSION) and not force:
+        return {"skipped": "already_applied"}
+
+    summary: dict[str, object] = {
+        "version": STATE_MIGRATION_VERSION,
+        "state_removed": 0,
+        "state_marked": 0,
+        "ntg_removed": 0,
+        "trade_removed": 0,
+        "backups": {},
+    }
+
+    state = load_signals_state()
+    if state:
+        summary["backups"]["signals_state"] = _backup_runtime_json(SIGNALS_STATE_FILE, STATE_MIGRATION_VERSION)
+        migrated: dict = {}
+        now = datetime.now(timezone.utc)
+        for key, val in state.items():
+            if not isinstance(val, dict):
+                migrated[key] = val
+                continue
+            key_str = str(key)
+            if key_str.startswith("ntg_"):
+                sent = val.get("sent")
+                try:
+                    sent_dt = datetime.fromisoformat(str(sent).replace("Z", "+00:00"))
+                    if sent_dt.tzinfo is None:
+                        sent_dt = sent_dt.replace(tzinfo=timezone.utc)
+                    if (now - sent_dt).total_seconds() > 86400:
+                        summary["ntg_removed"] = int(summary["ntg_removed"]) + 1
+                        continue
+                except Exception:
+                    summary["ntg_removed"] = int(summary["ntg_removed"]) + 1
+                    continue
+                migrated[key] = val
+                continue
+            if key_str.startswith("sb_"):
+                if not val.get("execution_status"):
+                    val["execution_status"] = "closed" if val.get("closed_at") else ("filled" if val.get("order_id") else "orphan")
+                    summary["state_marked"] = int(summary["state_marked"]) + 1
+                base_key = key_str[3:]
+                if not val.get("base_signal_key") and base_key in state:
+                    val["base_signal_key"] = base_key
+                    summary["state_marked"] = int(summary["state_marked"]) + 1
+                migrated[key] = val
+                continue
+            if not val.get("execution_status") and not _state_has_open_sb_for_base(state, key_str, val):
+                summary["state_removed"] = int(summary["state_removed"]) + 1
+                continue
+            if not val.get("execution_status"):
+                val["execution_status"] = "filled"
+                summary["state_marked"] = int(summary["state_marked"]) + 1
+            migrated[key] = val
+        if migrated != state:
+            save_signals_state(migrated)
+
+    trade_log = load_trade_log()
+    if trade_log:
+        summary["backups"]["trade_log"] = _backup_runtime_json(TRADE_LOG_FILE, STATE_MIGRATION_VERSION)
+        kept = []
+        for row in trade_log:
+            if not isinstance(row, dict):
+                continue
+            if not row.get("execution_status"):
+                summary["trade_removed"] = int(summary["trade_removed"]) + 1
+                continue
+            kept.append(row)
+        if kept != trade_log:
+            save_trade_log(kept)
+
+    migrations[STATE_MIGRATION_VERSION] = {
+        "applied_at": datetime.now(timezone.utc).isoformat(),
+        **summary,
+    }
+    save_json_file_atomic(STATE_MIGRATIONS_FILE, migrations, "save_state_migrations")
+    logger.warning("state_migration applied: %s", summary)
+    append_decision_log({
+        "action": "migrated",
+        "reason": "legacy_state_cleanup",
+        "signal_version": SIGNAL_SCHEMA_VERSION,
+        **{k: v for k, v in summary.items() if k != "backups"},
+    })
+    return summary
+
+
 def append_score_log(entry: dict) -> None:
     """
     v0.9.23: Дописывает одну строку в signals_score_log.jsonl.
@@ -4241,9 +4425,26 @@ def append_score_log(entry: dict) -> None:
         logger.warning("append_score_log: %s", e)
 
 
+def append_opportunity_log(entry: dict) -> None:
+    """
+    Append-only journal for replay/analysis. It records strong candidates even
+    when they are not executable because of tier/capability/risk.
+    """
+    try:
+        entry.setdefault("ts", now_msk().strftime("%Y-%m-%d %H:%M"))
+        entry.setdefault("signal_version", SIGNAL_SCHEMA_VERSION)
+        ticker = entry.get("ticker")
+        entry.setdefault("ticker_tier", ticker_tier(ticker))
+        with open(OPPORTUNITY_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("append_opportunity_log: %s", e)
+
+
 def log_new_signal(s: dict, signal_id: str) -> None:
     """
-    Добавляет новый сигнал в trade_log.json при первой отправке.
+    Добавляет новый сигнал в trade_log.json.
+    В auto-order режиме вызывается только после подтверждённого sandbox fill.
     Если сигнал с таким signal_id уже существует — не добавляет.
     """
     log = load_trade_log()
@@ -4289,6 +4490,32 @@ def log_new_signal(s: dict, signal_id: str) -> None:
     }
     log.append(record)
     save_trade_log(log)
+
+
+def build_signal_state_record(s: dict, now_iso: str | None = None) -> dict:
+    """Base signal state. Auto-order writes it only after confirmed execution."""
+    now_iso = now_iso or datetime.now(timezone.utc).isoformat()
+    return {
+        "ticker":     s["ticker"],
+        "direction":  s["direction"],
+        "entry":          s["entry"],
+        "stop":           s["stop"],
+        "take1":          s.get("take1"),
+        "take2":          s.get("take2"),
+        "trend_target":   s.get("trend_target"),
+        "breakeven_stop": s.get("breakeven_stop"),
+        "h1_atr":         s.get("h1_atr"),
+        "volume_ratio":   s.get("volume_ratio"),
+        "confidence":     s.get("confidence"),
+        "confidence_score": s.get("confidence_score"),
+        "sizing_source":  s.get("sizing_source"),
+        "session_label":  s.get("session_label"),
+        "rr":             s.get("rr"),
+        "first_seen":     now_iso,
+        "last_sent":      now_iso,
+        "sent_count":     1,
+        **_signal_meta(s),
+    }
 
 
 def update_trade_execution_status(
@@ -5502,36 +5729,49 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
         stop      = float(s.get("stop")  or 0)
         quality_flags = set(s.get("data_quality_flags", []))
         decision_reasons = set(s.get("decision_reasons", []))
+        tier = s.get("ticker_tier") or ticker_tier(ticker)
+        s["ticker_tier"] = tier
+        opportunity_base = {
+            "ticker": ticker,
+            "direction": direction,
+            "score": s.get("confidence_score"),
+            "confidence": confidence,
+            "signal_id": key,
+            "ticker_tier": tier,
+            "news_mode": s.get("news_mode"),
+            "decision_reasons": list(decision_reasons),
+            "data_quality_flags": list(quality_flags),
+        }
+
+        if tier == "tier_3":
+            reason = "tier3_watch_only"
+            append_score_log({**opportunity_base, "action": "watch_only", "reason": reason})
+            append_opportunity_log({**opportunity_base, "action": "watch_only", "reason": reason})
+            continue
+        if tier == "tier_2":
+            if (s.get("confidence_score") or 0) < TIER2_MIN_SCORE:
+                reason = "tier2_min_score"
+                append_score_log({**opportunity_base, "action": "rejected", "reason": reason})
+                append_opportunity_log({**opportunity_base, "action": "rejected", "reason": reason})
+                continue
+            if "stale_intraday" in quality_flags or "intraday_confirmation_conflict" in decision_reasons:
+                reason = "tier2_data_quality"
+                append_score_log({**opportunity_base, "action": "rejected", "reason": reason})
+                append_opportunity_log({**opportunity_base, "action": "rejected", "reason": reason})
+                continue
+            risk_multiplier *= 0.75
 
         if "invalid_price" in quality_flags:
-            append_score_log({
-                "ticker": ticker,
-                "direction": direction,
-                "score": s.get("confidence_score"),
-                "confidence": confidence,
-                "action": "skipped",
-                "reason": "invalid_price",
-            })
+            append_score_log({**opportunity_base, "action": "skipped", "reason": "invalid_price"})
+            append_opportunity_log({**opportunity_base, "action": "rejected", "reason": "invalid_price"})
             continue
         if "stale_intraday" in quality_flags and (s.get("confidence_score") or 0) < 10:
-            append_score_log({
-                "ticker": ticker,
-                "direction": direction,
-                "score": s.get("confidence_score"),
-                "confidence": confidence,
-                "action": "skipped",
-                "reason": "stale_intraday",
-            })
+            append_score_log({**opportunity_base, "action": "skipped", "reason": "stale_intraday"})
+            append_opportunity_log({**opportunity_base, "action": "rejected", "reason": "stale_intraday"})
             continue
         if "intraday_confirmation_conflict" in decision_reasons and (s.get("confidence_score") or 0) < 9:
-            append_score_log({
-                "ticker": ticker,
-                "direction": direction,
-                "score": s.get("confidence_score"),
-                "confidence": confidence,
-                "action": "skipped",
-                "reason": "quality_gate_conflict",
-            })
+            append_score_log({**opportunity_base, "action": "skipped", "reason": "quality_gate_conflict"})
+            append_opportunity_log({**opportunity_base, "action": "rejected", "reason": "quality_gate_conflict"})
             continue
 
         # v0.9.36: Sandbox runtime-blacklist (50002 в прошлом запросе).
@@ -5540,14 +5780,8 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
         except Exception:
             _sb_avail = None
         if _sb_avail and not _sb_avail(ticker):
-            append_score_log({
-                "ticker": ticker,
-                "direction": direction,
-                "score": s.get("confidence_score"),
-                "confidence": confidence,
-                "action": "skipped",
-                "reason": "sandbox_unavailable",
-            })
+            append_score_log({**opportunity_base, "action": "skipped", "reason": "sandbox_unavailable"})
+            append_opportunity_log({**opportunity_base, "action": "rejected", "reason": "sandbox_unavailable"})
             if _should_log_risk_block(ticker, "SANDBOX_UNAVAILABLE"):
                 logger.info("sandbox-blacklist skip: %s (ещё в 24ч blacklist)", ticker)
             continue
@@ -5575,8 +5809,8 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                 continue
 
         # ── Рассчитываем лоты по equity ───────────────────────────────────────
-        from tinvest_data import LOT_SIZE  # type: ignore[import]
-        lot_size  = LOT_SIZE.get(ticker, 1)
+        from tinvest_data import LOT_SIZE, get_lot_size  # type: ignore[import]
+        lot_size  = get_lot_size(ticker)
         stop_dist = abs(entry - stop)
 
         if equity > 0 and stop_dist > 0 and entry > 0:
@@ -5624,7 +5858,7 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                     continue  # позиция закрыта (сигнал достиг стопа/тейка)
                 sb_lots  = sv.get("lots", 1)
                 sb_entry = float(sv.get("entry") or sv.get("price") or 0)
-                sb_lot_size = LOT_SIZE.get(sv.get("ticker", ticker), 1)
+                sb_lot_size = get_lot_size(sv.get("ticker", ticker))
                 ticker_deployed += sb_lots * sb_lot_size * sb_entry
 
             new_ticker_total = ticker_deployed + lots * lot_size * entry
@@ -5655,7 +5889,7 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                     continue
                 sb_lots     = sv.get("lots", 1)
                 sb_entry    = float(sv.get("entry") or sv.get("price") or 0)
-                sb_lot_size = LOT_SIZE.get(sv.get("ticker", ""), 1)
+                sb_lot_size = get_lot_size(sv.get("ticker", ""))
                 total_deployed += sb_lots * sb_lot_size * sb_entry
 
             new_total = total_deployed + lots * lot_size * entry
@@ -5681,12 +5915,19 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
             # v0.9.12: T-Invest sandbox executed_order_price ненадёжен для рыночных ордеров
             # (может вернуть абсурдные значения, напр. TATN 3215₽ вместо 654₽).
             # Используем entry из сигнала как каноническую цену входа.
+            base_key = s.get("_state_key") or key
             api_price  = result.get("price")
             safe_price = (
                 api_price
                 if api_price and entry > 0 and 0.5 < api_price / entry < 2.0
                 else entry   # fallback — цена из сигнала
             )
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if not isinstance(state.get(base_key), dict):
+                state[base_key] = build_signal_state_record(s, now_iso)
+            state[base_key]["execution_status"] = "filled"
+            state[base_key]["sb_order_id"] = result.get("order_id")
+            log_new_signal(s, base_key)
             state[sb_key] = {
                 "ticker":       ticker,
                 "direction":    direction,
@@ -5697,16 +5938,24 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                 "price":        round(safe_price, 4) if safe_price else entry,
                 "lots":         result.get("lots"),
                 "equity_at_open": round(equity, 0) if equity else None,
-                "opened_at":    datetime.now(timezone.utc).isoformat(),
-                "base_signal_key": s.get("_state_key") or key,
+                "opened_at":    now_iso,
+                "base_signal_key": base_key,
                 "execution_status": "filled",
                 **_signal_meta(s),
             }
             update_trade_execution_status(
-                s.get("_state_key") or key,
+                base_key,
                 "filled",
                 sb_order_id=result.get("order_id"),
             )
+            append_opportunity_log({
+                **opportunity_base,
+                "action": "executed",
+                "reason": "sandbox_order_filled",
+                "signal_id": base_key,
+                "order_id": result.get("order_id"),
+                "lots": result.get("lots"),
+            })
             dir_emoji  = "🟢" if direction == "LONG" else "🔴"
             exec_price = safe_price or entry
             exec_lots  = result.get("lots", lots)
@@ -5719,6 +5968,29 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                 # v0.9.19: slim-формат ВХОД + текущий портфель
                 tg_send(tg_format_open(s, exec_lots, equity, risk_show, state))
             placed += 1
+        else:
+            base_key = s.get("_state_key") or key
+            if isinstance(state.get(base_key), dict):
+                state[base_key]["execution_status"] = "rejected"
+                state[base_key]["order_reject_reason"] = "sandbox_place_order_failed"
+                state[base_key]["last_order_attempt_at"] = datetime.now(timezone.utc).isoformat()
+            update_trade_execution_status(
+                base_key,
+                "rejected",
+                note="sandbox_place_order_failed",
+            )
+            append_score_log({
+                **opportunity_base,
+                "action": "skipped",
+                "reason": "sandbox_order_rejected",
+                "signal_id": base_key,
+            })
+            append_opportunity_log({
+                **opportunity_base,
+                "action": "rejected",
+                "reason": "sandbox_order_rejected",
+                "signal_id": base_key,
+            })
 
     return placed
 
@@ -5755,12 +6027,6 @@ def tg_notify_run(
                 # v0.9.9: используем оригинальный ключ state (_state_key), а не сегодняшний.
                 # signal_key(s) генерирует СЕГОДНЯШНЮЮ дату, но сигнал мог быть от 3 дней назад.
                 trade_key = s.get("_state_key") or signal_key(s)
-                update_trade_result(
-                    trade_key,
-                    result_map[reason],
-                    s.get("current_price"),
-                    state,   # v0.9.36: передаём state для проверки sb_-брата (executed flag)
-                )
                 # v0.9.10: закрываем sandbox-позицию при стопе или тейке
                 # Только финальные события: stop_hit и target2 (target1 → trailing, ещё открыта)
                 # v0.9.12: после закрытия помечаем state[sb_key]["closed_at"] — чтобы
@@ -5788,15 +6054,66 @@ def tg_notify_run(
                                 state[sb_key]["execution_status"] = "closed"
                                 if close_result.get("price"):
                                     s["current_price"] = close_result["price"]
+                                update_trade_result(
+                                    trade_key,
+                                    result_map[reason],
+                                    s.get("current_price"),
+                                    state,
+                                )
                                 save_signals_state(state)
                                 print(f"  📋 Sandbox закрыта [{reason}]: {ticker_close}")
                                 logger.info("sandbox closed %s (%s)", ticker_close, reason)
                                 # v0.9.19: slim ЗАКРЫТИЕ + портфель (equity неизвестен здесь → 0)
                                 tg_send(tg_format_close(s, reason, 0.0, state))
                             else:
+                                if isinstance(state.get(trade_key), dict):
+                                    state[trade_key]["hit"] = None
+                                    state[trade_key]["close_pending_reason"] = reason
+                                    state[trade_key]["last_close_attempt_at"] = datetime.now(timezone.utc).isoformat()
+                                    save_signals_state(state)
+                                append_score_log({
+                                    "ticker": s.get("ticker"),
+                                    "direction": s.get("direction"),
+                                    "score": s.get("confidence_score"),
+                                    "confidence": s.get("confidence"),
+                                    "action": "rejected",
+                                    "reason": "sandbox_close_rejected",
+                                    "signal_id": trade_key,
+                                })
                                 logger.warning("sandbox_close_position(%s) вернул None", ticker_close)
                         except Exception as _e:
+                            if isinstance(state.get(trade_key), dict):
+                                state[trade_key]["hit"] = None
+                                state[trade_key]["close_pending_reason"] = reason
+                                state[trade_key]["last_close_attempt_at"] = datetime.now(timezone.utc).isoformat()
+                                save_signals_state(state)
+                            append_score_log({
+                                "ticker": s.get("ticker"),
+                                "direction": s.get("direction"),
+                                "score": s.get("confidence_score"),
+                                "confidence": s.get("confidence"),
+                                "action": "rejected",
+                                "reason": "sandbox_close_failed",
+                                "signal_id": trade_key,
+                            })
                             logger.warning("sandbox close %s: %s", ticker_close, _e)
+                elif reason in ("stop_hit", "target2"):
+                    update_trade_result(
+                        trade_key,
+                        result_map[reason],
+                        s.get("current_price"),
+                        state,
+                    )
+                else:
+                    append_score_log({
+                        "ticker": s.get("ticker"),
+                        "direction": s.get("direction"),
+                        "score": s.get("confidence_score"),
+                        "confidence": s.get("confidence"),
+                        "action": "observed",
+                        "reason": "target1_observed",
+                        "signal_id": trade_key,
+                    })
             sent += 1
 
     # v0.9.8: Portfolio heat guard — считаем суммарный % риска открытых позиций
@@ -5857,6 +6174,12 @@ def tg_notify_run(
             _reason = "portfolio_heat" if too_hot else "session_closed"
             append_score_log({**_score_base, "action": "skipped", "reason": _reason})
             continue  # не открываем новые позиции при перегреве или в выходные
+        if SANDBOX_AUTO_ORDER:
+            # Auto mode: entry records are created by sandbox_execute_signals()
+            # only after a confirmed broker response. Failed orders must not
+            # become state/trade_log records or they turn into phantom trades.
+            append_score_log({**_score_base, "action": "skipped", "reason": "auto_order_controls_entry"})
+            continue
         do_send, reason = should_send_tg(s, state)
         if do_send:
             text = tg_format_signal(s, reason=reason)
@@ -5867,27 +6190,10 @@ def tg_notify_run(
                 append_score_log({**_score_base, "action": "traded",
                                   "reason": reason, "signal_id": key})
                 now = datetime.now(timezone.utc).isoformat()
-                state[key] = {
-                    "ticker":     s["ticker"],
-                    "direction":  s["direction"],
-                    "entry":          s["entry"],
-                    "stop":           s["stop"],
-                    "take1":          s.get("take1"),
-                    "take2":          s.get("take2"),
-                    "trend_target":   s.get("trend_target"),
-                    "breakeven_stop": s.get("breakeven_stop"),
-                    "h1_atr":         s.get("h1_atr"),       # v0.9.7: для трейлинга
-                    "volume_ratio":   s.get("volume_ratio"),  # v0.9.7: нужен для tg_format_signal
-                    "confidence":     s.get("confidence"),
-                    "confidence_score": s.get("confidence_score"),
-                    "sizing_source":  s.get("sizing_source"),
-                    "session_label":  s.get("session_label"),
-                    "rr":             s.get("rr"),
-                    "first_seen": state.get(key, {}).get("first_seen", now),
-                    "last_sent":  now,
-                    "sent_count": state.get(key, {}).get("sent_count", 0) + 1,
-                    **_signal_meta(s),
-                }
+                prev_state = state.get(key, {}) if isinstance(state.get(key), dict) else {}
+                state[key] = build_signal_state_record(s, now)
+                state[key]["first_seen"] = prev_state.get("first_seen", now)
+                state[key]["sent_count"] = prev_state.get("sent_count", 0) + 1
                 label = {"new": "НОВЫЙ", "upgrade": "РОСТ УВЕРЕН.", "repeat": "ПОВТОР"}.get(reason, reason)
                 print(f"  📲 Telegram [{label}]: {s['ticker']} {s['direction']}")
                 # v0.9.1: логируем только новые сигналы (не upgrade/repeat)
@@ -6789,6 +7095,18 @@ def main():
     # v0.9.27: Защита от двойного запуска (--watch или разовый скан)
     if not _acquire_pid_lock():
         sys.exit(0)
+
+    try:
+        _migration_summary = run_state_migrations()
+        if not _migration_summary.get("skipped"):
+            print(
+                "🧹 state migration: "
+                f"state_removed={_migration_summary.get('state_removed', 0)} "
+                f"trade_removed={_migration_summary.get('trade_removed', 0)} "
+                f"ntg_removed={_migration_summary.get('ntg_removed', 0)}"
+            )
+    except Exception as _e:
+        logger.warning("state_migration skipped: %s", _e)
 
     # v0.9.38: проверка LOT_SIZE против MOEX ISS (single startup call).
     # WARN логируется по каждому расхождению. Не блокирующе — бот продолжит работу,

@@ -12,6 +12,15 @@ news_memory.json
 cbr_rate_cache.json
 trade_log.json
 signals_score_log.jsonl
+signals_decision_log.jsonl
+opportunity_log.jsonl
+instrument_uid_cache.json
+instrument_capabilities.json
+sandbox_blacklist.json
+state_migrations.json
+state_backups/
+daily_diagnostics_*.json
+eod_state.json
 
 # Логи
 logs/

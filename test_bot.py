@@ -8,6 +8,7 @@ feedparser мокируется через sys.modules (не нужен для u
 import sys
 import os
 import glob
+import json
 import unittest
 import tempfile
 from unittest.mock import patch, MagicMock
@@ -555,6 +556,51 @@ class TestInstrumentCapabilities(unittest.TestCase):
 
                 self.assertTrue(td.instrument_capability_available("CBOM", "has_figi"))
 
+    def test_api_forbidden_sandbox_order_marks_long_capability_block(self):
+        class FakeClient:
+            def __init__(self, token):
+                self.sandbox = self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post_sandbox_order(self, **kwargs):
+                raise Exception("INVALID_ARGUMENT 30052: Instrument forbidden for trading by API")
+
+        class FakeOrderDirection:
+            ORDER_DIRECTION_BUY = "BUY"
+            ORDER_DIRECTION_SELL = "SELL"
+
+        class FakeOrderType:
+            ORDER_TYPE_MARKET = "MARKET"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            caps_file = os.path.join(tmpdir, "instrument_capabilities.json")
+            blacklist_file = os.path.join(tmpdir, "sandbox_blacklist.json")
+            with patch.object(td, "_CAPABILITIES_FILE", td._pathlib.Path(caps_file)), \
+                 patch.object(td, "_BLACKLIST_FILE", td._pathlib.Path(blacklist_file)), \
+                 patch.object(td, "_get_account_id", return_value="sandbox-account"), \
+                 patch.object(td, "is_available", return_value=True), \
+                 patch.object(td, "get_figi", return_value="BBG000000000"), \
+                 patch.object(td, "_get_token", return_value="token"), \
+                 patch.object(td, "_sdk_import", return_value=(FakeClient, FakeOrderDirection, FakeOrderType)), \
+                 patch.object(td, "find_and_cache_uid") as mock_find_uid:
+                td._INSTRUMENT_CAPABILITIES.clear()
+                td._SANDBOX_UNAVAILABLE.clear()
+                td._UID_CACHE.clear()
+
+                result = td.sandbox_place_order("YDEX", "SHORT", quantity=1)
+
+                self.assertIsNone(result)
+                self.assertFalse(td.is_sandbox_available("YDEX"))
+                caps = td._INSTRUMENT_CAPABILITIES["YDEX"]["sandbox_order"]
+                self.assertEqual(caps["reason"], "api_forbidden_30052")
+                self.assertEqual(caps["ttl_hours"], td.SANDBOX_BLACKLIST_TTL_HOURS_50002)
+                mock_find_uid.assert_not_called()
+
     def test_resolve_ticker_from_uid_cache(self):
         with patch.dict(td._UID_CACHE, {"SMLT": "BBG00F6NKQX3"}, clear=True):
             ticker = td.resolve_ticker_from_code("BBG00F6NKQX3")
@@ -562,6 +608,86 @@ class TestInstrumentCapabilities(unittest.TestCase):
 
     def test_resolve_ticker_from_static_alias(self):
         self.assertEqual(td.resolve_ticker_from_code("BBG00F6NKQX3"), "SMLT")
+
+    def test_sandbox_order_uses_uid_when_figi_missing(self):
+        class FakeResponse:
+            order_id = "ord-uid"
+            execution_report_status = "done"
+            executed_order_price = None
+
+        class FakeClient:
+            last_kwargs = None
+
+            def __init__(self, token):
+                self.sandbox = self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post_sandbox_order(self, **kwargs):
+                FakeClient.last_kwargs = kwargs
+                return FakeResponse()
+
+        class FakeOrderDirection:
+            ORDER_DIRECTION_BUY = "BUY"
+            ORDER_DIRECTION_SELL = "SELL"
+
+        class FakeOrderType:
+            ORDER_TYPE_MARKET = "MARKET"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            caps_file = os.path.join(tmpdir, "instrument_capabilities.json")
+            blacklist_file = os.path.join(tmpdir, "sandbox_blacklist.json")
+            with patch.object(td, "_CAPABILITIES_FILE", td._pathlib.Path(caps_file)), \
+                 patch.object(td, "_BLACKLIST_FILE", td._pathlib.Path(blacklist_file)), \
+                 patch.object(td, "_get_account_id", return_value="sandbox-account"), \
+                 patch.object(td, "is_available", return_value=True), \
+                 patch.object(td, "_get_token", return_value="token"), \
+                 patch.object(td, "_sdk_import", return_value=(FakeClient, FakeOrderDirection, FakeOrderType)), \
+                 patch.dict(td.FIGI_MAP, {}, clear=True), \
+                 patch.dict(td._UID_CACHE, {"HEAD": "uid-head"}, clear=True):
+                td._INSTRUMENT_CAPABILITIES.clear()
+                td._SANDBOX_UNAVAILABLE.clear()
+
+                result = td.sandbox_place_order("HEAD", "LONG", quantity=2)
+
+        self.assertEqual(result["order_id"], "ord-uid")
+        self.assertEqual(FakeClient.last_kwargs["instrument_id"], "uid-head")
+        self.assertNotIn("figi", FakeClient.last_kwargs)
+
+    def test_resolve_instrument_ids_looks_up_uid_when_figi_missing(self):
+        with patch.dict(td.FIGI_MAP, {}, clear=True), \
+             patch.dict(td._UID_CACHE, {}, clear=True), \
+             patch.object(td, "find_and_cache_uid", return_value="uid-posi") as mock_find, \
+             patch.object(td, "get_figi") as mock_get_figi:
+            figi, uid = td.resolve_instrument_ids("POSI")
+
+        self.assertIsNone(figi)
+        self.assertEqual(uid, "uid-posi")
+        mock_find.assert_called_once_with("POSI")
+        mock_get_figi.assert_not_called()
+
+    def test_get_lot_size_learns_unknown_ticker_from_moex(self):
+        with patch.dict(td.LOT_SIZE, {}, clear=True), \
+             patch.object(td, "fetch_moex_lot_size", return_value=10):
+            self.assertEqual(td.get_lot_size("VKCO"), 10)
+            self.assertEqual(td.LOT_SIZE["VKCO"], 10)
+
+    def test_get_lot_size_marks_unknown_when_moex_lookup_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            caps_file = os.path.join(tmpdir, "instrument_capabilities.json")
+            with patch.object(td, "_CAPABILITIES_FILE", td._pathlib.Path(caps_file)), \
+                 patch.dict(td.LOT_SIZE, {}, clear=True), \
+                 patch.object(td, "fetch_moex_lot_size", return_value=None):
+                td._INSTRUMENT_CAPABILITIES.clear()
+
+                self.assertEqual(td.get_lot_size("UNKNOWN"), 1)
+
+                caps = td._INSTRUMENT_CAPABILITIES["UNKNOWN"]["lot_size"]
+                self.assertEqual(caps["reason"], "unknown")
 
 
 class TestDailyReportDiagnostics(unittest.TestCase):
@@ -604,6 +730,43 @@ class TestDailyReportDiagnostics(unittest.TestCase):
         self.assertEqual(summary["total"], 3)
         self.assertEqual(summary["actions"]["skipped"], 2)
         self.assertEqual(summary["reasons"]["sandbox_unavailable"], 2)
+
+    def test_summarize_opportunities_release_counters(self):
+        summary = dr.summarize_opportunities([
+            {"action": "executed", "reason": "sandbox_order_filled", "ticker_tier": "tier_1"},
+            {"action": "rejected", "reason": "sandbox_order_rejected", "ticker_tier": "tier_2"},
+            {"action": "watch_only", "reason": "tier3_watch_only", "ticker_tier": "tier_3"},
+        ], [
+            {"action": "migrated", "reason": "legacy_state_cleanup"},
+        ])
+        self.assertEqual(summary["opportunity"], 3)
+        self.assertEqual(summary["executed"], 1)
+        self.assertEqual(summary["rejected"], 1)
+        self.assertEqual(summary["watch_only"], 1)
+        self.assertEqual(summary["legacy_cleaned"], 1)
+        self.assertEqual(summary["tiers"]["tier_3"], 1)
+
+    def test_summarize_capabilities_groups_instrument_aliases(self):
+        with patch.object(dr, "_list_degraded_instruments", return_value=[
+            {
+                "ticker": "BBG00F6NKQX3",
+                "capabilities": {
+                    "sandbox_order": {"reason": "figi_missing"},
+                    "has_figi": {"reason": "figi_missing"},
+                },
+            },
+            {
+                "ticker": "SMLT",
+                "capabilities": {
+                    "h1_tinvest": {"reason": "known_fallback"},
+                },
+            },
+        ]):
+            summary = dr.summarize_capabilities()
+
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(len(summary["rows"]), 1)
+        self.assertIn("SMLT", summary["rows"][0])
 
     def test_portfolio_mismatch_summary_detects_orphan(self):
         lines, count = dr.portfolio_mismatch_summary({
@@ -751,6 +914,19 @@ class TestDailyReportDiagnostics(unittest.TestCase):
         })
         self.assertEqual(count, 0, lines)
 
+    def test_signal_gap_ignores_rejected_order_signal(self):
+        lines, count = dr.signal_state_gap_summary({
+            "VTBR_SHORT_2026-04-29": {
+                "ticker": "VTBR",
+                "direction": "SHORT",
+                "entry": 87.8,
+                "hit": None,
+                "execution_status": "rejected",
+                "order_reject_reason": "sandbox_place_order_failed",
+            },
+        })
+        self.assertEqual(count, 0, lines)
+
     def test_no_market_signals_returns_empty(self):
         news = [self._news_item("LONG")]
         result = mb.synthesize_signals([], news)
@@ -777,6 +953,10 @@ class TestDailyReportDiagnostics(unittest.TestCase):
                 result_with_lkoh[0].get("confidence")
             )
 
+    def test_csv_env_list_normalizes_tickers(self):
+        with patch.dict(os.environ, {"EXTRA_TICKERS": " vkco, belu ,, "}, clear=False):
+            self.assertEqual(mb._csv_env_list("EXTRA_TICKERS"), ["VKCO", "BELU"])
+
 
 class TestStateResilience(unittest.TestCase):
 
@@ -801,6 +981,66 @@ class TestStateResilience(unittest.TestCase):
                 mb.save_trade_log(payload)
                 loaded = mb.load_trade_log()
             self.assertEqual(loaded, payload)
+
+    def test_state_migration_removes_legacy_unexecuted_records_with_backup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "signals_state.json")
+            trade_path = os.path.join(tmpdir, "trade_log.json")
+            migrations_path = os.path.join(tmpdir, "state_migrations.json")
+            decision_path = os.path.join(tmpdir, "decisions.jsonl")
+            stale_sent = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+            state = {
+                "OLD_LONG_2026-04-01": {
+                    "ticker": "OLD",
+                    "direction": "LONG",
+                    "entry": 10.0,
+                    "hit": None,
+                },
+                "SBER_LONG_2026-04-01": {
+                    "ticker": "SBER",
+                    "direction": "LONG",
+                    "entry": 300.0,
+                    "hit": None,
+                },
+                "sb_SBER_LONG_2026-04-01": {
+                    "ticker": "SBER",
+                    "direction": "LONG",
+                    "order_id": "ord-1",
+                },
+                "ntg_old": {"sent": stale_sent},
+            }
+            trade_log = [
+                {"signal_id": "OLD_LONG_2026-04-01", "ticker": "OLD"},
+                {"signal_id": "SBER_LONG_2026-04-01", "ticker": "SBER", "execution_status": "filled"},
+            ]
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+            with open(trade_path, "w", encoding="utf-8") as f:
+                json.dump(trade_log, f)
+
+            with patch.object(mb, "SIGNALS_STATE_FILE", state_path), \
+                 patch.object(mb, "TRADE_LOG_FILE", trade_path), \
+                 patch.object(mb, "STATE_MIGRATIONS_FILE", migrations_path), \
+                 patch.object(mb, "DECISION_LOG_FILE", decision_path):
+                summary = mb.run_state_migrations(force=True)
+
+            migrated_state = json.loads(open(state_path, encoding="utf-8").read())
+            migrated_trades = json.loads(open(trade_path, encoding="utf-8").read())
+            migrations = json.loads(open(migrations_path, encoding="utf-8").read())
+
+            self.assertEqual(summary["state_removed"], 1)
+            self.assertEqual(summary["trade_removed"], 1)
+            self.assertEqual(summary["ntg_removed"], 1)
+            self.assertNotIn("OLD_LONG_2026-04-01", migrated_state)
+            self.assertNotIn("ntg_old", migrated_state)
+            self.assertEqual(migrated_state["SBER_LONG_2026-04-01"]["execution_status"], "filled")
+            self.assertEqual(migrated_state["sb_SBER_LONG_2026-04-01"]["base_signal_key"], "SBER_LONG_2026-04-01")
+            self.assertEqual(len(migrated_trades), 1)
+            self.assertEqual(migrated_trades[0]["signal_id"], "SBER_LONG_2026-04-01")
+            self.assertIn(mb.STATE_MIGRATION_VERSION, migrations)
+            backups = os.listdir(os.path.join(tmpdir, "state_backups"))
+            self.assertTrue(any(name.startswith("signals_state.json.") for name in backups))
+            self.assertTrue(any(name.startswith("trade_log.json.") for name in backups))
 
 
 class TestMoexNetworkRetry(unittest.TestCase):
@@ -852,6 +1092,246 @@ class TestReconcileLinking(unittest.TestCase):
         self.assertIn("sb_SBER_LONG_2026-04-23", state)
         self.assertEqual(state["sb_SBER_LONG_2026-04-23"]["base_signal_key"], "SBER_LONG_2026-04-23")
         self.assertEqual(state["sb_SBER_LONG_2026-04-23"]["reconcile_status"], "linked_orphan")
+
+
+class TestExecutionRecording(unittest.TestCase):
+
+    def _signal(self):
+        return {
+            "ticker": "SBER",
+            "direction": "LONG",
+            "entry": 300.0,
+            "stop": 297.0,
+            "take1": 303.0,
+            "take2": 306.0,
+            "confidence": "🔥🔥 ОТЛИЧНАЯ",
+            "confidence_score": 12,
+            "volume_ratio": 2.5,
+            "rr": 2.0,
+            "signal_version": "test",
+            "decision_reasons": [],
+            "data_quality_flags": [],
+        }
+
+    def test_sandbox_fill_creates_trade_log_and_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trade_file = os.path.join(tmpdir, "trade_log.json")
+            score_file = os.path.join(tmpdir, "score.jsonl")
+            decision_file = os.path.join(tmpdir, "decision.jsonl")
+            fake_tinvest = MagicMock()
+            fake_tinvest.get_sandbox_portfolio.return_value = {"total_amount_rub": 1_000_000, "positions": []}
+            fake_tinvest.sandbox_place_order.return_value = {
+                "order_id": "ord-1",
+                "lots": 10,
+                "price": 300.0,
+            }
+            state = {}
+
+            with patch.object(mb, "TRADE_LOG_FILE", trade_file), \
+                 patch.object(mb, "SCORE_LOG_FILE", score_file), \
+                 patch.object(mb, "DECISION_LOG_FILE", decision_file), \
+                 patch.object(mb, "SANDBOX_AUTO_ORDER", True), \
+                 patch.object(mb, "SANDBOX_MAX_TICKER_PCT", 100.0), \
+                 patch.object(mb, "SANDBOX_MAX_TOTAL_PCT", 100.0), \
+                 patch.object(mb, "_tinvest_available", return_value=True), \
+                 patch.object(mb, "_tinvest", fake_tinvest):
+                placed = mb.sandbox_execute_signals([self._signal()], state)
+
+            key = f"SBER_LONG_{mb.now_msk().strftime('%Y-%m-%d')}"
+            self.assertEqual(placed, 1)
+            self.assertIn(key, state)
+            self.assertIn(f"sb_{key}", state)
+            self.assertEqual(state[key]["execution_status"], "filled")
+            self.assertEqual(state[f"sb_{key}"]["order_id"], "ord-1")
+            log = json.loads(open(trade_file, encoding="utf-8").read())
+            self.assertEqual(len(log), 1)
+            self.assertEqual(log[0]["signal_id"], key)
+            self.assertEqual(log[0]["execution_status"], "filled")
+            self.assertEqual(log[0]["sb_order_id"], "ord-1")
+
+    def test_sandbox_order_failure_does_not_create_trade_record(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trade_file = os.path.join(tmpdir, "trade_log.json")
+            score_file = os.path.join(tmpdir, "score.jsonl")
+            decision_file = os.path.join(tmpdir, "decision.jsonl")
+            fake_tinvest = MagicMock()
+            fake_tinvest.get_sandbox_portfolio.return_value = {"total_amount_rub": 1_000_000, "positions": []}
+            fake_tinvest.sandbox_place_order.return_value = None
+            state = {}
+
+            with patch.object(mb, "TRADE_LOG_FILE", trade_file), \
+                 patch.object(mb, "SCORE_LOG_FILE", score_file), \
+                 patch.object(mb, "DECISION_LOG_FILE", decision_file), \
+                 patch.object(mb, "SANDBOX_AUTO_ORDER", True), \
+                 patch.object(mb, "SANDBOX_MAX_TICKER_PCT", 100.0), \
+                 patch.object(mb, "SANDBOX_MAX_TOTAL_PCT", 100.0), \
+                 patch.object(mb, "_tinvest_available", return_value=True), \
+                 patch.object(mb, "_tinvest", fake_tinvest):
+                placed = mb.sandbox_execute_signals([self._signal()], state)
+
+            self.assertEqual(placed, 0)
+            self.assertEqual(state, {})
+            self.assertFalse(os.path.exists(trade_file))
+            score_lines = open(score_file, encoding="utf-8").read()
+            self.assertIn("sandbox_order_rejected", score_lines)
+
+    def test_tier3_signal_is_watch_only_without_order(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trade_file = os.path.join(tmpdir, "trade_log.json")
+            score_file = os.path.join(tmpdir, "score.jsonl")
+            decision_file = os.path.join(tmpdir, "decision.jsonl")
+            opportunity_file = os.path.join(tmpdir, "opportunity.jsonl")
+            fake_tinvest = MagicMock()
+            fake_tinvest.get_sandbox_portfolio.return_value = {"total_amount_rub": 1_000_000, "positions": []}
+            state = {}
+            signal = self._signal()
+            signal["ticker"] = "TIER3"
+
+            with patch.object(mb, "TRADE_LOG_FILE", trade_file), \
+                 patch.object(mb, "SCORE_LOG_FILE", score_file), \
+                 patch.object(mb, "DECISION_LOG_FILE", decision_file), \
+                 patch.object(mb, "OPPORTUNITY_LOG_FILE", opportunity_file), \
+                 patch.object(mb, "SANDBOX_AUTO_ORDER", True), \
+                 patch.object(mb, "_tinvest_available", return_value=True), \
+                 patch.object(mb, "_tinvest", fake_tinvest), \
+                 patch.object(mb, "ticker_tier", return_value="tier_3"):
+                placed = mb.sandbox_execute_signals([signal], state)
+
+            self.assertEqual(placed, 0)
+            fake_tinvest.sandbox_place_order.assert_not_called()
+            self.assertEqual(state, {})
+            self.assertIn("tier3_watch_only", open(score_file, encoding="utf-8").read())
+            self.assertIn("tier3_watch_only", open(opportunity_file, encoding="utf-8").read())
+
+    def test_close_failure_does_not_mark_trade_result(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trade_file = os.path.join(tmpdir, "trade_log.json")
+            score_file = os.path.join(tmpdir, "score.jsonl")
+            decision_file = os.path.join(tmpdir, "decision.jsonl")
+            fake_tinvest = MagicMock()
+            fake_tinvest.sandbox_close_position.return_value = None
+            key = "SBER_LONG_2026-04-29"
+            state = {
+                key: {
+                    **self._signal(),
+                    "hit": None,
+                    "opened_at": "2026-04-29T09:00:00+00:00",
+                },
+                f"sb_{key}": {
+                    "ticker": "SBER",
+                    "direction": "LONG",
+                    "order_id": "ord-1",
+                    "lots": 1,
+                    "opened_at": "2026-04-29T09:00:00+00:00",
+                    "execution_status": "filled",
+                },
+            }
+            with open(trade_file, "w", encoding="utf-8") as f:
+                json.dump([{
+                    "signal_id": key,
+                    "ticker": "SBER",
+                    "direction": "LONG",
+                    "entry": 300.0,
+                    "result": "open",
+                    "execution_status": "filled",
+                    "executed": True,
+                }], f)
+
+            with patch.object(mb, "TRADE_LOG_FILE", trade_file), \
+                 patch.object(mb, "SCORE_LOG_FILE", score_file), \
+                 patch.object(mb, "DECISION_LOG_FILE", decision_file), \
+                 patch.object(mb, "TELEGRAM_TOKEN", "token"), \
+                 patch.object(mb, "TELEGRAM_CHAT_ID", "chat"), \
+                 patch.object(mb, "SANDBOX_AUTO_ORDER", True), \
+                 patch.object(mb, "load_signals_state", return_value=state), \
+                 patch.object(mb, "save_signals_state"), \
+                 patch.object(mb, "_tinvest_available", return_value=True), \
+                 patch.object(mb, "_tinvest", fake_tinvest), \
+                 patch.object(mb, "tg_send", return_value=True):
+                mb.tg_notify_run([], [], {"SBER": {"last": 296.0}}, {})
+
+            log = json.loads(open(trade_file, encoding="utf-8").read())
+            self.assertEqual(log[0]["result"], "open")
+            self.assertIsNone(state[key]["hit"])
+            self.assertEqual(state[key]["close_pending_reason"], "stop_hit")
+            self.assertIn("sandbox_close_rejected", open(score_file, encoding="utf-8").read())
+
+    def test_close_success_marks_trade_result(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trade_file = os.path.join(tmpdir, "trade_log.json")
+            score_file = os.path.join(tmpdir, "score.jsonl")
+            decision_file = os.path.join(tmpdir, "decision.jsonl")
+            fake_tinvest = MagicMock()
+            fake_tinvest.sandbox_close_position.return_value = {"price": 296.0}
+            key = "SBER_LONG_2026-04-29"
+            state = {
+                key: {
+                    **self._signal(),
+                    "hit": None,
+                    "opened_at": "2026-04-29T09:00:00+00:00",
+                },
+                f"sb_{key}": {
+                    "ticker": "SBER",
+                    "direction": "LONG",
+                    "order_id": "ord-1",
+                    "lots": 1,
+                    "opened_at": "2026-04-29T09:00:00+00:00",
+                    "execution_status": "filled",
+                },
+            }
+            with open(trade_file, "w", encoding="utf-8") as f:
+                json.dump([{
+                    "signal_id": key,
+                    "ticker": "SBER",
+                    "direction": "LONG",
+                    "entry": 300.0,
+                    "result": "open",
+                    "execution_status": "filled",
+                    "executed": True,
+                }], f)
+
+            with patch.object(mb, "TRADE_LOG_FILE", trade_file), \
+                 patch.object(mb, "SCORE_LOG_FILE", score_file), \
+                 patch.object(mb, "DECISION_LOG_FILE", decision_file), \
+                 patch.object(mb, "TELEGRAM_TOKEN", "token"), \
+                 patch.object(mb, "TELEGRAM_CHAT_ID", "chat"), \
+                 patch.object(mb, "SANDBOX_AUTO_ORDER", True), \
+                 patch.object(mb, "load_signals_state", return_value=state), \
+                 patch.object(mb, "save_signals_state"), \
+                 patch.object(mb, "_tinvest_available", return_value=True), \
+                 patch.object(mb, "_tinvest", fake_tinvest), \
+                 patch.object(mb, "tg_send", return_value=True):
+                mb.tg_notify_run([], [], {"SBER": {"last": 296.0}}, {})
+
+            log = json.loads(open(trade_file, encoding="utf-8").read())
+            self.assertEqual(log[0]["result"], "loss")
+            self.assertEqual(log[0]["execution_status"], "closed")
+            self.assertEqual(state[f"sb_{key}"]["execution_status"], "closed")
+
+    def test_auto_order_mode_does_not_record_telegram_signal_as_trade(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trade_file = os.path.join(tmpdir, "trade_log.json")
+            score_file = os.path.join(tmpdir, "score.jsonl")
+            decision_file = os.path.join(tmpdir, "decision.jsonl")
+            state: dict = {}
+
+            with patch.object(mb, "TRADE_LOG_FILE", trade_file), \
+                 patch.object(mb, "SCORE_LOG_FILE", score_file), \
+                 patch.object(mb, "DECISION_LOG_FILE", decision_file), \
+                 patch.object(mb, "TELEGRAM_TOKEN", "token"), \
+                 patch.object(mb, "TELEGRAM_CHAT_ID", "chat"), \
+                 patch.object(mb, "SANDBOX_AUTO_ORDER", True), \
+                 patch.object(mb, "load_signals_state", return_value=state), \
+                 patch.object(mb, "save_signals_state") as mock_save, \
+                 patch.object(mb, "tg_send") as mock_tg_send:
+                mb.tg_notify_run([self._signal()], [], {}, {})
+
+            self.assertFalse(mock_tg_send.called)
+            self.assertFalse(os.path.exists(trade_file))
+            self.assertEqual(state, {})
+            mock_save.assert_called_once()
+            score_lines = open(score_file, encoding="utf-8").read()
+            self.assertIn("auto_order_controls_entry", score_lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -49,6 +49,7 @@ EOD_FILE       = _DIR / "eod_state.json"
 LOG_DIR        = _DIR / "logs"
 LOG_FILE       = _DIR / "bot.log"   # fallback если logs/ нет
 DECISION_LOG_FILE = _DIR / "signals_decision_log.jsonl"
+OPPORTUNITY_LOG_FILE = _DIR / "opportunity_log.jsonl"
 
 # МСК — фиксируем один раз на весь запуск (без скачков при переходе суток)
 _MSK_TZ     = pytz.timezone("Europe/Moscow")
@@ -145,6 +146,7 @@ def _build_daily_archive() -> Path | None:
         _DIR / "trade_log.json",
         _DIR / "signals_score_log.jsonl",
         _DIR / "signals_decision_log.jsonl",
+        _DIR / "opportunity_log.jsonl",
         _DIR / f"daily_diagnostics_{date_str}.json",
         _DIR / "news_memory.json",
         _DIR / "signals_state.json",
@@ -294,6 +296,28 @@ def load_today_decision_entries() -> list[dict]:
     return entries
 
 
+def load_today_opportunity_entries() -> list[dict]:
+    if not OPPORTUNITY_LOG_FILE.exists():
+        return []
+    entries: list[dict] = []
+    try:
+        with open(OPPORTUNITY_LOG_FILE, encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    item = json.loads(raw)
+                except Exception:
+                    continue
+                ts = str(item.get("ts") or "")
+                if ts.startswith(TODAY_STR):
+                    entries.append(item)
+    except Exception:
+        return []
+    return entries
+
+
 def summarize_decisions(entries: list[dict]) -> dict:
     summary = {
         "total": len(entries),
@@ -308,22 +332,51 @@ def summarize_decisions(entries: list[dict]) -> dict:
     return summary
 
 
+def summarize_opportunities(entries: list[dict], decision_entries: list[dict] | None = None) -> dict:
+    actions: dict[str, int] = {}
+    reasons: dict[str, int] = {}
+    tiers: dict[str, int] = {}
+    for item in entries:
+        action = str(item.get("action") or "unknown")
+        reason = str(item.get("reason") or "unknown")
+        tier = str(item.get("ticker_tier") or "unknown")
+        actions[action] = actions.get(action, 0) + 1
+        reasons[reason] = reasons.get(reason, 0) + 1
+        tiers[tier] = tiers.get(tier, 0) + 1
+    legacy_cleaned = 0
+    for item in decision_entries or []:
+        if str(item.get("reason")) == "legacy_state_cleanup":
+            legacy_cleaned += 1
+    return {
+        "opportunity": len(entries),
+        "executed": actions.get("executed", 0),
+        "rejected": actions.get("rejected", 0),
+        "watch_only": actions.get("watch_only", 0),
+        "legacy_cleaned": legacy_cleaned,
+        "actions": actions,
+        "reasons": reasons,
+        "tiers": tiers,
+    }
+
+
 def summarize_capabilities() -> dict:
     degraded = _list_degraded_instruments()
     capability_counts: dict[str, int] = {}
+    grouped: dict[str, set[str]] = {}
     rows: list[str] = []
     for item in degraded:
-        ticker = item.get("ticker", "?")
+        ticker = _normalize_ticker(item.get("ticker", "?"))
         caps = item.get("capabilities", {}) or {}
-        labels: list[str] = []
         for capability, meta in caps.items():
             capability_counts[capability] = capability_counts.get(capability, 0) + 1
             reason = str((meta or {}).get("reason") or "")
-            labels.append(f"{capability}:{reason}" if reason else capability)
+            label = f"{capability}:{reason}" if reason else capability
+            grouped.setdefault(ticker, set()).add(label)
+    for ticker, labels in grouped.items():
         if labels:
-            rows.append(f"{ticker} ({', '.join(labels[:3])})")
+            rows.append(f"{ticker} ({', '.join(sorted(labels)[:3])})")
     return {
-        "count": len(degraded),
+        "count": len(grouped),
         "rows": rows[:6],
         "capability_counts": capability_counts,
     }
@@ -452,12 +505,14 @@ def build_daily_diagnostics(
     state: dict,
     log_lines: list[str],
     decision_entries: list[dict],
+    opportunity_entries: list[dict] | None = None,
 ) -> dict:
     return {
         "date": TODAY_STR,
         "generated_at": _NOW_MSK.isoformat(),
         "strategy_results": summarize_strategy_results(all_trades),
         "reason_codes": summarize_decisions(decision_entries),
+        "release_counters": summarize_opportunities(opportunity_entries or [], decision_entries),
         "uid_fallback": summarize_uid_fallback(log_lines),
         "network_resilience": summarize_network_resilience(log_lines),
         "reconcile_health": summarize_reconcile_health(state, decision_entries),
@@ -710,6 +765,8 @@ def signal_state_gap_summary(state: dict) -> tuple[list[str], int]:
         if not isinstance(val, dict):
             continue
         if key.startswith(("sb_", "news_", "ntg_")):
+            continue
+        if val.get("execution_status") in {"virtual", "ghost_closed", "rejected"}:
             continue
         if val.get("hit") in ("target2", "stop_hit"):
             continue
@@ -1146,7 +1203,8 @@ def main() -> int:
     decision_entries   = load_today_decision_entries()
     decision_stats     = summarize_decisions(decision_entries)
     capability_stats   = summarize_capabilities()
-    diagnostics        = build_daily_diagnostics(all_trades, state, log_lines_raw, decision_entries)
+    opportunity_entries = load_today_opportunity_entries()
+    diagnostics        = build_daily_diagnostics(all_trades, state, log_lines_raw, decision_entries, opportunity_entries)
     save_daily_diagnostics(diagnostics)
     opened, closed     = trades_today(all_trades)
     stats              = day_pnl_stats(closed)

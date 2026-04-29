@@ -51,12 +51,14 @@ import pathlib as _pathlib
 _SANDBOX_UNAVAILABLE: dict[str, tuple[datetime, str]] = {}   # ticker -> (marked_at_utc, reason)
 SANDBOX_BLACKLIST_TTL_HOURS         = 24     # для figi_missing и прочих временных причин
 SANDBOX_BLACKLIST_TTL_HOURS_50002   = 168    # 7 дней для инструментов с 50002 (не в sandbox)
+_SANDBOX_LONG_BLOCK_REASONS = {"50002", "api_forbidden_30052"}
 _BLACKLIST_FILE: _pathlib.Path = _pathlib.Path(__file__).parent / "sandbox_blacklist.json"
 _CAPABILITIES_FILE: _pathlib.Path = _pathlib.Path(__file__).parent / "instrument_capabilities.json"
 _INSTRUMENT_CAPABILITIES: dict[str, dict[str, dict[str, object]]] = {}
 _DEFAULT_CAPABILITIES = {
     "has_figi": True,
     "h1_tinvest": True,
+    "lot_size": True,
     "orderbook": True,
     "sandbox_order": True,
 }
@@ -93,7 +95,7 @@ def _capability_ttl_hours(capability: str, reason: str) -> int:
     if capability in ("h1_tinvest", "orderbook") and reason in ("50002", "known_fallback"):
         return 168
     if capability == "sandbox_order":
-        if reason == "50002":
+        if reason in _SANDBOX_LONG_BLOCK_REASONS:
             return SANDBOX_BLACKLIST_TTL_HOURS_50002
         if reason == "30079":
             return 12
@@ -315,7 +317,7 @@ def mark_sandbox_unavailable(ticker: str, reason: str = "50002") -> None:
     v0.9.37: reason='figi_missing' — когда FIGI_MAP не содержит тикер.
     v0.9.38.3: persistent — сохраняется в файл, переживает рестарты.
     """
-    ttl = SANDBOX_BLACKLIST_TTL_HOURS_50002 if reason == "50002" else SANDBOX_BLACKLIST_TTL_HOURS
+    ttl = SANDBOX_BLACKLIST_TTL_HOURS_50002 if reason in _SANDBOX_LONG_BLOCK_REASONS else SANDBOX_BLACKLIST_TTL_HOURS
     if ticker not in _SANDBOX_UNAVAILABLE:
         logger.warning(
             "[SANDBOX_BLACKLIST] %s → blacklist на %dч (reason=%s) [persistent]",
@@ -332,7 +334,7 @@ def is_sandbox_available(ticker: str) -> bool:
     if not marked:
         return True
     marked_at, reason = marked
-    ttl = SANDBOX_BLACKLIST_TTL_HOURS_50002 if reason == "50002" else SANDBOX_BLACKLIST_TTL_HOURS
+    ttl = SANDBOX_BLACKLIST_TTL_HOURS_50002 if reason in _SANDBOX_LONG_BLOCK_REASONS else SANDBOX_BLACKLIST_TTL_HOURS
     age_h = (_now_utc() - marked_at).total_seconds() / 3600
     if age_h >= ttl:
         _SANDBOX_UNAVAILABLE.pop(ticker, None)
@@ -351,6 +353,46 @@ def list_sandbox_unavailable() -> list[tuple[str, str]]:
 #  v0.9.38 — верификация LOT_SIZE против MOEX ISS
 # ══════════════════════════════════════════════════════════════════════════════
 _LOT_VERIFY_DONE: bool = False
+
+
+def fetch_moex_lot_size(ticker: str, timeout: float = 3.0) -> Optional[int]:
+    """Fetch LOTSIZE from MOEX ISS for tickers added via EXTRA_TICKERS."""
+    import urllib.request as _urlreq
+    import json as _json
+
+    url = (f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/"
+           f"TQBR/securities/{ticker}.json?iss.meta=off")
+    try:
+        raw = _urlreq.urlopen(url, timeout=timeout).read()
+        data = _json.loads(raw)
+        cols = data["securities"]["columns"]
+        rows = data["securities"]["data"]
+        if not rows:
+            return None
+        return int(rows[0][cols.index("LOTSIZE")])
+    except Exception as _e:
+        logger.debug("fetch_moex_lot_size(%s): %s", ticker, _e)
+        return None
+
+
+def get_lot_size(ticker: str) -> int:
+    """Return lot size, learning unknown tickers from MOEX once per process."""
+    if ticker in LOT_SIZE:
+        return LOT_SIZE[ticker]
+    moex_lot = fetch_moex_lot_size(ticker)
+    if moex_lot and moex_lot > 0:
+        LOT_SIZE[ticker] = moex_lot
+        logger.info("[LOT_SIZE] %s → MOEX ISS LOTSIZE=%d (runtime cache)", ticker, moex_lot)
+        return moex_lot
+    mark_instrument_issue(
+        ticker,
+        "lot_size",
+        "unknown",
+        ttl_hours=24,
+        detail="LOT_SIZE missing and MOEX ISS lookup failed",
+    )
+    return 1
+
 
 def verify_lot_sizes(timeout: float = 5.0, force: bool = False) -> list[tuple[str, int, int]]:
     """Фетчит LOTSIZE тикеров из MOEX ISS и сверяет с LOT_SIZE.
@@ -685,6 +727,29 @@ def get_figi(ticker: str) -> Optional[str]:
     return figi
 
 
+def resolve_instrument_ids(ticker: str, *, allow_uid_lookup: bool = True) -> tuple[Optional[str], Optional[str]]:
+    """Return (figi, uid) for a ticker, preferring cached/static data.
+
+    Newer MOEX listings often work in T-Invest by instrument UID before we have a
+    reliable FIGI in FIGI_MAP. Missing FIGI should therefore be an execution
+    degradation, not an immediate hard failure.
+    """
+    figi = FIGI_MAP.get(ticker)
+    uid = _UID_CACHE.get(ticker)
+    if figi:
+        return figi, uid
+    if uid or not allow_uid_lookup:
+        return figi, uid
+    uid = find_and_cache_uid(ticker)
+    if uid:
+        if not figi:
+            logger.info("[INSTRUMENT_RESOLVE] %s → UID найден без FIGI_MAP", ticker)
+        return figi, uid
+    if not figi:
+        get_figi(ticker)  # one-shot warning + capability marker
+    return figi, None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ФАЗА 1: Данные (котировки, история)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -767,14 +832,12 @@ def get_orderbook(ticker: str, depth: int = 10) -> Optional[dict]:
         logger.debug("get_orderbook(%s): capability disabled → skip", ticker)
         return None
 
-    figi = get_figi(ticker)
-    if not figi:
-        logger.debug("get_orderbook(%s): FIGI не найден", ticker)
+    figi, _uid = resolve_instrument_ids(ticker)
+    if not figi and not _uid:
+        logger.debug("get_orderbook(%s): instrument id не найден", ticker)
         return None
 
     # v0.9.38.4: если UID уже закэширован — используем instrument_id
-    _uid = _UID_CACHE.get(ticker)
-
     def _fetch_ob(client: object) -> object:
         if _uid:
             return client.market_data.get_order_book(instrument_id=_uid, depth=depth)
@@ -855,8 +918,8 @@ def get_candles_tinvest(ticker: str, days: int = 21) -> list[dict]:
     if not is_available():
         return []
 
-    figi = get_figi(ticker)
-    if not figi:
+    figi, uid = resolve_instrument_ids(ticker)
+    if not figi and not uid:
         return []
 
     try:
@@ -873,7 +936,7 @@ def get_candles_tinvest(ticker: str, days: int = 21) -> list[dict]:
             )
 
         result = []
-        lot = LOT_SIZE.get(ticker, 1)
+        lot = get_lot_size(ticker)
         for c in response.candles:
             vol_lots = c.volume  # T-Invest отдаёт объём в лотах
             # Конвертируем в рубли: объём_лотов × лотность × цена_закрытия
@@ -952,14 +1015,18 @@ def get_h1_candles(ticker: str, days: int = 5) -> list[dict]:
         date_from = datetime.now(timezone.utc) - timedelta(days=days + 2)
 
         with Client(_get_token()) as client:
-            response = client.market_data.get_candles(
-                figi=figi,
-                from_=date_from,
-                to=datetime.now(timezone.utc),
-                interval=CandleInterval.CANDLE_INTERVAL_HOUR,
-            )
+            kwargs = {
+                "from_": date_from,
+                "to": datetime.now(timezone.utc),
+                "interval": CandleInterval.CANDLE_INTERVAL_HOUR,
+            }
+            if uid:
+                kwargs["instrument_id"] = uid
+            else:
+                kwargs["figi"] = figi
+            response = client.market_data.get_candles(**kwargs)
 
-        lot = LOT_SIZE.get(ticker, 1)
+        lot = get_lot_size(ticker)
         result = []
         for c in response.candles:
             close_price = _proto_to_float(c.close)
@@ -1172,13 +1239,12 @@ def sandbox_place_order(
         logger.info("[SANDBOX] %s skip: capability cooldown still active", ticker)
         return None
 
-    figi = get_figi(ticker)
-    if not figi:
+    figi, _uid_override = resolve_instrument_ids(ticker)
+    if not figi and not _uid_override:
         return None
 
-    # v0.9.38.4: проверяем UID-кэш — если уже есть, сразу используем instrument_id
-    # (FIGI устарел для ряда тикеров, T-Invest возвращает 50002 даже при верном FIGI)
-    _uid_override = _UID_CACHE.get(ticker)
+    # v0.9.38.4+: если UID известен — используем instrument_id напрямую
+    # (FIGI устарел или отсутствует для ряда тикеров).
 
     def _do_order(client, order_dir, order_type_cls) -> object:
         import uuid as _uuid
@@ -1230,7 +1296,7 @@ def sandbox_place_order(
             "quantity":  quantity,
             "price":     exec_price,
             "lots":      quantity,
-            "shares":    quantity * LOT_SIZE.get(ticker, 1),
+            "shares":    quantity * get_lot_size(ticker),
         }
         logger.info(
             "[SANDBOX] %s %s ×%dл → %s  статус=%s%s",
@@ -1254,6 +1320,12 @@ def sandbox_place_order(
                 "30079",
                 detail="Instrument unavailable for trading in sandbox",
             )
+        elif "30052" in err_str or "Instrument forbidden for trading by API" in err_str:
+            logger.warning(
+                "[SANDBOX] %s запрещён для торговли через API/sandbox (30052) — ставим долгий cooldown",
+                ticker,
+            )
+            mark_sandbox_unavailable(ticker, reason="api_forbidden_30052")
         elif "50002" in err_str:
             # v0.9.38.4: FIGI устарел → ищем UID через FindInstrument и делаем retry
             if not _uid_override:
@@ -1302,7 +1374,7 @@ def sandbox_place_order(
                             "quantity":  quantity,
                             "price":     exec_price2,
                             "lots":      quantity,
-                            "shares":    quantity * LOT_SIZE.get(ticker, 1),
+                            "shares":    quantity * get_lot_size(ticker),
                         }
                     except Exception as e2:
                         logger.warning(
@@ -1347,7 +1419,7 @@ def sandbox_close_position(
     if not portfolio:
         return None
 
-    lot_size = LOT_SIZE.get(ticker, 1)
+    lot_size = get_lot_size(ticker)
 
     for pos in portfolio["positions"]:
         if pos["ticker"] == ticker and pos["quantity"] != 0:
