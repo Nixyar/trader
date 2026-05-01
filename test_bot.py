@@ -15,6 +15,14 @@ from unittest.mock import patch, MagicMock
 from datetime import datetime, timedelta, timezone
 from statistics import mean
 
+
+class _FixedTradingDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        value = datetime(2026, 4, 29, 12, 0, tzinfo=timezone.utc)
+        return value.astimezone(tz) if tz else value.replace(tzinfo=None)
+
+
 # ─── Путь к ботам ─────────────────────────────────────────────────────────────
 
 BOT_DIR = os.path.join(os.path.dirname(__file__), "mnt", "Desktop", "trader")
@@ -1093,6 +1101,47 @@ class TestReconcileLinking(unittest.TestCase):
         self.assertEqual(state["sb_SBER_LONG_2026-04-23"]["base_signal_key"], "SBER_LONG_2026-04-23")
         self.assertEqual(state["sb_SBER_LONG_2026-04-23"]["reconcile_status"], "linked_orphan")
 
+    def test_reconcile_auto_closes_unlinked_orphan(self):
+        state = {
+            "sb_SBER_orphan": {
+                "ticker": "SBER",
+                "direction": "LONG",
+                "entry": 322.72,
+                "price": 320.0,
+                "lots": 28,
+                "execution_status": "orphan",
+            }
+        }
+        portfolio = {
+            "positions": [
+                {"ticker": "SBER", "quantity": 28, "avg_price": 322.72, "curr_price": 320.0}
+            ]
+        }
+        fake_tinvest = MagicMock()
+        fake_tinvest.get_sandbox_portfolio.return_value = portfolio
+        fake_tinvest.sandbox_close_position.return_value = {
+            "order_id": "close-1",
+            "price": 320.0,
+        }
+
+        with patch.object(mb, "SANDBOX_AUTO_ORDER", True), \
+             patch.object(mb, "SANDBOX_ORPHAN_POLICY", "close"), \
+             patch.object(mb, "_tinvest_available", return_value=True), \
+             patch.object(mb, "_tinvest", fake_tinvest), \
+             patch.object(mb, "save_signals_state") as mock_save, \
+             patch.object(mb, "append_decision_log") as mock_decision:
+            mb.reconcile_sandbox_state(state)
+
+        fake_tinvest.sandbox_close_position.assert_called_once_with("SBER")
+        self.assertEqual(state["sb_SBER_orphan"]["execution_status"], "orphan_closed")
+        self.assertEqual(state["sb_SBER_orphan"]["close_reason"], "reconcile_orphan_auto_close")
+        self.assertEqual(state["sb_SBER_orphan"]["close_order_id"], "close-1")
+        mock_save.assert_called_once()
+        self.assertTrue(any(
+            call.args[0].get("reason") == "reconcile_orphan_auto_close"
+            for call in mock_decision.call_args_list
+        ))
+
 
 class TestExecutionRecording(unittest.TestCase):
 
@@ -1133,11 +1182,12 @@ class TestExecutionRecording(unittest.TestCase):
                  patch.object(mb, "SANDBOX_AUTO_ORDER", True), \
                  patch.object(mb, "SANDBOX_MAX_TICKER_PCT", 100.0), \
                  patch.object(mb, "SANDBOX_MAX_TOTAL_PCT", 100.0), \
+                 patch.object(mb, "datetime", _FixedTradingDateTime), \
                  patch.object(mb, "_tinvest_available", return_value=True), \
                  patch.object(mb, "_tinvest", fake_tinvest):
                 placed = mb.sandbox_execute_signals([self._signal()], state)
 
-            key = f"SBER_LONG_{mb.now_msk().strftime('%Y-%m-%d')}"
+            key = "SBER_LONG_2026-04-29"
             self.assertEqual(placed, 1)
             self.assertIn(key, state)
             self.assertIn(f"sb_{key}", state)
@@ -1165,6 +1215,7 @@ class TestExecutionRecording(unittest.TestCase):
                  patch.object(mb, "SANDBOX_AUTO_ORDER", True), \
                  patch.object(mb, "SANDBOX_MAX_TICKER_PCT", 100.0), \
                  patch.object(mb, "SANDBOX_MAX_TOTAL_PCT", 100.0), \
+                 patch.object(mb, "datetime", _FixedTradingDateTime), \
                  patch.object(mb, "_tinvest_available", return_value=True), \
                  patch.object(mb, "_tinvest", fake_tinvest):
                 placed = mb.sandbox_execute_signals([self._signal()], state)
@@ -1192,6 +1243,7 @@ class TestExecutionRecording(unittest.TestCase):
                  patch.object(mb, "DECISION_LOG_FILE", decision_file), \
                  patch.object(mb, "OPPORTUNITY_LOG_FILE", opportunity_file), \
                  patch.object(mb, "SANDBOX_AUTO_ORDER", True), \
+                 patch.object(mb, "datetime", _FixedTradingDateTime), \
                  patch.object(mb, "_tinvest_available", return_value=True), \
                  patch.object(mb, "_tinvest", fake_tinvest), \
                  patch.object(mb, "ticker_tier", return_value="tier_3"):
@@ -1321,6 +1373,7 @@ class TestExecutionRecording(unittest.TestCase):
                  patch.object(mb, "TELEGRAM_TOKEN", "token"), \
                  patch.object(mb, "TELEGRAM_CHAT_ID", "chat"), \
                  patch.object(mb, "SANDBOX_AUTO_ORDER", True), \
+                 patch.object(mb, "datetime", _FixedTradingDateTime), \
                  patch.object(mb, "load_signals_state", return_value=state), \
                  patch.object(mb, "save_signals_state") as mock_save, \
                  patch.object(mb, "tg_send") as mock_tg_send:
