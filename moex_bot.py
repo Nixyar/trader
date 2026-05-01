@@ -662,6 +662,7 @@ _ai_backoff_until: datetime | None = None  # v0.9.10: при 403 блокиру�
 # Sandbox: минимальная уверенность для авто-ордера (HIGH = только 🔥 ВЫСОКАЯ)
 SANDBOX_AUTO_ORDER   = os.environ.get("SANDBOX_AUTO_ORDER", "true").lower() == "true"
 SANDBOX_ORDER_LOTS   = int(os.environ.get("SANDBOX_ORDER_LOTS", "1"))  # лотов на сигнал (fallback)
+SANDBOX_ORPHAN_POLICY = os.environ.get("SANDBOX_ORPHAN_POLICY", "close").lower()
 
 # ─── Риск-менеджмент позиций (v0.9.11) ────────────────────────────────────────
 # Три независимых ограничения. Ордер блокируется если ЛЮБОЕ нарушено.
@@ -5336,6 +5337,53 @@ def reconcile_sandbox_state(state: dict) -> None:
     if not portfolio:
         return
 
+    def _close_unlinked_orphan(orphan_key: str, orphan_val: dict) -> bool:
+        if SANDBOX_ORPHAN_POLICY != "close":
+            return False
+        if orphan_val.get("base_signal_key") or orphan_val.get("closed_at"):
+            return False
+        if str(orphan_val.get("execution_status") or "") not in {"orphan", "linked_orphan", ""}:
+            return False
+        ticker = orphan_val.get("ticker")
+        if not ticker:
+            return False
+        try:
+            close_result = _tinvest.sandbox_close_position(ticker)  # type: ignore[union-attr]
+        except Exception as exc:
+            logger.warning("reconcile_orphan auto-close %s: %s", ticker, exc)
+            append_decision_log({
+                "action": "rejected",
+                "reason": "reconcile_orphan_close_failed",
+                "ticker": ticker,
+                "state_key": orphan_key,
+                "error": str(exc),
+            })
+            return False
+        if not close_result:
+            logger.warning("reconcile_orphan auto-close %s вернул None", ticker)
+            append_decision_log({
+                "action": "rejected",
+                "reason": "reconcile_orphan_close_rejected",
+                "ticker": ticker,
+                "state_key": orphan_key,
+            })
+            return False
+        orphan_val["closed_at"] = datetime.now(timezone.utc).isoformat()
+        orphan_val["close_reason"] = "reconcile_orphan_auto_close"
+        orphan_val["close_price"] = close_result.get("price")
+        orphan_val["execution_status"] = "orphan_closed"
+        orphan_val["close_order_id"] = close_result.get("order_id")
+        append_decision_log({
+            "action": "closed",
+            "reason": "reconcile_orphan_auto_close",
+            "ticker": ticker,
+            "direction": orphan_val.get("direction"),
+            "state_key": orphan_key,
+            "order_id": close_result.get("order_id"),
+        })
+        logger.warning("reconcile_orphan auto-closed %s (%s)", ticker, orphan_key)
+        return True
+
     # Словарь {ticker: position_dict} для реальных позиций (без кэша)
     real_positions: dict[str, dict] = {}
     for pos in portfolio.get("positions", []):
@@ -5406,6 +5454,7 @@ def reconcile_sandbox_state(state: dict) -> None:
                     val["price"] = pos.get("curr_price", val.get("price", 0))
                     val["execution_status"] = val.get("reconcile_status", "orphan")
                     val["reconcile_seen_at"] = datetime.now(timezone.utc).isoformat()
+                    _close_unlinked_orphan(key, val)
                     changed = True
             continue
         qty = pos.get("quantity", 0)
@@ -5456,6 +5505,8 @@ def reconcile_sandbox_state(state: dict) -> None:
             if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
                 tg_send(f"⚠️ *Reconcile*: найдена неизвестная позиция `{ticker}` "
                         f"({direction} ×{abs(qty):.0f}) — добавлена в state как orphan.")
+            if not linked_signal_key:
+                _close_unlinked_orphan(orphan_key, state[orphan_key])
 
     if changed:
         save_signals_state(state)
