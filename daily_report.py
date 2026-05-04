@@ -489,6 +489,8 @@ def summarize_reconcile_health(state: dict, decision_entries: list[dict]) -> dic
             continue
         if val.get("close_reason") == "reconcile_ghost":
             stats["ghost_closed"] += 1
+        if val.get("closed_at"):
+            continue
         status = str(val.get("reconcile_status") or val.get("execution_status") or "")
         if status == "linked_orphan":
             stats["linked_orphan"] += 1

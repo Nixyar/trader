@@ -697,6 +697,24 @@ class TestInstrumentCapabilities(unittest.TestCase):
                 caps = td._INSTRUMENT_CAPABILITIES["UNKNOWN"]["lot_size"]
                 self.assertEqual(caps["reason"], "unknown")
 
+    def test_data_layer_missing_figi_does_not_blacklist_sandbox(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            caps_file = os.path.join(tmpdir, "instrument_capabilities.json")
+            blacklist_file = os.path.join(tmpdir, "sandbox_blacklist.json")
+            with patch.object(td, "_CAPABILITIES_FILE", td._pathlib.Path(caps_file)), \
+                 patch.object(td, "_BLACKLIST_FILE", td._pathlib.Path(blacklist_file)), \
+                 patch.dict(td.FIGI_MAP, {}, clear=True), \
+                 patch.object(td, "is_available", return_value=True):
+                td._INSTRUMENT_CAPABILITIES.clear()
+                td._SANDBOX_UNAVAILABLE.clear()
+                td._FIGI_MISSING_LOGGED.clear()
+
+                self.assertEqual(td.get_h1_candles("HEAD"), [])
+
+                self.assertTrue(td.is_sandbox_available("HEAD"))
+                self.assertNotIn("HEAD", td._SANDBOX_UNAVAILABLE)
+                self.assertFalse(td.instrument_capability_available("HEAD", "has_figi"))
+
 
 class TestDailyReportDiagnostics(unittest.TestCase):
 
@@ -753,6 +771,27 @@ class TestDailyReportDiagnostics(unittest.TestCase):
         self.assertEqual(summary["watch_only"], 1)
         self.assertEqual(summary["legacy_cleaned"], 1)
         self.assertEqual(summary["tiers"]["tier_3"], 1)
+
+    def test_reconcile_health_ignores_closed_orphan_status(self):
+        summary = dr.summarize_reconcile_health({
+            "sb_HEAD_orphan": {
+                "ticker": "HEAD",
+                "execution_status": "orphan_closed",
+                "reconcile_status": "orphan",
+                "closed_at": "2026-05-04T06:50:23+00:00",
+                "close_reason": "reconcile_orphan_auto_close",
+            },
+            "sb_BBG_orphan": {
+                "ticker": "BBG",
+                "execution_status": "ghost_closed",
+                "reconcile_status": "orphan",
+                "closed_at": "2026-05-04T06:50:23+00:00",
+                "close_reason": "reconcile_ghost",
+            },
+        }, [])
+
+        self.assertEqual(summary["orphan"], 0)
+        self.assertEqual(summary["ghost_closed"], 1)
 
     def test_summarize_capabilities_groups_instrument_aliases(self):
         with patch.object(dr, "_list_degraded_instruments", return_value=[

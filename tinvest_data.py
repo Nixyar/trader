@@ -706,24 +706,32 @@ def is_available() -> bool:
 
 _FIGI_MISSING_LOGGED: set[str] = set()
 
-def get_figi(ticker: str) -> Optional[str]:
+def get_figi(ticker: str, *, mark_sandbox: bool = True) -> Optional[str]:
     """Возвращает FIGI для тикера или None если не найден.
 
     v0.9.37: WARNING логируется один раз на тикер (до рестарта процесса),
     плюс автоматический blacklist с reason='figi_missing', чтобы sandbox
     не пытался размещать ордер и не генерил фантомы в trade_log.
+
+    mark_sandbox=False используется data-layer вызовами: отсутствие FIGI для
+    свечей/last price не должно блокировать последующий UID fallback ордера.
     """
     figi = FIGI_MAP.get(ticker)
     if not figi:
         if ticker not in _FIGI_MISSING_LOGGED:
+            action = (
+                "Тикер помечен как sandbox-unavailable до рестарта."
+                if mark_sandbox else
+                "Data-layer продолжит через MOEX fallback; sandbox попробует UID при ордере."
+            )
             logger.warning(
-                "FIGI не найден для тикера %s — добавь в FIGI_MAP (tinvest_data.py). "
-                "Тикер помечен как sandbox-unavailable до рестарта.",
-                ticker,
+                "FIGI не найден для тикера %s — добавь в FIGI_MAP (tinvest_data.py). %s",
+                ticker, action,
             )
             _FIGI_MISSING_LOGGED.add(ticker)
+        if mark_sandbox:
             mark_sandbox_unavailable(ticker, reason="figi_missing")
-            mark_instrument_issue(ticker, "has_figi", "figi_missing", detail="FIGI_MAP lookup failed")
+        mark_instrument_issue(ticker, "has_figi", "figi_missing", detail="FIGI_MAP lookup failed")
     return figi
 
 
@@ -764,7 +772,7 @@ def get_last_price(ticker: str) -> Optional[dict]:
     if not is_available():
         return None
 
-    figi = get_figi(ticker)
+    figi = get_figi(ticker, mark_sandbox=False)
     if not figi:
         return None
 
@@ -1004,7 +1012,7 @@ def get_h1_candles(ticker: str, days: int = 5) -> list[dict]:
         logger.debug("get_h1_candles(%s): в списке CANDLES_SKIP → MOEX ISS fallback", ticker)
         return []
 
-    figi = get_figi(ticker)
+    figi = get_figi(ticker, mark_sandbox=False)
     if not figi:
         return []
 
