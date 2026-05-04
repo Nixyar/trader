@@ -1560,6 +1560,58 @@ class TestH1WatchHelpers(unittest.TestCase):
         exp = datetime.fromisoformat(watch["NVTK_SHORT"]["expires_at"])
         self.assertGreater(exp, datetime.now(timezone.utc))
 
+    def test_daily_change_pct_uses_previous_close(self):
+        candles = [{"close": 100.0}, {"close": 97.5}]
+
+        self.assertEqual(mb.daily_change_pct(candles), -2.5)
+
+    def test_price_momentum_radar_logs_watch_only_once(self):
+        candles = [{"close": 100.0}, {"close": 97.5}]
+        levels = {"last_close": 97.5, "ma50": 101.0}
+        anomaly = {
+            "anomaly": False,
+            "ratio": 1.4,
+            "last_volume": 120_000_000,
+            "avg_volume": 85_000_000,
+            "absolute_ok": True,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opportunity_file = os.path.join(tmpdir, "opportunity.jsonl")
+            with patch.object(mb, "OPPORTUNITY_LOG_FILE", opportunity_file):
+                mb._MARKET_RADAR_SEEN.clear()
+                self.assertTrue(mb.maybe_log_price_momentum_radar("GMKN", candles, levels, anomaly))
+                self.assertFalse(mb.maybe_log_price_momentum_radar("GMKN", candles, levels, anomaly))
+
+            rows = [json.loads(line) for line in open(opportunity_file, encoding="utf-8")]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["action"], "watch_only")
+            self.assertEqual(rows[0]["reason"], "price_momentum_radar")
+            self.assertEqual(rows[0]["direction"], "SHORT")
+
+    def test_h1_watch_radar_entry_is_deduplicated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opportunity_file = os.path.join(tmpdir, "opportunity.jsonl")
+            with patch.object(mb, "OPPORTUNITY_LOG_FILE", opportunity_file):
+                mb._MARKET_RADAR_SEEN.clear()
+                first = mb.append_market_radar_opportunity(
+                    "HEAD", "h1_watch_pending",
+                    direction="SHORT",
+                    levels={"last_close": 2911},
+                    anomaly={"ratio": 2.03},
+                    change_pct=-1.88,
+                )
+                second = mb.append_market_radar_opportunity(
+                    "HEAD", "h1_watch_pending",
+                    direction="SHORT",
+                    levels={"last_close": 2911},
+                    anomaly={"ratio": 2.03},
+                    change_pct=-1.88,
+                )
+
+            self.assertTrue(first)
+            self.assertFalse(second)
+            self.assertEqual(len(open(opportunity_file, encoding="utf-8").read().splitlines()), 1)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ЗАПУСК

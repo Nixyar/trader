@@ -689,6 +689,7 @@ SANDBOX_MAX_TOTAL_PCT  = float(os.environ.get("SANDBOX_MAX_TOTAL_PCT",  "40.0"))
 # (ticker, reason). Держим окно 30 мин на уникальную пару — лог чище.
 _RISK_BLOCK_SEEN: dict[tuple, tuple] = {}   # (ticker, reason_code) -> (last_logged_utc, suppressed_count)
 _RISK_BLOCK_DEDUP_MIN = 30
+_MARKET_RADAR_SEEN: set[tuple[str, str, str]] = set()  # (YYYY-MM-DD, ticker, reason)
 
 # Максимальный дневной убыток: если внутри дня −2% к SOD equity — стоп новых входов.
 MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "2.0"))
@@ -815,6 +816,12 @@ LATE_ENTRY_MAX_PCT = float(os.environ.get("LATE_ENTRY_MAX_PCT", "1.5"))  # % о�
 #   Убирает ~40% ложных входов без изменения логики стопов.
 MA50_TREND_FILTER = bool(int(os.environ.get("MA50_TREND_FILTER", "1")))
 MA50_HARD_FILTER  = bool(int(os.environ.get("MA50_HARD_FILTER",  "1")))
+
+# ─── Opportunity radar ───────────────────────────────────────────────────────
+# Не торгует сам по себе. Нужен, чтобы дневной экспорт показывал сильные
+# движения/зоны интереса, которые не дошли до trade-grade сигнала.
+PRICE_RADAR_MIN_ABS_CHANGE_PCT = float(os.environ.get("PRICE_RADAR_MIN_ABS_CHANGE_PCT", "2.0"))
+PRICE_RADAR_MIN_VOLUME_RATIO   = float(os.environ.get("PRICE_RADAR_MIN_VOLUME_RATIO",   "1.25"))
 
 # ─── Portfolio heat guard (v0.9.8) ───────────────────────────────────────────
 # Суммарный риск по всем открытым позициям не должен превышать PORTFOLIO_HEAT_MAX %.
@@ -4442,6 +4449,88 @@ def append_opportunity_log(entry: dict) -> None:
         logger.warning("append_opportunity_log: %s", e)
 
 
+def daily_change_pct(candles: list[dict]) -> float | None:
+    """Change of the latest daily candle versus the previous close."""
+    closes = [c.get("close") for c in candles if c.get("close")]
+    if len(closes) < 2 or not closes[-2]:
+        return None
+    return round((closes[-1] - closes[-2]) / closes[-2] * 100, 2)
+
+
+def _radar_direction(change_pct: float | None, levels: dict) -> str:
+    if change_pct is not None and change_pct > 0:
+        return "LONG"
+    if change_pct is not None and change_pct < 0:
+        return "SHORT"
+    price = levels.get("last_close") or 0
+    ma50 = levels.get("ma50") or price
+    return "LONG" if price >= ma50 else "SHORT"
+
+
+def append_market_radar_opportunity(
+    ticker: str,
+    reason: str,
+    *,
+    direction: str | None = None,
+    levels: dict | None = None,
+    anomaly: dict | None = None,
+    change_pct: float | None = None,
+    extra: dict | None = None,
+) -> bool:
+    """
+    Deduplicated watch-only journal entry for candidates that are visible to the
+    market scanner but have not become executable signals.
+    """
+    today = now_msk().strftime("%Y-%m-%d")
+    key = (today, ticker, reason)
+    if key in _MARKET_RADAR_SEEN:
+        return False
+    _MARKET_RADAR_SEEN.add(key)
+    levels = levels or {}
+    anomaly = anomaly or {}
+    entry = {
+        "ticker": ticker,
+        "direction": direction or _radar_direction(change_pct, levels),
+        "action": "watch_only",
+        "reason": reason,
+        "price": levels.get("last_close"),
+        "daily_change_pct": change_pct,
+        "volume_ratio": anomaly.get("ratio"),
+        "last_volume": anomaly.get("last_volume"),
+        "avg_volume": anomaly.get("avg_volume"),
+        "absolute_ok": anomaly.get("absolute_ok"),
+        "data_quality_flags": [],
+        "decision_reasons": [reason],
+    }
+    if extra:
+        entry.update(extra)
+    append_opportunity_log(entry)
+    return True
+
+
+def maybe_log_price_momentum_radar(ticker: str, candles: list[dict], levels: dict, anomaly: dict) -> bool:
+    """
+    Logs large directional daily moves that missed the stricter volume-anomaly
+    gate. This is diagnostics/radar only, never an auto-order trigger.
+    """
+    change_pct = daily_change_pct(candles)
+    ratio = anomaly.get("ratio") or 0
+    if change_pct is None:
+        return False
+    if abs(change_pct) < PRICE_RADAR_MIN_ABS_CHANGE_PCT:
+        return False
+    if ratio < PRICE_RADAR_MIN_VOLUME_RATIO and not anomaly.get("absolute_ok"):
+        return False
+    return append_market_radar_opportunity(
+        ticker,
+        "price_momentum_radar",
+        levels=levels,
+        anomaly=anomaly,
+        change_pct=change_pct,
+        extra={"threshold_abs_change_pct": PRICE_RADAR_MIN_ABS_CHANGE_PCT},
+    )
+
+
 def log_new_signal(s: dict, signal_id: str) -> None:
     """
     Добавляет новый сигнал в trade_log.json.
@@ -6415,10 +6504,22 @@ def run_once(news_only: bool = False):
                     if _dir_chk == "LONG" and _price_chk < _ma50_chk:
                         print(f"       ❌ MA50 фильтр: mean-rev LONG заблокирован (цена {_price_chk} < MA50 {_ma50_chk:.1f})")
                         logger.info("%s: mean-rev LONG заблокирован MA50 (цена=%.2f < MA50=%.2f)", ticker, _price_chk, _ma50_chk)
+                        append_market_radar_opportunity(
+                            ticker, "ma50_mean_reversion_blocked",
+                            direction=_dir_chk, levels=levels, anomaly=anomaly,
+                            change_pct=daily_change_pct(candles),
+                            extra={"signal_type": _sig_type},
+                        )
                         continue
                     if _dir_chk == "SHORT" and _price_chk > _ma50_chk:
                         print(f"       ❌ MA50 фильтр: mean-rev SHORT заблокирован (цена {_price_chk} > MA50 {_ma50_chk:.1f})")
                         logger.info("%s: mean-rev SHORT заблокирован MA50 (цена=%.2f > MA50=%.2f)", ticker, _price_chk, _ma50_chk)
+                        append_market_radar_opportunity(
+                            ticker, "ma50_mean_reversion_blocked",
+                            direction=_dir_chk, levels=levels, anomaly=anomaly,
+                            change_pct=daily_change_pct(candles),
+                            extra={"signal_type": _sig_type},
+                        )
                         continue
                 type_label = "📈 momentum" if _sig_type == "momentum" else "↩️ mean-rev"
                 print(f"       {type_label} → {_dir_chk}")
@@ -6467,6 +6568,12 @@ def run_once(news_only: bool = False):
                         print(f"       👀 H1 нет подтверждения — {watch_key} добавлен в watch ({H1_WATCH_HOURS:.0f}ч)")
                         logger.info("%s: ДОБАВЛЕН в h1_watch, направление=%s, ×%.1f, ждём %gч",
                                     ticker, _dir_chk, anomaly.get("ratio", 0), H1_WATCH_HOURS)
+                        append_market_radar_opportunity(
+                            ticker, "h1_watch_pending",
+                            direction=_dir_chk, levels=levels, anomaly=anomaly,
+                            change_pct=daily_change_pct(candles),
+                            extra={"signal_type": _sig_type, "watch_key": watch_key},
+                        )
                         # v0.9.19: watch-алерты убраны из Telegram (только вход/закрытие)
                         logger.info("%s: watch-alert подавлен (v0.9.19)", ticker)
                     else:
@@ -6482,6 +6589,7 @@ def run_once(news_only: bool = False):
             else:
                 reason = "объём мал" if not anomaly.get("absolute_ok", True) else f"×{anomaly.get('ratio', 0)}"
                 print(f"— норма ({reason})")
+                maybe_log_price_momentum_radar(ticker, candles, levels, anomaly)
 
         # ── v0.9.3: обрабатываем watch-лист (тикеры из прошлых сканов) ──────
         watch_tickers = [v for v in h1_watch.values() if v["ticker"] not in {s["ticker"] for s in market_signals}]
