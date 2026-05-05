@@ -732,6 +732,13 @@ OPPORTUNITY_LOG_FILE = os.path.join(
 PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moex_bot.pid")
 # Минимальный интервал повторной отправки одного сигнала (часов)
 TG_REPEAT_HOURS = float(os.environ.get("TG_REPEAT_HOURS", "3"))
+NEWS_EVENT_SANDBOX_ORDER = bool(int(os.environ.get("NEWS_EVENT_SANDBOX_ORDER", "1")))
+NEWS_EVENT_MIN_STRENGTH_AI = int(os.environ.get("NEWS_EVENT_MIN_STRENGTH_AI", "2"))
+NEWS_EVENT_MIN_STRENGTH_KEYWORDS = int(os.environ.get("NEWS_EVENT_MIN_STRENGTH_KEYWORDS", "3"))
+NEWS_EVENT_TYPES = set(
+    _csv_env_list("NEWS_EVENT_TYPES")
+    or ["EARNINGS", "DIVIDEND", "CORP", "SANCTIONS", "CB_RATE", "GEOPOLITICS", "OIL", "CURRENCY"]
+)
 
 # ─── Управление позицией ────────────────────────────────────────────────────
 # Коэффициенты для стопа/тейков (в единицах ATR).
@@ -2773,6 +2780,133 @@ def assess_news_status(item: "NewsItem", intraday_data: dict) -> str:
     return NEWS_STATUS_FRESH if (age_hours is None or age_hours < 1) else NEWS_STATUS_PENDING
 
 
+def is_news_event_tradable(item: "NewsItem") -> tuple[bool, str]:
+    """Sandbox-only gate for standalone news-event entries."""
+    if not NEWS_EVENT_SANDBOX_ORDER:
+        return False, "news_event_disabled"
+    if item.direction not in ("LONG", "SHORT") or not item.tickers:
+        return False, "news_event_no_direction"
+    min_strength = (
+        NEWS_EVENT_MIN_STRENGTH_AI
+        if item.analyzed_by == "ai"
+        else NEWS_EVENT_MIN_STRENGTH_KEYWORDS
+    )
+    if item.strength < min_strength:
+        return False, "news_event_low_strength"
+    if item.event_type not in NEWS_EVENT_TYPES:
+        return False, "news_event_type_not_allowed"
+    if item.status in (NEWS_STATUS_REJECTED, NEWS_STATUS_PRICED):
+        return False, "news_event_already_resolved"
+    return True, "news_event_candidate"
+
+
+def build_news_event_signals(
+    news_signals: list["NewsItem"],
+    ctx: dict,
+    intraday_data: dict,
+    existing_market_tickers: set[str] | None = None,
+) -> list[dict]:
+    """
+    Builds standalone sandbox-tradable signals for strong event news. This is
+    intentionally separate from normal news scoring and only runs in sandbox.
+    """
+    if not NEWS_EVENT_SANDBOX_ORDER:
+        return []
+    existing_market_tickers = existing_market_tickers or set()
+    built: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    for n in news_signals:
+        tradable, reason = is_news_event_tradable(n)
+        if not tradable:
+            append_decision_log({
+                "action": "skipped",
+                "reason": reason,
+                "ticker": ",".join(n.tickers[:4]),
+                "direction": n.direction,
+                "news_mode": n.analyzed_by or "keywords",
+                "strength": n.strength,
+                "event_type": n.event_type,
+            })
+            continue
+        for ticker in n.tickers[:3]:
+            if ticker in existing_market_tickers:
+                continue
+            key = (ticker, n.direction)
+            if key in seen:
+                continue
+            seen.add(key)
+            candles = get_candles(ticker, days=55)
+            if not candles:
+                append_opportunity_log({
+                    "ticker": ticker,
+                    "direction": n.direction,
+                    "action": "rejected",
+                    "reason": "news_event_no_candles",
+                    "news_mode": n.analyzed_by or "keywords",
+                    "event_type": n.event_type,
+                    "strength": n.strength,
+                })
+                continue
+            levels = calc_levels(candles)
+            intraday = intraday_data.get(ticker) or get_intraday_price(ticker)
+            if intraday:
+                intraday_data[ticker] = intraday
+                _current_intraday[ticker] = intraday
+            pseudo_anomaly = {
+                "anomaly": True,
+                "ratio": max(1.5, float(n.strength or 0)),
+                "last_volume": None,
+                "avg_volume": None,
+                "absolute_ok": True,
+                "reason": "news_event",
+            }
+            h1_confirm = {
+                "type": "news_event",
+                "note": f"{n.event_type} {n.direction} strength={n.strength}: {n.reason or n.title[:90]}",
+            }
+            signal = build_market_signal(
+                ticker, levels, pseudo_anomaly, ctx,
+                intraday=intraday or None,
+                h1_confirm=h1_confirm,
+                direction_override=n.direction,
+                signal_type_override="momentum",
+                signal_kind="NEWS_EVENT",
+            )
+            if not signal:
+                append_opportunity_log({
+                    "ticker": ticker,
+                    "direction": n.direction,
+                    "action": "rejected",
+                    "reason": "news_event_signal_invalid",
+                    "news_mode": n.analyzed_by or "keywords",
+                    "event_type": n.event_type,
+                    "strength": n.strength,
+                })
+                continue
+            signal["strategy"] = "news_event"
+            signal["news_mode"] = n.analyzed_by or "keywords"
+            signal["news_event_type"] = n.event_type
+            signal["news_event_strength"] = n.strength
+            signal["news_event_title"] = n.title
+            signal["news_event_url"] = n.url
+            signal["decision_reasons"] = sorted(set(signal.get("decision_reasons", []) + ["news_event_signal"]))
+            append_opportunity_log({
+                "ticker": ticker,
+                "direction": n.direction,
+                "action": "watch_only",
+                "reason": "news_event_candidate",
+                "news_mode": n.analyzed_by or "keywords",
+                "event_type": n.event_type,
+                "strength": n.strength,
+                "price": signal.get("entry"),
+                "volume_ratio": signal.get("volume_ratio"),
+                "decision_reasons": signal.get("decision_reasons", []),
+            })
+            built.append(signal)
+    return built
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  МОДУЛЬ 2: ПАРСИНГ НОВОСТЕЙ + КЭШ
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3320,6 +3454,9 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
             elif h1_type == "index_rebound":
                 h1_pts = 2
                 patterns.append("📈 отбой IMOEX")
+            elif h1_type == "news_event":
+                h1_pts = 1
+                patterns.append("📰 новостной event")
             else:  # "volume" — новый тип (v0.9.7)
                 h1_pts = 2
                 patterns.append("📊 объём H1")
@@ -3722,6 +3859,16 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
             if "📈 отбой IMOEX" not in patterns:
                 patterns.append("📈 отбой IMOEX")
             decision_reasons.append("index_rebound_signal")
+
+        if ms.get("strategy") == "news_event":
+            event_pts = 2
+            if ms.get("news_event_strength", 0) >= 3:
+                event_pts += 1
+            score += event_pts
+            score_breakdown.append(f"NewsEvent=+{event_pts}")
+            if "📰 новостной event" not in patterns:
+                patterns.append("📰 новостной event")
+            decision_reasons.append("news_event_signal")
 
         score = max(0, score)  # score не может быть отрицательным
         confidence = _score_to_confidence(score)
@@ -6948,6 +7095,16 @@ def run_once(news_only: bool = False):
         print("✅")
     for n in news_signals:
         n.status = assess_news_status(n, intraday_data)
+
+    news_event_market_signals: list[dict] = []
+    if news_signals and not news_only:
+        existing_market_tickers = {s["ticker"] for s in market_signals}
+        news_event_market_signals = build_news_event_signals(
+            news_signals, ctx, intraday_data, existing_market_tickers
+        )
+        if news_event_market_signals:
+            market_signals.extend(news_event_market_signals)
+            print(f"  📰 News-event sandbox candidates: {len(news_event_market_signals)}")
 
     # ── Модуль 4 ─────────────────────────────────────────────────────────────
     synthesized = []

@@ -530,6 +530,62 @@ class TestSynthesizeSignals(unittest.TestCase):
         self.assertEqual(len(result), 1, f"Ожидали, что батч не обнулится: {result}")
         self.assertEqual(result[0]["ticker"], "SBER")
 
+    def test_news_event_gate_allows_strong_ai_event(self):
+        news = self._news_item("LONG")
+        news.analyzed_by = "ai"
+        news.strength = 2
+        news.event_type = "EARNINGS"
+        news.status = mb.NEWS_STATUS_ACTIVE
+
+        allowed, reason = mb.is_news_event_tradable(news)
+
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "news_event_candidate")
+
+    def test_news_event_gate_rejects_resolved_news(self):
+        news = self._news_item("LONG")
+        news.analyzed_by = "ai"
+        news.strength = 3
+        news.status = mb.NEWS_STATUS_PRICED
+
+        allowed, reason = mb.is_news_event_tradable(news)
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "news_event_already_resolved")
+
+    def test_build_news_event_signals_creates_sandbox_signal(self):
+        news = self._news_item("LONG")
+        news.analyzed_by = "ai"
+        news.strength = 3
+        news.status = mb.NEWS_STATUS_ACTIVE
+        candles = [
+            {"open": 295.0, "high": 301.0, "low": 294.0, "close": 296.0, "value": 100_000_000},
+            {"open": 296.0, "high": 303.0, "low": 295.0, "close": 301.0, "value": 120_000_000},
+        ] * 30
+        intraday = {
+            "last": 302.0,
+            "vwap": 300.0,
+            "last_begin": "2026-05-05 12:00:00",
+            "change_pct": 1.2,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opportunity_file = os.path.join(tmpdir, "opportunity.jsonl")
+            decision_file = os.path.join(tmpdir, "decision.jsonl")
+            with patch.object(mb, "OPPORTUNITY_LOG_FILE", opportunity_file), \
+                 patch.object(mb, "DECISION_LOG_FILE", decision_file), \
+                 patch.object(mb, "get_candles", return_value=candles), \
+                 patch.object(mb, "get_intraday_price", return_value=intraday), \
+                 patch.object(mb, "_tinvest_available", return_value=False), \
+                 patch.object(mb, "is_moex_open", return_value=False):
+                signals = mb.build_news_event_signals([news], {}, {}, set())
+                synthesized = mb.synthesize_signals(signals, [news])
+
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]["type"], "NEWS_EVENT")
+        self.assertEqual(signals[0]["strategy"], "news_event")
+        self.assertGreaterEqual(synthesized[0]["confidence_score"], 9)
+        self.assertIn("news_event_signal", synthesized[0]["decision_reasons"])
+
 
 class TestInstrumentCapabilities(unittest.TestCase):
 
