@@ -732,6 +732,13 @@ OPPORTUNITY_LOG_FILE = os.path.join(
 PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moex_bot.pid")
 # Минимальный интервал повторной отправки одного сигнала (часов)
 TG_REPEAT_HOURS = float(os.environ.get("TG_REPEAT_HOURS", "3"))
+NEWS_EVENT_SANDBOX_ORDER = bool(int(os.environ.get("NEWS_EVENT_SANDBOX_ORDER", "1")))
+NEWS_EVENT_MIN_STRENGTH_AI = int(os.environ.get("NEWS_EVENT_MIN_STRENGTH_AI", "2"))
+NEWS_EVENT_MIN_STRENGTH_KEYWORDS = int(os.environ.get("NEWS_EVENT_MIN_STRENGTH_KEYWORDS", "3"))
+NEWS_EVENT_TYPES = set(
+    _csv_env_list("NEWS_EVENT_TYPES")
+    or ["EARNINGS", "DIVIDEND", "CORP", "SANCTIONS", "CB_RATE", "GEOPOLITICS", "OIL", "CURRENCY"]
+)
 
 # ─── Управление позицией ────────────────────────────────────────────────────
 # Коэффициенты для стопа/тейков (в единицах ATR).
@@ -822,6 +829,15 @@ MA50_HARD_FILTER  = bool(int(os.environ.get("MA50_HARD_FILTER",  "1")))
 # движения/зоны интереса, которые не дошли до trade-grade сигнала.
 PRICE_RADAR_MIN_ABS_CHANGE_PCT = float(os.environ.get("PRICE_RADAR_MIN_ABS_CHANGE_PCT", "2.0"))
 PRICE_RADAR_MIN_VOLUME_RATIO   = float(os.environ.get("PRICE_RADAR_MIN_VOLUME_RATIO",   "1.25"))
+INDEX_REBOUND_RADAR_ENABLED = bool(int(os.environ.get("INDEX_REBOUND_RADAR_ENABLED", "1")))
+INDEX_REBOUND_TICKERS = set(
+    _csv_env_list("INDEX_REBOUND_TICKERS")
+    or ["SBER", "VTBR", "T", "MOEX", "YDEX", "AFKS", "CBOM"]
+)
+INDEX_REBOUND_MIN_INDEX_PCT = float(os.environ.get("INDEX_REBOUND_MIN_INDEX_PCT", "1.5"))
+INDEX_REBOUND_MIN_TICKER_PCT = float(os.environ.get("INDEX_REBOUND_MIN_TICKER_PCT", "1.0"))
+INDEX_REBOUND_MIN_TICKER_HIGH_PCT = float(os.environ.get("INDEX_REBOUND_MIN_TICKER_HIGH_PCT", "1.5"))
+INDEX_REBOUND_SANDBOX_ORDER = bool(int(os.environ.get("INDEX_REBOUND_SANDBOX_ORDER", "1")))
 
 # ─── Portfolio heat guard (v0.9.8) ───────────────────────────────────────────
 # Суммарный риск по всем открытым позициям не должен превышать PORTFOLIO_HEAT_MAX %.
@@ -1614,6 +1630,7 @@ def get_intraday_price(ticker: str) -> dict:
         last_price = candles[-1]["close"]
         change_pct = (last_price - open_price) / open_price * 100
         vwap       = calc_vwap(candles)
+        rebound    = calc_intraday_rebound(candles)
         volumes = [float(c.get("value") or 0) for c in candles]
         recent_window = max(1, min(6, len(volumes)))
         avg_hourly_volume = round(sum(volumes) / len(volumes), 2) if volumes else 0.0
@@ -1624,6 +1641,7 @@ def get_intraday_price(ticker: str) -> dict:
             "last":       round(last_price, 2),
             "change_pct": round(change_pct, 2),
             "vwap":       vwap,
+            **rebound,
             "candle_count": len(candles),
             "last_begin": last_begin,
             "volume": current_window_volume,
@@ -1631,6 +1649,62 @@ def get_intraday_price(ticker: str) -> dict:
         }
     except Exception as e:
         logger.warning("get_intraday_price(%s): %s", ticker, e)
+        return {}
+
+
+def calc_intraday_rebound(candles: list[dict]) -> dict:
+    """Intraday rebound metrics from the current day's low."""
+    if not candles:
+        return {}
+    low_idx, low_candle = min(
+        enumerate(candles),
+        key=lambda item: item[1].get("low") if item[1].get("low") is not None else float("inf"),
+    )
+    low = low_candle.get("low")
+    last = candles[-1].get("close")
+    if not low or not last:
+        return {}
+    after_low = candles[low_idx:]
+    high_after_low = max((c.get("high") or 0) for c in after_low) if after_low else 0
+    return {
+        "intraday_low": round(low, 2),
+        "intraday_low_time": str(low_candle.get("begin") or "")[11:16],
+        "rebound_from_low_pct": round((last - low) / low * 100, 2),
+        "rebound_high_from_low_pct": round((high_after_low - low) / low * 100, 2) if high_after_low else None,
+    }
+
+
+def get_index_intraday_context() -> dict:
+    """10-minute IMOEX context for broad-market rebound diagnostics."""
+    today = now_msk().strftime("%Y-%m-%d")
+    url = (
+        f"{BASE_URL}/engines/stock/markets/index/boards/SNDX"
+        f"/securities/IMOEX/candles.json?from={today}&till={today}&interval=10"
+    )
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        cols = data["candles"]["columns"]
+        rows = data["candles"]["data"]
+        if not rows:
+            return {}
+        candles = [dict(zip(cols, row)) for row in rows]
+        open_price = candles[0]["open"]
+        last_price = candles[-1]["close"]
+        rebound = calc_intraday_rebound(candles)
+        return {
+            "ticker": "IMOEX",
+            "open": round(open_price, 2),
+            "last": round(last_price, 2),
+            "change_pct": round((last_price - open_price) / open_price * 100, 2),
+            "vwap": calc_vwap(candles),
+            "candle_count": len(candles),
+            "last_begin": candles[-1].get("begin") or "",
+            **rebound,
+        }
+    except Exception as e:
+        logger.warning("get_index_intraday_context(IMOEX): %s", e)
         return {}
 
 
@@ -2124,6 +2198,9 @@ def build_market_signal(
     intraday: dict | None = None,
     h1_levels: dict | None = None,
     h1_confirm: dict | None = None,   # v0.9.3: {"type": "breakout"|"momentum", "note": ...}
+    direction_override: str | None = None,
+    signal_type_override: str | None = None,
+    signal_kind: str = "VOLUME",
 ) -> dict | None:
     """
     intraday — результат get_intraday_price(ticker): {"open", "last", "change_pct", "vwap"}
@@ -2178,6 +2255,10 @@ def build_market_signal(
 
     # v0.9.4: умное определение направления с учётом MA50-тренда
     direction, signal_type = determine_direction(price, levels)
+    if direction_override in ("LONG", "SHORT"):
+        direction = direction_override
+    if signal_type_override in ("momentum", "mean_reversion"):
+        signal_type = signal_type_override
     decision_reasons.append(f"signal_type:{signal_type}")
 
     # RSI подтверждение: для momentum — расширенный диапазон (тренд может держать RSI высоко)
@@ -2544,7 +2625,7 @@ def build_market_signal(
     pos_calc  = calc_position_size(price, stop, lot_size=lot_size)
 
     return {
-        "type":               "VOLUME",
+        "type":               signal_kind,
         "ticker":             ticker,
         "direction":          direction,
         "entry":              price,
@@ -2697,6 +2778,133 @@ def assess_news_status(item: "NewsItem", intraday_data: dict) -> str:
     if matches > 0:
         return NEWS_STATUS_PRICED if (age_hours is not None and age_hours >= 2) else NEWS_STATUS_ACTIVE
     return NEWS_STATUS_FRESH if (age_hours is None or age_hours < 1) else NEWS_STATUS_PENDING
+
+
+def is_news_event_tradable(item: "NewsItem") -> tuple[bool, str]:
+    """Sandbox-only gate for standalone news-event entries."""
+    if not NEWS_EVENT_SANDBOX_ORDER:
+        return False, "news_event_disabled"
+    if item.direction not in ("LONG", "SHORT") or not item.tickers:
+        return False, "news_event_no_direction"
+    min_strength = (
+        NEWS_EVENT_MIN_STRENGTH_AI
+        if item.analyzed_by == "ai"
+        else NEWS_EVENT_MIN_STRENGTH_KEYWORDS
+    )
+    if item.strength < min_strength:
+        return False, "news_event_low_strength"
+    if item.event_type not in NEWS_EVENT_TYPES:
+        return False, "news_event_type_not_allowed"
+    if item.status in (NEWS_STATUS_REJECTED, NEWS_STATUS_PRICED):
+        return False, "news_event_already_resolved"
+    return True, "news_event_candidate"
+
+
+def build_news_event_signals(
+    news_signals: list["NewsItem"],
+    ctx: dict,
+    intraday_data: dict,
+    existing_market_tickers: set[str] | None = None,
+) -> list[dict]:
+    """
+    Builds standalone sandbox-tradable signals for strong event news. This is
+    intentionally separate from normal news scoring and only runs in sandbox.
+    """
+    if not NEWS_EVENT_SANDBOX_ORDER:
+        return []
+    existing_market_tickers = existing_market_tickers or set()
+    built: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    for n in news_signals:
+        tradable, reason = is_news_event_tradable(n)
+        if not tradable:
+            append_decision_log({
+                "action": "skipped",
+                "reason": reason,
+                "ticker": ",".join(n.tickers[:4]),
+                "direction": n.direction,
+                "news_mode": n.analyzed_by or "keywords",
+                "strength": n.strength,
+                "event_type": n.event_type,
+            })
+            continue
+        for ticker in n.tickers[:3]:
+            if ticker in existing_market_tickers:
+                continue
+            key = (ticker, n.direction)
+            if key in seen:
+                continue
+            seen.add(key)
+            candles = get_candles(ticker, days=55)
+            if not candles:
+                append_opportunity_log({
+                    "ticker": ticker,
+                    "direction": n.direction,
+                    "action": "rejected",
+                    "reason": "news_event_no_candles",
+                    "news_mode": n.analyzed_by or "keywords",
+                    "event_type": n.event_type,
+                    "strength": n.strength,
+                })
+                continue
+            levels = calc_levels(candles)
+            intraday = intraday_data.get(ticker) or get_intraday_price(ticker)
+            if intraday:
+                intraday_data[ticker] = intraday
+                _current_intraday[ticker] = intraday
+            pseudo_anomaly = {
+                "anomaly": True,
+                "ratio": max(1.5, float(n.strength or 0)),
+                "last_volume": None,
+                "avg_volume": None,
+                "absolute_ok": True,
+                "reason": "news_event",
+            }
+            h1_confirm = {
+                "type": "news_event",
+                "note": f"{n.event_type} {n.direction} strength={n.strength}: {n.reason or n.title[:90]}",
+            }
+            signal = build_market_signal(
+                ticker, levels, pseudo_anomaly, ctx,
+                intraday=intraday or None,
+                h1_confirm=h1_confirm,
+                direction_override=n.direction,
+                signal_type_override="momentum",
+                signal_kind="NEWS_EVENT",
+            )
+            if not signal:
+                append_opportunity_log({
+                    "ticker": ticker,
+                    "direction": n.direction,
+                    "action": "rejected",
+                    "reason": "news_event_signal_invalid",
+                    "news_mode": n.analyzed_by or "keywords",
+                    "event_type": n.event_type,
+                    "strength": n.strength,
+                })
+                continue
+            signal["strategy"] = "news_event"
+            signal["news_mode"] = n.analyzed_by or "keywords"
+            signal["news_event_type"] = n.event_type
+            signal["news_event_strength"] = n.strength
+            signal["news_event_title"] = n.title
+            signal["news_event_url"] = n.url
+            signal["decision_reasons"] = sorted(set(signal.get("decision_reasons", []) + ["news_event_signal"]))
+            append_opportunity_log({
+                "ticker": ticker,
+                "direction": n.direction,
+                "action": "watch_only",
+                "reason": "news_event_candidate",
+                "news_mode": n.analyzed_by or "keywords",
+                "event_type": n.event_type,
+                "strength": n.strength,
+                "price": signal.get("entry"),
+                "volume_ratio": signal.get("volume_ratio"),
+                "decision_reasons": signal.get("decision_reasons", []),
+            })
+            built.append(signal)
+    return built
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3243,6 +3451,12 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
             elif h1_type == "momentum":
                 h1_pts = 2
                 patterns.append("💪 импульс H1")
+            elif h1_type == "index_rebound":
+                h1_pts = 2
+                patterns.append("📈 отбой IMOEX")
+            elif h1_type == "news_event":
+                h1_pts = 1
+                patterns.append("📰 новостной event")
             else:  # "volume" — новый тип (v0.9.7)
                 h1_pts = 2
                 patterns.append("📊 объём H1")
@@ -3637,6 +3851,24 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
         if conflict_penalty:
             score += conflict_penalty
             score_breakdown.append(f"Conflicts={conflict_penalty}")
+
+        if ms.get("strategy") == "index_rebound":
+            rebound_pts = 2
+            score += rebound_pts
+            score_breakdown.append(f"IndexRebound=+{rebound_pts}")
+            if "📈 отбой IMOEX" not in patterns:
+                patterns.append("📈 отбой IMOEX")
+            decision_reasons.append("index_rebound_signal")
+
+        if ms.get("strategy") == "news_event":
+            event_pts = 2
+            if ms.get("news_event_strength", 0) >= 3:
+                event_pts += 1
+            score += event_pts
+            score_breakdown.append(f"NewsEvent=+{event_pts}")
+            if "📰 новостной event" not in patterns:
+                patterns.append("📰 новостной event")
+            decision_reasons.append("news_event_signal")
 
         score = max(0, score)  # score не может быть отрицательным
         confidence = _score_to_confidence(score)
@@ -4529,6 +4761,107 @@ def maybe_log_price_momentum_radar(ticker: str, candles: list[dict], levels: dic
         change_pct=change_pct,
         extra={"threshold_abs_change_pct": PRICE_RADAR_MIN_ABS_CHANGE_PCT},
     )
+
+
+def maybe_log_index_rebound_radar(
+    ticker: str,
+    intraday: dict,
+    index_intraday: dict,
+    levels: dict,
+    anomaly: dict,
+    change_pct: float | None,
+) -> bool:
+    """
+    Broad-market bounce radar. It marks beta/liquid tickers that rebound together
+    with IMOEX even when daily volume is not anomalous enough for auto-trading.
+    """
+    if not INDEX_REBOUND_RADAR_ENABLED:
+        return False
+    if ticker not in INDEX_REBOUND_TICKERS:
+        return False
+    if not intraday or not index_intraday:
+        return False
+    idx_rebound = index_intraday.get("rebound_from_low_pct") or 0
+    ticker_rebound = intraday.get("rebound_from_low_pct") or 0
+    ticker_high_rebound = intraday.get("rebound_high_from_low_pct") or 0
+    if idx_rebound < INDEX_REBOUND_MIN_INDEX_PCT:
+        return False
+    if ticker_rebound < INDEX_REBOUND_MIN_TICKER_PCT:
+        return False
+    if ticker_high_rebound < INDEX_REBOUND_MIN_TICKER_HIGH_PCT:
+        return False
+    if intraday.get("vwap") and intraday.get("last") and intraday["last"] < intraday["vwap"]:
+        return False
+    return append_market_radar_opportunity(
+        ticker,
+        "index_rebound_radar",
+        direction="LONG",
+        levels=levels,
+        anomaly=anomaly,
+        change_pct=change_pct,
+        extra={
+            "intraday_change_pct": intraday.get("change_pct"),
+            "rebound_from_low_pct": ticker_rebound,
+            "rebound_high_from_low_pct": ticker_high_rebound,
+            "intraday_low_time": intraday.get("intraday_low_time"),
+            "vwap": intraday.get("vwap"),
+            "imoex_change_pct": index_intraday.get("change_pct"),
+            "imoex_rebound_from_low_pct": idx_rebound,
+            "imoex_low_time": index_intraday.get("intraday_low_time"),
+        },
+    )
+
+
+def build_index_rebound_signal(
+    ticker: str,
+    levels: dict,
+    ctx: dict,
+    intraday: dict,
+    index_intraday: dict,
+    anomaly: dict,
+) -> dict | None:
+    """Builds a sandbox-tradable LONG signal from a broad IMOEX rebound."""
+    if not INDEX_REBOUND_SANDBOX_ORDER:
+        return None
+    rebound = intraday.get("rebound_from_low_pct") or 0
+    idx_rebound = index_intraday.get("rebound_from_low_pct") or 0
+    pseudo_anomaly = {
+        **(anomaly or {}),
+        "anomaly": True,
+        "ratio": max(float((anomaly or {}).get("ratio") or 0), 1.5),
+        "reason": "index_rebound",
+    }
+    h1_confirm = {
+        "type": "index_rebound",
+        "note": (
+            f"IMOEX rebound {idx_rebound:.2f}% от лоя "
+            f"{index_intraday.get('intraday_low_time', '?')}; "
+            f"{ticker} rebound {rebound:.2f}% выше VWAP"
+        ),
+    }
+    signal = build_market_signal(
+        ticker, levels, pseudo_anomaly, ctx,
+        intraday=intraday,
+        h1_confirm=h1_confirm,
+        direction_override="LONG",
+        signal_type_override="momentum",
+        signal_kind="INDEX_REBOUND",
+    )
+    if not signal:
+        return None
+    signal["strategy"] = "index_rebound"
+    signal["volume_ratio"] = pseudo_anomaly["ratio"]
+    signal["decision_reasons"] = sorted(set(signal.get("decision_reasons", []) + ["index_rebound_signal"]))
+    signal["data_quality_flags"] = sorted(set(signal.get("data_quality_flags", [])))
+    signal["index_rebound"] = {
+        "ticker_rebound_from_low_pct": rebound,
+        "ticker_rebound_high_from_low_pct": intraday.get("rebound_high_from_low_pct"),
+        "ticker_low_time": intraday.get("intraday_low_time"),
+        "imoex_rebound_from_low_pct": idx_rebound,
+        "imoex_change_pct": index_intraday.get("change_pct"),
+        "imoex_low_time": index_intraday.get("intraday_low_time"),
+    }
+    return signal
 
 
 def log_new_signal(s: dict, signal_id: str) -> None:
@@ -6468,6 +6801,14 @@ def run_once(news_only: bool = False):
                 logger.info("h1_watch: %s истёк — H1 так и не подтвердилось, убран", _ek)
 
         print(f"\n📊 СКАНИРОВАНИЕ РЫНКА ({len(TICKERS)} тикеров)\n")
+        index_intraday = get_index_intraday_context()
+        if index_intraday.get("rebound_from_low_pct", 0) >= INDEX_REBOUND_MIN_INDEX_PCT:
+            logger.info(
+                "IMOEX rebound radar active: rebound=%.2f%% change=%+.2f%% low_time=%s",
+                index_intraday.get("rebound_from_low_pct", 0),
+                index_intraday.get("change_pct", 0),
+                index_intraday.get("intraday_low_time", "?"),
+            )
         for ticker in TICKERS:
             print(f"  → {ticker}", end=" ", flush=True)
             # v0.9.2: 55 дней для MA50 (было 21, хватало только для MA20)
@@ -6590,6 +6931,20 @@ def run_once(news_only: bool = False):
                 reason = "объём мал" if not anomaly.get("absolute_ok", True) else f"×{anomaly.get('ratio', 0)}"
                 print(f"— норма ({reason})")
                 maybe_log_price_momentum_radar(ticker, candles, levels, anomaly)
+                if ticker in INDEX_REBOUND_TICKERS and index_intraday:
+                    rebound_intraday = get_intraday_price(ticker)
+                    if rebound_intraday:
+                        intraday_data[ticker] = rebound_intraday
+                        _current_intraday[ticker] = rebound_intraday
+                        maybe_log_index_rebound_radar(
+                            ticker, rebound_intraday, index_intraday,
+                            levels, anomaly, daily_change_pct(candles),
+                        )
+                        rebound_signal = build_index_rebound_signal(
+                            ticker, levels, ctx, rebound_intraday, index_intraday, anomaly
+                        )
+                        if rebound_signal:
+                            market_signals.append(rebound_signal)
 
         # ── v0.9.3: обрабатываем watch-лист (тикеры из прошлых сканов) ──────
         watch_tickers = [v for v in h1_watch.values() if v["ticker"] not in {s["ticker"] for s in market_signals}]
@@ -6740,6 +7095,16 @@ def run_once(news_only: bool = False):
         print("✅")
     for n in news_signals:
         n.status = assess_news_status(n, intraday_data)
+
+    news_event_market_signals: list[dict] = []
+    if news_signals and not news_only:
+        existing_market_tickers = {s["ticker"] for s in market_signals}
+        news_event_market_signals = build_news_event_signals(
+            news_signals, ctx, intraday_data, existing_market_tickers
+        )
+        if news_event_market_signals:
+            market_signals.extend(news_event_market_signals)
+            print(f"  📰 News-event sandbox candidates: {len(news_event_market_signals)}")
 
     # ── Модуль 4 ─────────────────────────────────────────────────────────────
     synthesized = []

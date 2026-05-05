@@ -530,6 +530,62 @@ class TestSynthesizeSignals(unittest.TestCase):
         self.assertEqual(len(result), 1, f"Ожидали, что батч не обнулится: {result}")
         self.assertEqual(result[0]["ticker"], "SBER")
 
+    def test_news_event_gate_allows_strong_ai_event(self):
+        news = self._news_item("LONG")
+        news.analyzed_by = "ai"
+        news.strength = 2
+        news.event_type = "EARNINGS"
+        news.status = mb.NEWS_STATUS_ACTIVE
+
+        allowed, reason = mb.is_news_event_tradable(news)
+
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "news_event_candidate")
+
+    def test_news_event_gate_rejects_resolved_news(self):
+        news = self._news_item("LONG")
+        news.analyzed_by = "ai"
+        news.strength = 3
+        news.status = mb.NEWS_STATUS_PRICED
+
+        allowed, reason = mb.is_news_event_tradable(news)
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "news_event_already_resolved")
+
+    def test_build_news_event_signals_creates_sandbox_signal(self):
+        news = self._news_item("LONG")
+        news.analyzed_by = "ai"
+        news.strength = 3
+        news.status = mb.NEWS_STATUS_ACTIVE
+        candles = [
+            {"open": 295.0, "high": 301.0, "low": 294.0, "close": 296.0, "value": 100_000_000},
+            {"open": 296.0, "high": 303.0, "low": 295.0, "close": 301.0, "value": 120_000_000},
+        ] * 30
+        intraday = {
+            "last": 302.0,
+            "vwap": 300.0,
+            "last_begin": "2026-05-05 12:00:00",
+            "change_pct": 1.2,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opportunity_file = os.path.join(tmpdir, "opportunity.jsonl")
+            decision_file = os.path.join(tmpdir, "decision.jsonl")
+            with patch.object(mb, "OPPORTUNITY_LOG_FILE", opportunity_file), \
+                 patch.object(mb, "DECISION_LOG_FILE", decision_file), \
+                 patch.object(mb, "get_candles", return_value=candles), \
+                 patch.object(mb, "get_intraday_price", return_value=intraday), \
+                 patch.object(mb, "_tinvest_available", return_value=False), \
+                 patch.object(mb, "is_moex_open", return_value=False):
+                signals = mb.build_news_event_signals([news], {}, {}, set())
+                synthesized = mb.synthesize_signals(signals, [news])
+
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]["type"], "NEWS_EVENT")
+        self.assertEqual(signals[0]["strategy"], "news_event")
+        self.assertGreaterEqual(synthesized[0]["confidence_score"], 9)
+        self.assertIn("news_event_signal", synthesized[0]["decision_reasons"])
+
 
 class TestInstrumentCapabilities(unittest.TestCase):
 
@@ -1611,6 +1667,104 @@ class TestH1WatchHelpers(unittest.TestCase):
             self.assertTrue(first)
             self.assertFalse(second)
             self.assertEqual(len(open(opportunity_file, encoding="utf-8").read().splitlines()), 1)
+
+    def test_calc_intraday_rebound_uses_low_before_close(self):
+        candles = [
+            {"low": 100.0, "high": 102.0, "close": 101.0, "begin": "2026-05-05 10:00:00"},
+            {"low": 95.0, "high": 97.0, "close": 96.0, "begin": "2026-05-05 11:10:00"},
+            {"low": 96.0, "high": 99.0, "close": 98.0, "begin": "2026-05-05 12:00:00"},
+        ]
+
+        result = mb.calc_intraday_rebound(candles)
+
+        self.assertEqual(result["intraday_low"], 95.0)
+        self.assertEqual(result["intraday_low_time"], "11:10")
+        self.assertEqual(result["rebound_from_low_pct"], 3.16)
+        self.assertEqual(result["rebound_high_from_low_pct"], 4.21)
+
+    def test_index_rebound_radar_logs_liquid_beta_ticker(self):
+        intraday = {
+            "last": 91.5,
+            "vwap": 90.4,
+            "change_pct": 1.8,
+            "rebound_from_low_pct": 2.7,
+            "rebound_high_from_low_pct": 3.4,
+            "intraday_low_time": "11:10",
+        }
+        index_intraday = {
+            "change_pct": 1.0,
+            "rebound_from_low_pct": 2.1,
+            "intraday_low_time": "11:10",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opportunity_file = os.path.join(tmpdir, "opportunity.jsonl")
+            with patch.object(mb, "OPPORTUNITY_LOG_FILE", opportunity_file):
+                mb._MARKET_RADAR_SEEN.clear()
+                logged = mb.maybe_log_index_rebound_radar(
+                    "VTBR", intraday, index_intraday,
+                    {"last_close": 91.5}, {"ratio": 0.75}, 2.32,
+                )
+
+            rows = [json.loads(line) for line in open(opportunity_file, encoding="utf-8")]
+            self.assertTrue(logged)
+            self.assertEqual(rows[0]["reason"], "index_rebound_radar")
+            self.assertEqual(rows[0]["direction"], "LONG")
+            self.assertEqual(rows[0]["imoex_rebound_from_low_pct"], 2.1)
+
+    def test_index_rebound_radar_rejects_below_vwap(self):
+        logged = mb.maybe_log_index_rebound_radar(
+            "SBER",
+            {"last": 319.0, "vwap": 320.0, "rebound_from_low_pct": 2.0, "rebound_high_from_low_pct": 2.5},
+            {"rebound_from_low_pct": 2.0},
+            {"last_close": 319.0},
+            {"ratio": 0.8},
+            -0.1,
+        )
+
+        self.assertFalse(logged)
+
+    def test_build_index_rebound_signal_is_tradable_strategy_signal(self):
+        levels = {
+            "last_close": 91.5,
+            "support": 89.1,
+            "resistance": 94.0,
+            "atr": 1.0,
+            "rsi": 58.0,
+            "ma20": 90.0,
+            "ma50": 89.0,
+            "adx": 24.0,
+            "obv_trend": "up",
+            "obv_bull_div": False,
+            "obv_bear_div": False,
+            "ma_crossover": None,
+        }
+        intraday = {
+            "last": 91.5,
+            "vwap": 90.4,
+            "last_begin": "2026-05-05 17:30:00",
+            "change_pct": 1.8,
+            "rebound_from_low_pct": 2.7,
+            "rebound_high_from_low_pct": 3.4,
+            "intraday_low_time": "11:10",
+        }
+        index_intraday = {
+            "change_pct": 1.0,
+            "rebound_from_low_pct": 2.1,
+            "intraday_low_time": "11:10",
+        }
+        with patch.object(mb, "_tinvest_available", return_value=False), \
+             patch.object(mb, "is_moex_open", return_value=False):
+            signal = mb.build_index_rebound_signal(
+                "VTBR", levels, {"imoex_regime": "bull"}, intraday, index_intraday, {"ratio": 0.75}
+            )
+            synthesized = mb.synthesize_signals([signal], [])
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal["type"], "INDEX_REBOUND")
+        self.assertEqual(signal["direction"], "LONG")
+        self.assertEqual(signal["strategy"], "index_rebound")
+        self.assertGreaterEqual(synthesized[0]["confidence_score"], 9)
+        self.assertIn("index_rebound_signal", synthesized[0]["decision_reasons"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
