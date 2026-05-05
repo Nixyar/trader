@@ -822,6 +822,14 @@ MA50_HARD_FILTER  = bool(int(os.environ.get("MA50_HARD_FILTER",  "1")))
 # движения/зоны интереса, которые не дошли до trade-grade сигнала.
 PRICE_RADAR_MIN_ABS_CHANGE_PCT = float(os.environ.get("PRICE_RADAR_MIN_ABS_CHANGE_PCT", "2.0"))
 PRICE_RADAR_MIN_VOLUME_RATIO   = float(os.environ.get("PRICE_RADAR_MIN_VOLUME_RATIO",   "1.25"))
+INDEX_REBOUND_RADAR_ENABLED = bool(int(os.environ.get("INDEX_REBOUND_RADAR_ENABLED", "1")))
+INDEX_REBOUND_TICKERS = set(
+    _csv_env_list("INDEX_REBOUND_TICKERS")
+    or ["SBER", "VTBR", "T", "MOEX", "YDEX", "AFKS", "CBOM"]
+)
+INDEX_REBOUND_MIN_INDEX_PCT = float(os.environ.get("INDEX_REBOUND_MIN_INDEX_PCT", "1.5"))
+INDEX_REBOUND_MIN_TICKER_PCT = float(os.environ.get("INDEX_REBOUND_MIN_TICKER_PCT", "1.0"))
+INDEX_REBOUND_MIN_TICKER_HIGH_PCT = float(os.environ.get("INDEX_REBOUND_MIN_TICKER_HIGH_PCT", "1.5"))
 
 # ─── Portfolio heat guard (v0.9.8) ───────────────────────────────────────────
 # Суммарный риск по всем открытым позициям не должен превышать PORTFOLIO_HEAT_MAX %.
@@ -1614,6 +1622,7 @@ def get_intraday_price(ticker: str) -> dict:
         last_price = candles[-1]["close"]
         change_pct = (last_price - open_price) / open_price * 100
         vwap       = calc_vwap(candles)
+        rebound    = calc_intraday_rebound(candles)
         volumes = [float(c.get("value") or 0) for c in candles]
         recent_window = max(1, min(6, len(volumes)))
         avg_hourly_volume = round(sum(volumes) / len(volumes), 2) if volumes else 0.0
@@ -1624,6 +1633,7 @@ def get_intraday_price(ticker: str) -> dict:
             "last":       round(last_price, 2),
             "change_pct": round(change_pct, 2),
             "vwap":       vwap,
+            **rebound,
             "candle_count": len(candles),
             "last_begin": last_begin,
             "volume": current_window_volume,
@@ -1631,6 +1641,62 @@ def get_intraday_price(ticker: str) -> dict:
         }
     except Exception as e:
         logger.warning("get_intraday_price(%s): %s", ticker, e)
+        return {}
+
+
+def calc_intraday_rebound(candles: list[dict]) -> dict:
+    """Intraday rebound metrics from the current day's low."""
+    if not candles:
+        return {}
+    low_idx, low_candle = min(
+        enumerate(candles),
+        key=lambda item: item[1].get("low") if item[1].get("low") is not None else float("inf"),
+    )
+    low = low_candle.get("low")
+    last = candles[-1].get("close")
+    if not low or not last:
+        return {}
+    after_low = candles[low_idx:]
+    high_after_low = max((c.get("high") or 0) for c in after_low) if after_low else 0
+    return {
+        "intraday_low": round(low, 2),
+        "intraday_low_time": str(low_candle.get("begin") or "")[11:16],
+        "rebound_from_low_pct": round((last - low) / low * 100, 2),
+        "rebound_high_from_low_pct": round((high_after_low - low) / low * 100, 2) if high_after_low else None,
+    }
+
+
+def get_index_intraday_context() -> dict:
+    """10-minute IMOEX context for broad-market rebound diagnostics."""
+    today = now_msk().strftime("%Y-%m-%d")
+    url = (
+        f"{BASE_URL}/engines/stock/markets/index/boards/SNDX"
+        f"/securities/IMOEX/candles.json?from={today}&till={today}&interval=10"
+    )
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        cols = data["candles"]["columns"]
+        rows = data["candles"]["data"]
+        if not rows:
+            return {}
+        candles = [dict(zip(cols, row)) for row in rows]
+        open_price = candles[0]["open"]
+        last_price = candles[-1]["close"]
+        rebound = calc_intraday_rebound(candles)
+        return {
+            "ticker": "IMOEX",
+            "open": round(open_price, 2),
+            "last": round(last_price, 2),
+            "change_pct": round((last_price - open_price) / open_price * 100, 2),
+            "vwap": calc_vwap(candles),
+            "candle_count": len(candles),
+            "last_begin": candles[-1].get("begin") or "",
+            **rebound,
+        }
+    except Exception as e:
+        logger.warning("get_index_intraday_context(IMOEX): %s", e)
         return {}
 
 
@@ -4531,6 +4597,55 @@ def maybe_log_price_momentum_radar(ticker: str, candles: list[dict], levels: dic
     )
 
 
+def maybe_log_index_rebound_radar(
+    ticker: str,
+    intraday: dict,
+    index_intraday: dict,
+    levels: dict,
+    anomaly: dict,
+    change_pct: float | None,
+) -> bool:
+    """
+    Broad-market bounce radar. It marks beta/liquid tickers that rebound together
+    with IMOEX even when daily volume is not anomalous enough for auto-trading.
+    """
+    if not INDEX_REBOUND_RADAR_ENABLED:
+        return False
+    if ticker not in INDEX_REBOUND_TICKERS:
+        return False
+    if not intraday or not index_intraday:
+        return False
+    idx_rebound = index_intraday.get("rebound_from_low_pct") or 0
+    ticker_rebound = intraday.get("rebound_from_low_pct") or 0
+    ticker_high_rebound = intraday.get("rebound_high_from_low_pct") or 0
+    if idx_rebound < INDEX_REBOUND_MIN_INDEX_PCT:
+        return False
+    if ticker_rebound < INDEX_REBOUND_MIN_TICKER_PCT:
+        return False
+    if ticker_high_rebound < INDEX_REBOUND_MIN_TICKER_HIGH_PCT:
+        return False
+    if intraday.get("vwap") and intraday.get("last") and intraday["last"] < intraday["vwap"]:
+        return False
+    return append_market_radar_opportunity(
+        ticker,
+        "index_rebound_radar",
+        direction="LONG",
+        levels=levels,
+        anomaly=anomaly,
+        change_pct=change_pct,
+        extra={
+            "intraday_change_pct": intraday.get("change_pct"),
+            "rebound_from_low_pct": ticker_rebound,
+            "rebound_high_from_low_pct": ticker_high_rebound,
+            "intraday_low_time": intraday.get("intraday_low_time"),
+            "vwap": intraday.get("vwap"),
+            "imoex_change_pct": index_intraday.get("change_pct"),
+            "imoex_rebound_from_low_pct": idx_rebound,
+            "imoex_low_time": index_intraday.get("intraday_low_time"),
+        },
+    )
+
+
 def log_new_signal(s: dict, signal_id: str) -> None:
     """
     Добавляет новый сигнал в trade_log.json.
@@ -6468,6 +6583,14 @@ def run_once(news_only: bool = False):
                 logger.info("h1_watch: %s истёк — H1 так и не подтвердилось, убран", _ek)
 
         print(f"\n📊 СКАНИРОВАНИЕ РЫНКА ({len(TICKERS)} тикеров)\n")
+        index_intraday = get_index_intraday_context()
+        if index_intraday.get("rebound_from_low_pct", 0) >= INDEX_REBOUND_MIN_INDEX_PCT:
+            logger.info(
+                "IMOEX rebound radar active: rebound=%.2f%% change=%+.2f%% low_time=%s",
+                index_intraday.get("rebound_from_low_pct", 0),
+                index_intraday.get("change_pct", 0),
+                index_intraday.get("intraday_low_time", "?"),
+            )
         for ticker in TICKERS:
             print(f"  → {ticker}", end=" ", flush=True)
             # v0.9.2: 55 дней для MA50 (было 21, хватало только для MA20)
@@ -6590,6 +6713,15 @@ def run_once(news_only: bool = False):
                 reason = "объём мал" if not anomaly.get("absolute_ok", True) else f"×{anomaly.get('ratio', 0)}"
                 print(f"— норма ({reason})")
                 maybe_log_price_momentum_radar(ticker, candles, levels, anomaly)
+                if ticker in INDEX_REBOUND_TICKERS and index_intraday:
+                    rebound_intraday = get_intraday_price(ticker)
+                    if rebound_intraday:
+                        intraday_data[ticker] = rebound_intraday
+                        _current_intraday[ticker] = rebound_intraday
+                        maybe_log_index_rebound_radar(
+                            ticker, rebound_intraday, index_intraday,
+                            levels, anomaly, daily_change_pct(candles),
+                        )
 
         # ── v0.9.3: обрабатываем watch-лист (тикеры из прошлых сканов) ──────
         watch_tickers = [v for v in h1_watch.values() if v["ticker"] not in {s["ticker"] for s in market_signals}]

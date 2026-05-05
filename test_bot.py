@@ -1612,6 +1612,61 @@ class TestH1WatchHelpers(unittest.TestCase):
             self.assertFalse(second)
             self.assertEqual(len(open(opportunity_file, encoding="utf-8").read().splitlines()), 1)
 
+    def test_calc_intraday_rebound_uses_low_before_close(self):
+        candles = [
+            {"low": 100.0, "high": 102.0, "close": 101.0, "begin": "2026-05-05 10:00:00"},
+            {"low": 95.0, "high": 97.0, "close": 96.0, "begin": "2026-05-05 11:10:00"},
+            {"low": 96.0, "high": 99.0, "close": 98.0, "begin": "2026-05-05 12:00:00"},
+        ]
+
+        result = mb.calc_intraday_rebound(candles)
+
+        self.assertEqual(result["intraday_low"], 95.0)
+        self.assertEqual(result["intraday_low_time"], "11:10")
+        self.assertEqual(result["rebound_from_low_pct"], 3.16)
+        self.assertEqual(result["rebound_high_from_low_pct"], 4.21)
+
+    def test_index_rebound_radar_logs_liquid_beta_ticker(self):
+        intraday = {
+            "last": 91.5,
+            "vwap": 90.4,
+            "change_pct": 1.8,
+            "rebound_from_low_pct": 2.7,
+            "rebound_high_from_low_pct": 3.4,
+            "intraday_low_time": "11:10",
+        }
+        index_intraday = {
+            "change_pct": 1.0,
+            "rebound_from_low_pct": 2.1,
+            "intraday_low_time": "11:10",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opportunity_file = os.path.join(tmpdir, "opportunity.jsonl")
+            with patch.object(mb, "OPPORTUNITY_LOG_FILE", opportunity_file):
+                mb._MARKET_RADAR_SEEN.clear()
+                logged = mb.maybe_log_index_rebound_radar(
+                    "VTBR", intraday, index_intraday,
+                    {"last_close": 91.5}, {"ratio": 0.75}, 2.32,
+                )
+
+            rows = [json.loads(line) for line in open(opportunity_file, encoding="utf-8")]
+            self.assertTrue(logged)
+            self.assertEqual(rows[0]["reason"], "index_rebound_radar")
+            self.assertEqual(rows[0]["direction"], "LONG")
+            self.assertEqual(rows[0]["imoex_rebound_from_low_pct"], 2.1)
+
+    def test_index_rebound_radar_rejects_below_vwap(self):
+        logged = mb.maybe_log_index_rebound_radar(
+            "SBER",
+            {"last": 319.0, "vwap": 320.0, "rebound_from_low_pct": 2.0, "rebound_high_from_low_pct": 2.5},
+            {"rebound_from_low_pct": 2.0},
+            {"last_close": 319.0},
+            {"ratio": 0.8},
+            -0.1,
+        )
+
+        self.assertFalse(logged)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ЗАПУСК
