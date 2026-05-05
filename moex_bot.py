@@ -830,6 +830,7 @@ INDEX_REBOUND_TICKERS = set(
 INDEX_REBOUND_MIN_INDEX_PCT = float(os.environ.get("INDEX_REBOUND_MIN_INDEX_PCT", "1.5"))
 INDEX_REBOUND_MIN_TICKER_PCT = float(os.environ.get("INDEX_REBOUND_MIN_TICKER_PCT", "1.0"))
 INDEX_REBOUND_MIN_TICKER_HIGH_PCT = float(os.environ.get("INDEX_REBOUND_MIN_TICKER_HIGH_PCT", "1.5"))
+INDEX_REBOUND_SANDBOX_ORDER = bool(int(os.environ.get("INDEX_REBOUND_SANDBOX_ORDER", "1")))
 
 # ─── Portfolio heat guard (v0.9.8) ───────────────────────────────────────────
 # Суммарный риск по всем открытым позициям не должен превышать PORTFOLIO_HEAT_MAX %.
@@ -2190,6 +2191,9 @@ def build_market_signal(
     intraday: dict | None = None,
     h1_levels: dict | None = None,
     h1_confirm: dict | None = None,   # v0.9.3: {"type": "breakout"|"momentum", "note": ...}
+    direction_override: str | None = None,
+    signal_type_override: str | None = None,
+    signal_kind: str = "VOLUME",
 ) -> dict | None:
     """
     intraday — результат get_intraday_price(ticker): {"open", "last", "change_pct", "vwap"}
@@ -2244,6 +2248,10 @@ def build_market_signal(
 
     # v0.9.4: умное определение направления с учётом MA50-тренда
     direction, signal_type = determine_direction(price, levels)
+    if direction_override in ("LONG", "SHORT"):
+        direction = direction_override
+    if signal_type_override in ("momentum", "mean_reversion"):
+        signal_type = signal_type_override
     decision_reasons.append(f"signal_type:{signal_type}")
 
     # RSI подтверждение: для momentum — расширенный диапазон (тренд может держать RSI высоко)
@@ -2610,7 +2618,7 @@ def build_market_signal(
     pos_calc  = calc_position_size(price, stop, lot_size=lot_size)
 
     return {
-        "type":               "VOLUME",
+        "type":               signal_kind,
         "ticker":             ticker,
         "direction":          direction,
         "entry":              price,
@@ -3309,6 +3317,9 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
             elif h1_type == "momentum":
                 h1_pts = 2
                 patterns.append("💪 импульс H1")
+            elif h1_type == "index_rebound":
+                h1_pts = 2
+                patterns.append("📈 отбой IMOEX")
             else:  # "volume" — новый тип (v0.9.7)
                 h1_pts = 2
                 patterns.append("📊 объём H1")
@@ -3703,6 +3714,14 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
         if conflict_penalty:
             score += conflict_penalty
             score_breakdown.append(f"Conflicts={conflict_penalty}")
+
+        if ms.get("strategy") == "index_rebound":
+            rebound_pts = 2
+            score += rebound_pts
+            score_breakdown.append(f"IndexRebound=+{rebound_pts}")
+            if "📈 отбой IMOEX" not in patterns:
+                patterns.append("📈 отбой IMOEX")
+            decision_reasons.append("index_rebound_signal")
 
         score = max(0, score)  # score не может быть отрицательным
         confidence = _score_to_confidence(score)
@@ -4644,6 +4663,58 @@ def maybe_log_index_rebound_radar(
             "imoex_low_time": index_intraday.get("intraday_low_time"),
         },
     )
+
+
+def build_index_rebound_signal(
+    ticker: str,
+    levels: dict,
+    ctx: dict,
+    intraday: dict,
+    index_intraday: dict,
+    anomaly: dict,
+) -> dict | None:
+    """Builds a sandbox-tradable LONG signal from a broad IMOEX rebound."""
+    if not INDEX_REBOUND_SANDBOX_ORDER:
+        return None
+    rebound = intraday.get("rebound_from_low_pct") or 0
+    idx_rebound = index_intraday.get("rebound_from_low_pct") or 0
+    pseudo_anomaly = {
+        **(anomaly or {}),
+        "anomaly": True,
+        "ratio": max(float((anomaly or {}).get("ratio") or 0), 1.5),
+        "reason": "index_rebound",
+    }
+    h1_confirm = {
+        "type": "index_rebound",
+        "note": (
+            f"IMOEX rebound {idx_rebound:.2f}% от лоя "
+            f"{index_intraday.get('intraday_low_time', '?')}; "
+            f"{ticker} rebound {rebound:.2f}% выше VWAP"
+        ),
+    }
+    signal = build_market_signal(
+        ticker, levels, pseudo_anomaly, ctx,
+        intraday=intraday,
+        h1_confirm=h1_confirm,
+        direction_override="LONG",
+        signal_type_override="momentum",
+        signal_kind="INDEX_REBOUND",
+    )
+    if not signal:
+        return None
+    signal["strategy"] = "index_rebound"
+    signal["volume_ratio"] = pseudo_anomaly["ratio"]
+    signal["decision_reasons"] = sorted(set(signal.get("decision_reasons", []) + ["index_rebound_signal"]))
+    signal["data_quality_flags"] = sorted(set(signal.get("data_quality_flags", [])))
+    signal["index_rebound"] = {
+        "ticker_rebound_from_low_pct": rebound,
+        "ticker_rebound_high_from_low_pct": intraday.get("rebound_high_from_low_pct"),
+        "ticker_low_time": intraday.get("intraday_low_time"),
+        "imoex_rebound_from_low_pct": idx_rebound,
+        "imoex_change_pct": index_intraday.get("change_pct"),
+        "imoex_low_time": index_intraday.get("intraday_low_time"),
+    }
+    return signal
 
 
 def log_new_signal(s: dict, signal_id: str) -> None:
@@ -6722,6 +6793,11 @@ def run_once(news_only: bool = False):
                             ticker, rebound_intraday, index_intraday,
                             levels, anomaly, daily_change_pct(candles),
                         )
+                        rebound_signal = build_index_rebound_signal(
+                            ticker, levels, ctx, rebound_intraday, index_intraday, anomaly
+                        )
+                        if rebound_signal:
+                            market_signals.append(rebound_signal)
 
         # ── v0.9.3: обрабатываем watch-лист (тикеры из прошлых сканов) ──────
         watch_tickers = [v for v in h1_watch.values() if v["ticker"] not in {s["ticker"] for s in market_signals}]

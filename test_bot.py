@@ -1667,6 +1667,49 @@ class TestH1WatchHelpers(unittest.TestCase):
 
         self.assertFalse(logged)
 
+    def test_build_index_rebound_signal_is_tradable_strategy_signal(self):
+        levels = {
+            "last_close": 91.5,
+            "support": 89.1,
+            "resistance": 94.0,
+            "atr": 1.0,
+            "rsi": 58.0,
+            "ma20": 90.0,
+            "ma50": 89.0,
+            "adx": 24.0,
+            "obv_trend": "up",
+            "obv_bull_div": False,
+            "obv_bear_div": False,
+            "ma_crossover": None,
+        }
+        intraday = {
+            "last": 91.5,
+            "vwap": 90.4,
+            "last_begin": "2026-05-05 17:30:00",
+            "change_pct": 1.8,
+            "rebound_from_low_pct": 2.7,
+            "rebound_high_from_low_pct": 3.4,
+            "intraday_low_time": "11:10",
+        }
+        index_intraday = {
+            "change_pct": 1.0,
+            "rebound_from_low_pct": 2.1,
+            "intraday_low_time": "11:10",
+        }
+        with patch.object(mb, "_tinvest_available", return_value=False), \
+             patch.object(mb, "is_moex_open", return_value=False):
+            signal = mb.build_index_rebound_signal(
+                "VTBR", levels, {"imoex_regime": "bull"}, intraday, index_intraday, {"ratio": 0.75}
+            )
+            synthesized = mb.synthesize_signals([signal], [])
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal["type"], "INDEX_REBOUND")
+        self.assertEqual(signal["direction"], "LONG")
+        self.assertEqual(signal["strategy"], "index_rebound")
+        self.assertGreaterEqual(synthesized[0]["confidence_score"], 9)
+        self.assertIn("index_rebound_signal", synthesized[0]["decision_reasons"])
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ЗАПУСК
