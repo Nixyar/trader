@@ -926,8 +926,15 @@ def get_candles_tinvest(ticker: str, days: int = 21) -> list[dict]:
     if not is_available():
         return []
 
-    figi, uid = resolve_instrument_ids(ticker)
-    if not figi and not uid:
+    figi = get_figi(ticker, mark_sandbox=False)
+    if not figi:
+        mark_instrument_issue(
+            ticker,
+            "has_figi",
+            "figi_missing",
+            ttl_hours=24,
+            detail="FIGI missing for T-Invest daily candles; MOEX fallback will be used",
+        )
         return []
 
     try:
@@ -1012,8 +1019,24 @@ def get_h1_candles(ticker: str, days: int = 5) -> list[dict]:
         logger.debug("get_h1_candles(%s): в списке CANDLES_SKIP → MOEX ISS fallback", ticker)
         return []
 
-    figi = get_figi(ticker, mark_sandbox=False)
-    if not figi:
+    # H1 data is allowed to degrade to MOEX fallback, but it must not mutate
+    # sandbox execution availability because a UID lookup/API call is transient.
+    figi, uid = resolve_instrument_ids(ticker, allow_uid_lookup=False)
+    if not figi and not uid:
+        mark_instrument_issue(
+            ticker,
+            "has_figi",
+            "figi_missing",
+            ttl_hours=24,
+            detail="FIGI/UID missing for T-Invest H1; MOEX fallback will be used",
+        )
+        if ticker not in _FIGI_MISSING_LOGGED:
+            logger.warning(
+                "FIGI/UID не найден для тикера %s — T-Invest H1 пропущен, "
+                "MOEX fallback; sandbox UID lookup не блокируем.",
+                ticker,
+            )
+            _FIGI_MISSING_LOGGED.add(ticker)
         return []
 
     try:

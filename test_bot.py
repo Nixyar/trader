@@ -722,6 +722,54 @@ class TestInstrumentCapabilities(unittest.TestCase):
         self.assertEqual(FakeClient.last_kwargs["instrument_id"], "uid-head")
         self.assertNotIn("figi", FakeClient.last_kwargs)
 
+    def test_h1_candles_uses_resolved_uid_without_name_error(self):
+        class FakeQuotation:
+            units = 100
+            nano = 0
+
+        class FakeCandle:
+            open = FakeQuotation()
+            close = FakeQuotation()
+            high = FakeQuotation()
+            low = FakeQuotation()
+            volume = 10
+            time = datetime(2026, 5, 6, 10, 0, tzinfo=timezone.utc)
+
+        class FakeResponse:
+            candles = [FakeCandle()]
+
+        class FakeClient:
+            last_kwargs = None
+            market_data = None
+
+            def __init__(self, token):
+                self.market_data = self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def get_candles(self, **kwargs):
+                FakeClient.last_kwargs = kwargs
+                return FakeResponse()
+
+        class FakeInterval:
+            CANDLE_INTERVAL_HOUR = "hour"
+
+        with patch.object(td, "is_available", return_value=True), \
+             patch.object(td, "instrument_capability_available", return_value=True), \
+             patch.object(td, "resolve_instrument_ids", return_value=(None, "uid-head")), \
+             patch.object(td, "_sdk_import", return_value=(FakeClient, FakeInterval)), \
+             patch.object(td, "_get_token", return_value="token"), \
+             patch.object(td, "get_lot_size", return_value=1):
+            result = td.get_h1_candles("HEAD")
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(FakeClient.last_kwargs["instrument_id"], "uid-head")
+        self.assertNotIn("figi", FakeClient.last_kwargs)
+
     def test_resolve_instrument_ids_looks_up_uid_when_figi_missing(self):
         with patch.dict(td.FIGI_MAP, {}, clear=True), \
              patch.dict(td._UID_CACHE, {}, clear=True), \
@@ -1723,6 +1771,22 @@ class TestH1WatchHelpers(unittest.TestCase):
 
         self.assertFalse(logged)
 
+    def test_build_index_rebound_signal_rejects_below_vwap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opportunity_file = os.path.join(tmpdir, "opportunity.jsonl")
+            with patch.object(mb, "OPPORTUNITY_LOG_FILE", opportunity_file):
+                signal = mb.build_index_rebound_signal(
+                    "SBER",
+                    {"last_close": 319.0, "support": 315.0, "resistance": 330.0, "atr": 2.0},
+                    {},
+                    {"last": 319.0, "vwap": 320.0, "rebound_from_low_pct": 2.0, "rebound_high_from_low_pct": 2.5},
+                    {"rebound_from_low_pct": 2.0},
+                    {"ratio": 0.8},
+                )
+
+            self.assertIsNone(signal)
+            self.assertIn("index_rebound_below_vwap", open(opportunity_file, encoding="utf-8").read())
+
     def test_build_index_rebound_signal_is_tradable_strategy_signal(self):
         levels = {
             "last_close": 91.5,
@@ -1765,6 +1829,33 @@ class TestH1WatchHelpers(unittest.TestCase):
         self.assertEqual(signal["strategy"], "index_rebound")
         self.assertGreaterEqual(synthesized[0]["confidence_score"], 9)
         self.assertIn("index_rebound_signal", synthesized[0]["decision_reasons"])
+
+    def test_sandbox_strategy_rejects_weak_index_rebound(self):
+        reason = mb.sandbox_strategy_reject_reason({
+            "strategy": "index_rebound",
+            "confidence_score": 8,
+            "vwap_confirm": True,
+        })
+
+        self.assertEqual(reason, "index_rebound_min_score")
+
+    def test_sandbox_strategy_rejects_index_rebound_vwap_conflict(self):
+        reason = mb.sandbox_strategy_reject_reason({
+            "strategy": "index_rebound",
+            "confidence_score": 10,
+            "vwap_confirm": False,
+        })
+
+        self.assertEqual(reason, "index_rebound_vwap_required")
+
+    def test_sandbox_strategy_rejects_stale_news_event(self):
+        reason = mb.sandbox_strategy_reject_reason(
+            {"strategy": "news_event", "confidence_score": 21, "vwap_confirm": True},
+            {"stale_intraday"},
+            {"news_event_signal"},
+        )
+
+        self.assertEqual(reason, "stale_intraday")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
