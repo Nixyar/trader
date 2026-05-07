@@ -1002,6 +1002,13 @@ def _normalize_news_text(text: str) -> str:
 def _signal_meta(signal: dict) -> dict:
     return {
         "signal_version": SIGNAL_SCHEMA_VERSION,
+        "type": signal.get("type"),
+        "strategy": signal.get("strategy"),
+        "pattern": signal.get("pattern"),
+        "pattern_details": signal.get("pattern_details"),
+        "score_breakdown": signal.get("score_breakdown"),
+        "vwap_confirm": signal.get("vwap_confirm"),
+        "vwap_note": signal.get("vwap_note"),
         "decision_reasons": list(signal.get("decision_reasons", [])),
         "data_quality_flags": list(signal.get("data_quality_flags", [])),
         "news_mode": signal.get("news_mode", "none"),
@@ -4775,23 +4782,12 @@ def maybe_log_index_rebound_radar(
     Broad-market bounce radar. It marks beta/liquid tickers that rebound together
     with IMOEX even when daily volume is not anomalous enough for auto-trading.
     """
-    if not INDEX_REBOUND_RADAR_ENABLED:
-        return False
-    if ticker not in INDEX_REBOUND_TICKERS:
-        return False
-    if not intraday or not index_intraday:
+    ok, _reason = is_index_rebound_candidate(ticker, intraday, index_intraday)
+    if not ok:
         return False
     idx_rebound = index_intraday.get("rebound_from_low_pct") or 0
     ticker_rebound = intraday.get("rebound_from_low_pct") or 0
     ticker_high_rebound = intraday.get("rebound_high_from_low_pct") or 0
-    if idx_rebound < INDEX_REBOUND_MIN_INDEX_PCT:
-        return False
-    if ticker_rebound < INDEX_REBOUND_MIN_TICKER_PCT:
-        return False
-    if ticker_high_rebound < INDEX_REBOUND_MIN_TICKER_HIGH_PCT:
-        return False
-    if intraday.get("vwap") and intraday.get("last") and intraday["last"] < intraday["vwap"]:
-        return False
     return append_market_radar_opportunity(
         ticker,
         "index_rebound_radar",
@@ -4812,6 +4808,27 @@ def maybe_log_index_rebound_radar(
     )
 
 
+def is_index_rebound_candidate(ticker: str, intraday: dict, index_intraday: dict) -> tuple[bool, str]:
+    if not INDEX_REBOUND_RADAR_ENABLED:
+        return False, "index_rebound_disabled"
+    if ticker not in INDEX_REBOUND_TICKERS:
+        return False, "index_rebound_ticker_not_allowed"
+    if not intraday or not index_intraday:
+        return False, "index_rebound_missing_intraday"
+    idx_rebound = index_intraday.get("rebound_from_low_pct") or 0
+    ticker_rebound = intraday.get("rebound_from_low_pct") or 0
+    ticker_high_rebound = intraday.get("rebound_high_from_low_pct") or 0
+    if idx_rebound < INDEX_REBOUND_MIN_INDEX_PCT:
+        return False, "index_rebound_imoex_too_weak"
+    if ticker_rebound < INDEX_REBOUND_MIN_TICKER_PCT:
+        return False, "index_rebound_ticker_too_weak"
+    if ticker_high_rebound < INDEX_REBOUND_MIN_TICKER_HIGH_PCT:
+        return False, "index_rebound_high_too_weak"
+    if intraday.get("vwap") and intraday.get("last") and intraday["last"] < intraday["vwap"]:
+        return False, "index_rebound_below_vwap"
+    return True, "index_rebound_candidate"
+
+
 def build_index_rebound_signal(
     ticker: str,
     levels: dict,
@@ -4822,6 +4839,16 @@ def build_index_rebound_signal(
 ) -> dict | None:
     """Builds a sandbox-tradable LONG signal from a broad IMOEX rebound."""
     if not INDEX_REBOUND_SANDBOX_ORDER:
+        return None
+    ok, reject_reason = is_index_rebound_candidate(ticker, intraday, index_intraday)
+    if not ok:
+        append_opportunity_log({
+            "ticker": ticker,
+            "direction": "LONG",
+            "action": "rejected",
+            "reason": reject_reason,
+            "decision_reasons": ["index_rebound_signal"],
+        })
         return None
     rebound = intraday.get("rebound_from_low_pct") or 0
     idx_rebound = index_intraday.get("rebound_from_low_pct") or 0
@@ -6005,6 +6032,34 @@ def check_daily_loss_brake(sod_equity: float | None, current_equity: float) -> b
     return drawdown_pct >= MAX_DAILY_LOSS_PCT
 
 
+def sandbox_strategy_reject_reason(
+    signal: dict,
+    quality_flags: set[str] | None = None,
+    decision_reasons: set[str] | None = None,
+) -> str | None:
+    """Extra sandbox quality gates for non-core experimental strategies."""
+    strategy = signal.get("strategy")
+    quality_flags = quality_flags or set(signal.get("data_quality_flags", []))
+    decision_reasons = decision_reasons or set(signal.get("decision_reasons", []))
+    score = signal.get("confidence_score") or 0
+
+    if strategy == "index_rebound":
+        if score < 9:
+            return "index_rebound_min_score"
+        if "stale_intraday" in quality_flags:
+            return "stale_intraday"
+        if signal.get("vwap_confirm") is not True:
+            return "index_rebound_vwap_required"
+        if "ma50_against" in decision_reasons:
+            return "index_rebound_trend_conflict"
+    elif strategy == "news_event":
+        if "stale_intraday" in quality_flags:
+            return "stale_intraday"
+        if signal.get("vwap_confirm") is False and score < 12:
+            return "news_event_vwap_conflict"
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  v0.9.37 — reconcile trade_log ↔ sandbox.portfolio
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6233,6 +6288,12 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                 append_opportunity_log({**opportunity_base, "action": "rejected", "reason": reason})
                 continue
             risk_multiplier *= 0.75
+
+        strategy_reject_reason = sandbox_strategy_reject_reason(s, quality_flags, decision_reasons)
+        if strategy_reject_reason:
+            append_score_log({**opportunity_base, "action": "skipped", "reason": strategy_reject_reason})
+            append_opportunity_log({**opportunity_base, "action": "rejected", "reason": strategy_reject_reason})
+            continue
 
         if "invalid_price" in quality_flags:
             append_score_log({**opportunity_base, "action": "skipped", "reason": "invalid_price"})
