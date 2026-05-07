@@ -537,6 +537,45 @@ def _proto_to_float(obj) -> float:
     return units + nano / 1_000_000_000
 
 
+def _normalize_executed_order_price(
+    ticker: str,
+    raw_price: Optional[float],
+    quantity: int,
+    expected_price: Optional[float] = None,
+) -> Optional[float]:
+    """T-Invest sandbox may return market order value instead of unit price."""
+    if not raw_price:
+        return None
+    raw = float(raw_price)
+    if not expected_price or expected_price <= 0:
+        return raw
+
+    expected = float(expected_price)
+    candidates = [raw]
+    if quantity:
+        candidates.append(raw / quantity)
+        lot_size = get_lot_size(ticker)
+        if lot_size:
+            candidates.append(raw / (quantity * lot_size))
+
+    plausible = [c for c in candidates if c > 0 and 0.2 <= c / expected <= 5.0]
+    if not plausible:
+        logger.warning(
+            "[SANDBOX PRICE] %s: suspicious executed_order_price=%s expected≈%s qty=%s",
+            ticker, raw, expected, quantity,
+        )
+        return raw
+
+    normalized = min(plausible, key=lambda c: abs(c - expected))
+    if abs(normalized - raw) > max(0.01, expected * 0.05):
+        logger.warning(
+            "[SANDBOX PRICE] %s: normalized executed_order_price %s → %s "
+            "(expected≈%s, qty=%s)",
+            ticker, raw, round(normalized, 4), expected, quantity,
+        )
+    return normalized
+
+
 def _sdk_import(*names: str):
     """
     Импортирует имена из SDK-модуля независимо от его реального пути.
@@ -1235,6 +1274,7 @@ def sandbox_place_order(
     direction: str,     # "LONG" (BUY) или "SHORT" (SELL)
     quantity: int = 1,  # количество лотов
     account_id: str = "",
+    expected_price: Optional[float] = None,
 ) -> Optional[dict]:
     """
     Выставляет рыночный ордер в T-Invest Sandbox (бумажная торговля).
@@ -1318,6 +1358,9 @@ def sandbox_place_order(
                 if resp.executed_order_price
                 else None
             )
+            exec_price = _normalize_executed_order_price(
+                ticker, exec_price, quantity, expected_price
+            )
 
         result = {
             "order_id":  resp.order_id,
@@ -1389,6 +1432,9 @@ def sandbox_place_order(
                                 _proto_to_float(resp2.executed_order_price)
                                 if resp2.executed_order_price
                                 else None
+                            )
+                            exec_price2 = _normalize_executed_order_price(
+                                ticker, exec_price2, quantity, expected_price
                             )
                         # Retry успешен — снимаем блокировки если были
                         _SANDBOX_UNAVAILABLE.pop(ticker, None)
@@ -1463,7 +1509,13 @@ def sandbox_close_position(
                 f"[SANDBOX CLOSE] {ticker}: qty={pos['quantity']} акций "
                 f"/ lot_size={lot_size} = {qty_lots} лот → {close_dir}"
             )
-            return sandbox_place_order(ticker, close_dir, qty_lots, acc_id)
+            return sandbox_place_order(
+                ticker,
+                close_dir,
+                qty_lots,
+                acc_id,
+                expected_price=abs(pos.get("current_price") or pos.get("avg_price") or 0),
+            )
 
     logger.info(f"Нет открытой позиции по {ticker} в sandbox")
     return None

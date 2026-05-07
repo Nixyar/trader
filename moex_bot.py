@@ -894,7 +894,7 @@ BASE_URL = "https://iss.moex.com/iss"
 EVENT_CALENDAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "event_calendar.json")
 DECISION_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signals_decision_log.jsonl")
 STATE_MIGRATIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state_migrations.json")
-STATE_MIGRATION_VERSION = "2026-04-29-execution-contract-v1"
+STATE_MIGRATION_VERSION = "2026-05-07-execution-contract-price-repair-v2"
 
 _JSON_BACKUP_SUFFIX = ".corrupt"
 
@@ -4549,6 +4549,36 @@ def _state_has_open_sb_for_base(state: dict, base_key: str, base_val: dict) -> b
     return False
 
 
+def _repair_anomalous_close_price(row: dict, state: dict) -> bool:
+    """Repair sandbox rows where broker returned order value instead of unit price."""
+    try:
+        entry = float(row.get("entry") or 0)
+        exit_price = float(row.get("exit_price") or 0)
+        if entry <= 0 or exit_price <= 0 or exit_price / entry < 20:
+            return False
+        signal_id = str(row.get("signal_id") or "")
+        sb_entry = state.get(f"sb_{signal_id}") if isinstance(state, dict) else None
+        lots = float((sb_entry or {}).get("lots") or row.get("lots") or 0)
+        if lots <= 0:
+            return False
+        candidate = exit_price / lots
+        if not (candidate > 0 and 0.2 <= candidate / entry <= 5.0):
+            return False
+        row["exit_price_raw"] = exit_price
+        row["exit_price"] = round(candidate, 4)
+        mult = 1 if row.get("direction") == "LONG" else -1
+        row["pnl_pct"] = round(mult * (row["exit_price"] - entry) / entry * 100, 2)
+        note = f"[PRICE_REPAIRED: raw_exit_price={exit_price} / lots={int(lots) if lots.is_integer() else lots}]"
+        if note not in (row.get("notes") or ""):
+            row["notes"] = ((row.get("notes") or "") + " " + note).strip()
+        if isinstance(sb_entry, dict):
+            sb_entry["close_price_raw"] = exit_price
+            sb_entry["close_price"] = row["exit_price"]
+        return True
+    except Exception:
+        return False
+
+
 def run_state_migrations(force: bool = False) -> dict:
     """One-shot cleanup for pre execution-contract runtime JSON files.
 
@@ -4570,6 +4600,7 @@ def run_state_migrations(force: bool = False) -> dict:
         "state_marked": 0,
         "ntg_removed": 0,
         "trade_removed": 0,
+        "price_repaired": 0,
         "backups": {},
     }
 
@@ -4577,6 +4608,7 @@ def run_state_migrations(force: bool = False) -> dict:
     if state:
         summary["backups"]["signals_state"] = _backup_runtime_json(SIGNALS_STATE_FILE, STATE_MIGRATION_VERSION)
         migrated: dict = {}
+        state_changed = False
         now = datetime.now(timezone.utc)
         for key, val in state.items():
             if not isinstance(val, dict):
@@ -4591,9 +4623,11 @@ def run_state_migrations(force: bool = False) -> dict:
                         sent_dt = sent_dt.replace(tzinfo=timezone.utc)
                     if (now - sent_dt).total_seconds() > 86400:
                         summary["ntg_removed"] = int(summary["ntg_removed"]) + 1
+                        state_changed = True
                         continue
                 except Exception:
                     summary["ntg_removed"] = int(summary["ntg_removed"]) + 1
+                    state_changed = True
                     continue
                 migrated[key] = val
                 continue
@@ -4601,35 +4635,47 @@ def run_state_migrations(force: bool = False) -> dict:
                 if not val.get("execution_status"):
                     val["execution_status"] = "closed" if val.get("closed_at") else ("filled" if val.get("order_id") else "orphan")
                     summary["state_marked"] = int(summary["state_marked"]) + 1
+                    state_changed = True
                 base_key = key_str[3:]
                 if not val.get("base_signal_key") and base_key in state:
                     val["base_signal_key"] = base_key
                     summary["state_marked"] = int(summary["state_marked"]) + 1
+                    state_changed = True
                 migrated[key] = val
                 continue
             if not val.get("execution_status") and not _state_has_open_sb_for_base(state, key_str, val):
                 summary["state_removed"] = int(summary["state_removed"]) + 1
+                state_changed = True
                 continue
             if not val.get("execution_status"):
                 val["execution_status"] = "filled"
                 summary["state_marked"] = int(summary["state_marked"]) + 1
+                state_changed = True
             migrated[key] = val
-        if migrated != state:
+        if state_changed:
             save_signals_state(migrated)
+            state = migrated
 
     trade_log = load_trade_log()
     if trade_log:
         summary["backups"]["trade_log"] = _backup_runtime_json(TRADE_LOG_FILE, STATE_MIGRATION_VERSION)
         kept = []
+        trade_changed = False
         for row in trade_log:
             if not isinstance(row, dict):
+                trade_changed = True
                 continue
             if not row.get("execution_status"):
                 summary["trade_removed"] = int(summary["trade_removed"]) + 1
+                trade_changed = True
                 continue
+            if _repair_anomalous_close_price(row, state):
+                summary["price_repaired"] = int(summary["price_repaired"]) + 1
+                trade_changed = True
             kept.append(row)
-        if kept != trade_log:
+        if trade_changed:
             save_trade_log(kept)
+            save_signals_state(state)
 
     migrations[STATE_MIGRATION_VERSION] = {
         "applied_at": datetime.now(timezone.utc).isoformat(),
