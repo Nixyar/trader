@@ -722,6 +722,17 @@ class TestInstrumentCapabilities(unittest.TestCase):
         self.assertEqual(FakeClient.last_kwargs["instrument_id"], "uid-head")
         self.assertNotIn("figi", FakeClient.last_kwargs)
 
+    def test_normalize_executed_order_price_handles_total_order_value(self):
+        with patch.object(td, "get_lot_size", return_value=10):
+            price = td._normalize_executed_order_price(
+                "ROSN",
+                raw_price=97_728.0,
+                quantity=240,
+                expected_price=407.0,
+            )
+
+        self.assertAlmostEqual(price, 407.2)
+
     def test_h1_candles_uses_resolved_uid_without_name_error(self):
         class FakeQuotation:
             units = 100
@@ -1192,6 +1203,51 @@ class TestStateResilience(unittest.TestCase):
             backups = os.listdir(os.path.join(tmpdir, "state_backups"))
             self.assertTrue(any(name.startswith("signals_state.json.") for name in backups))
             self.assertTrue(any(name.startswith("trade_log.json.") for name in backups))
+
+    def test_state_migration_repairs_aggregate_close_price(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "signals_state.json")
+            trade_path = os.path.join(tmpdir, "trade_log.json")
+            migrations_path = os.path.join(tmpdir, "state_migrations.json")
+            decision_path = os.path.join(tmpdir, "decisions.jsonl")
+            state = {
+                "sb_ROSN_SHORT_2026-05-06": {
+                    "ticker": "ROSN",
+                    "direction": "SHORT",
+                    "order_id": "ord-rosn",
+                    "lots": 240,
+                    "close_price": 97_728.0,
+                    "execution_status": "closed",
+                    "base_signal_key": "ROSN_SHORT_2026-05-06",
+                },
+            }
+            trade_log = [{
+                "signal_id": "ROSN_SHORT_2026-05-06",
+                "ticker": "ROSN",
+                "direction": "SHORT",
+                "entry": 421.0,
+                "exit_price": 97_728.0,
+                "pnl_pct": -23113.3,
+                "execution_status": "closed",
+            }]
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+            with open(trade_path, "w", encoding="utf-8") as f:
+                json.dump(trade_log, f)
+
+            with patch.object(mb, "SIGNALS_STATE_FILE", state_path), \
+                 patch.object(mb, "TRADE_LOG_FILE", trade_path), \
+                 patch.object(mb, "STATE_MIGRATIONS_FILE", migrations_path), \
+                 patch.object(mb, "DECISION_LOG_FILE", decision_path):
+                summary = mb.run_state_migrations(force=True)
+
+            migrated_state = json.loads(open(state_path, encoding="utf-8").read())
+            migrated_trades = json.loads(open(trade_path, encoding="utf-8").read())
+            self.assertEqual(summary["price_repaired"], 1)
+            self.assertEqual(migrated_trades[0]["exit_price"], 407.2)
+            self.assertEqual(migrated_trades[0]["pnl_pct"], 3.28)
+            self.assertEqual(migrated_state["sb_ROSN_SHORT_2026-05-06"]["close_price"], 407.2)
+            self.assertEqual(migrated_state["sb_ROSN_SHORT_2026-05-06"]["close_price_raw"], 97_728.0)
 
 
 class TestMoexNetworkRetry(unittest.TestCase):
