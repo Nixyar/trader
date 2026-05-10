@@ -1249,6 +1249,51 @@ class TestStateResilience(unittest.TestCase):
             self.assertEqual(migrated_state["sb_ROSN_SHORT_2026-05-06"]["close_price"], 407.2)
             self.assertEqual(migrated_state["sb_ROSN_SHORT_2026-05-06"]["close_price_raw"], 97_728.0)
 
+    def test_state_migration_repairs_lot_size_aggregate_close_price(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "signals_state.json")
+            trade_path = os.path.join(tmpdir, "trade_log.json")
+            migrations_path = os.path.join(tmpdir, "state_migrations.json")
+            decision_path = os.path.join(tmpdir, "decisions.jsonl")
+            state = {
+                "sb_ALRS_LONG_2026-05-07": {
+                    "ticker": "ALRS",
+                    "direction": "LONG",
+                    "order_id": "ord-alrs",
+                    "lots": 353,
+                    "close_price": 99_051.8,
+                    "execution_status": "closed",
+                    "base_signal_key": "ALRS_LONG_2026-05-07",
+                },
+            }
+            trade_log = [{
+                "signal_id": "ALRS_LONG_2026-05-07",
+                "ticker": "ALRS",
+                "direction": "LONG",
+                "entry": 28.84,
+                "exit_price": 99_051.8,
+                "pnl_pct": 343352.84,
+                "execution_status": "closed",
+            }]
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+            with open(trade_path, "w", encoding="utf-8") as f:
+                json.dump(trade_log, f)
+
+            with patch.object(mb, "SIGNALS_STATE_FILE", state_path), \
+                 patch.object(mb, "TRADE_LOG_FILE", trade_path), \
+                 patch.object(mb, "STATE_MIGRATIONS_FILE", migrations_path), \
+                 patch.object(mb, "DECISION_LOG_FILE", decision_path):
+                summary = mb.run_state_migrations(force=True)
+
+            migrated_state = json.loads(open(state_path, encoding="utf-8").read())
+            migrated_trades = json.loads(open(trade_path, encoding="utf-8").read())
+            self.assertEqual(summary["price_repaired"], 1)
+            self.assertEqual(migrated_trades[0]["exit_price"], 28.06)
+            self.assertEqual(migrated_trades[0]["pnl_pct"], -2.7)
+            self.assertEqual(migrated_state["sb_ALRS_LONG_2026-05-07"]["close_price"], 28.06)
+            self.assertEqual(migrated_state["sb_ALRS_LONG_2026-05-07"]["close_price_raw"], 99_051.8)
+
 
 class TestMoexNetworkRetry(unittest.TestCase):
 
