@@ -894,7 +894,7 @@ BASE_URL = "https://iss.moex.com/iss"
 EVENT_CALENDAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "event_calendar.json")
 DECISION_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signals_decision_log.jsonl")
 STATE_MIGRATIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state_migrations.json")
-STATE_MIGRATION_VERSION = "2026-05-07-execution-contract-price-repair-v2"
+STATE_MIGRATION_VERSION = "2026-05-10-execution-contract-price-repair-v3"
 
 _JSON_BACKUP_SUFFIX = ".corrupt"
 
@@ -4561,14 +4561,21 @@ def _repair_anomalous_close_price(row: dict, state: dict) -> bool:
         lots = float((sb_entry or {}).get("lots") or row.get("lots") or 0)
         if lots <= 0:
             return False
-        candidate = exit_price / lots
-        if not (candidate > 0 and 0.2 <= candidate / entry <= 5.0):
+        ticker = row.get("ticker") or (sb_entry or {}).get("ticker") or ""
+        lot_size = float(LOT_SIZES.get(str(ticker), 1) or 1)
+        candidates = [exit_price / lots]
+        if lot_size > 1:
+            candidates.append(exit_price / (lots * lot_size))
+        plausible = [c for c in candidates if c > 0 and 0.2 <= c / entry <= 5.0]
+        if not plausible:
             return False
+        candidate = min(plausible, key=lambda c: abs(c - entry))
         row["exit_price_raw"] = exit_price
         row["exit_price"] = round(candidate, 4)
         mult = 1 if row.get("direction") == "LONG" else -1
         row["pnl_pct"] = round(mult * (row["exit_price"] - entry) / entry * 100, 2)
-        note = f"[PRICE_REPAIRED: raw_exit_price={exit_price} / lots={int(lots) if lots.is_integer() else lots}]"
+        divisor = lots if candidate == candidates[0] else lots * lot_size
+        note = f"[PRICE_REPAIRED: raw_exit_price={exit_price} / divisor={int(divisor) if divisor.is_integer() else divisor}]"
         if note not in (row.get("notes") or ""):
             row["notes"] = ((row.get("notes") or "") + " " + note).strip()
         if isinstance(sb_entry, dict):
@@ -5090,6 +5097,13 @@ def update_trade_result(signal_id: str, result: str, exit_price: float | None = 
                 entry = r["entry"]
                 mult  = 1 if r.get("direction") == "LONG" else -1
                 r["pnl_pct"] = round(mult * (exit_price - entry) / entry * 100, 2)
+            if executed and _repair_anomalous_close_price(r, state if isinstance(state, dict) else {}):
+                logger.warning(
+                    "[trade_log] repaired anomalous close price for %s: raw=%s fixed=%s",
+                    signal_id, r.get("exit_price_raw"), r.get("exit_price"),
+                )
+                if isinstance(state, dict):
+                    save_signals_state(state)
             if not executed:
                 prev_notes = r.get("notes") or ""
                 marker = "[NOT_EXECUTED: risk-block/50002/no-order]"
