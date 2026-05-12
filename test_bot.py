@@ -1046,6 +1046,46 @@ class TestDailyReportDiagnostics(unittest.TestCase):
         self.assertEqual(uid["uid_cache_success"], 1)
         self.assertEqual(uid["uid_retry_success"], 1)
 
+    def test_stop_execution_quality_tracks_adverse_slippage(self):
+        summary = dr.summarize_stop_execution_quality([
+            {
+                "signal_id": "AFLT_SHORT_2026-05-08",
+                "ticker": "AFLT",
+                "direction": "SHORT",
+                "result": "loss",
+                "stop": 48.14,
+                "exit_price": 48.56,
+                "exit_time": "2026-05-12 09:50",
+                "executed": True,
+            },
+            {
+                "signal_id": "SBER_LONG_2026-05-08",
+                "ticker": "SBER",
+                "direction": "LONG",
+                "result": "loss",
+                "stop": 320.0,
+                "exit_price": 319.2,
+                "exit_time": "2026-05-12 10:10",
+                "executed": True,
+            },
+            {
+                "signal_id": "MOEX_LONG_2026-05-12",
+                "ticker": "MOEX",
+                "direction": "LONG",
+                "result": None,
+                "stop": 169.2,
+                "exit_price": None,
+                "executed": True,
+            },
+        ], date_str="2026-05-12")
+
+        self.assertEqual(summary["stop_loss_trades"], 2)
+        self.assertEqual(summary["slipped_stop_exits"], 2)
+        self.assertEqual(summary["rows"][0]["ticker"], "AFLT")
+        self.assertEqual(summary["rows"][0]["slippage_abs"], 0.42)
+        self.assertEqual(summary["rows"][1]["ticker"], "SBER")
+        self.assertEqual(summary["max_slippage_pct"], 0.872)
+
     def test_format_trade_opened_marks_phantom(self):
         line = dr.format_trade_opened({
             "ticker": "SMLT",

@@ -502,6 +502,60 @@ def summarize_reconcile_health(state: dict, decision_entries: list[dict]) -> dic
     return stats
 
 
+def summarize_stop_execution_quality(all_trades: list[dict], *, date_str: str | None = None) -> dict:
+    stats = {
+        "stop_loss_trades": 0,
+        "slipped_stop_exits": 0,
+        "avg_slippage_pct": 0.0,
+        "max_slippage_pct": 0.0,
+        "rows": [],
+    }
+    slippage_values: list[float] = []
+
+    for trade in all_trades:
+        if date_str and not str(trade.get("exit_time") or "").startswith(date_str):
+            continue
+        if not _is_executed(trade):
+            continue
+        if str(trade.get("result") or "").lower() not in {"loss", "stop"}:
+            continue
+
+        direction = str(trade.get("direction") or "").upper()
+        stop = float(trade.get("stop") or 0)
+        exit_price = float(trade.get("exit_price") or 0)
+        if direction not in {"LONG", "SHORT"} or stop <= 0 or exit_price <= 0:
+            continue
+
+        adverse_slip = (exit_price - stop) if direction == "SHORT" else (stop - exit_price)
+        if adverse_slip <= 0:
+            continue
+
+        slip_pct = adverse_slip / stop * 100
+        stats["stop_loss_trades"] += 1
+        stats["slipped_stop_exits"] += 1
+        slippage_values.append(slip_pct)
+        stats["rows"].append({
+            "signal_id": trade.get("signal_id"),
+            "ticker": trade.get("ticker"),
+            "direction": direction,
+            "planned_stop": round(stop, 4),
+            "actual_exit": round(exit_price, 4),
+            "slippage_abs": round(adverse_slip, 4),
+            "slippage_pct": round(slip_pct, 3),
+            "exit_time": trade.get("exit_time"),
+        })
+
+    if slippage_values:
+        stats["avg_slippage_pct"] = round(sum(slippage_values) / len(slippage_values), 3)
+        stats["max_slippage_pct"] = round(max(slippage_values), 3)
+        stats["rows"] = sorted(
+            stats["rows"],
+            key=lambda row: (-float(row["slippage_pct"]), str(row.get("signal_id") or "")),
+        )[:8]
+
+    return stats
+
+
 def build_daily_diagnostics(
     all_trades: list[dict],
     state: dict,
@@ -518,6 +572,7 @@ def build_daily_diagnostics(
         "uid_fallback": summarize_uid_fallback(log_lines),
         "network_resilience": summarize_network_resilience(log_lines),
         "reconcile_health": summarize_reconcile_health(state, decision_entries),
+        "stop_execution_quality": summarize_stop_execution_quality(all_trades, date_str=TODAY_STR),
     }
 
 
