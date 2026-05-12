@@ -247,6 +247,7 @@ def find_and_cache_uid(ticker: str) -> Optional[str]:
     После первого успешного поиска uid кэшируется — повторных API-вызовов нет.
     """
     if ticker in _UID_CACHE:
+        _cleanup_capability_entry(ticker, "has_figi")
         return _UID_CACHE[ticker]
     if not is_available():
         return None
@@ -260,6 +261,7 @@ def find_and_cache_uid(ticker: str) -> Optional[str]:
                 if uid:
                     _UID_CACHE[ticker] = uid
                     _save_uid_cache()
+                    _cleanup_capability_entry(ticker, "has_figi")
                     logger.info(
                         "[UID] %s → uid=%s (FIGI=%s) — кэшировано",
                         ticker, uid, getattr(inst, "figi", "?"),
@@ -784,8 +786,11 @@ def resolve_instrument_ids(ticker: str, *, allow_uid_lookup: bool = True) -> tup
     figi = FIGI_MAP.get(ticker)
     uid = _UID_CACHE.get(ticker)
     if figi:
+        _cleanup_capability_entry(ticker, "has_figi")
         return figi, uid
     if uid or not allow_uid_lookup:
+        if uid:
+            _cleanup_capability_entry(ticker, "has_figi")
         return figi, uid
     uid = find_and_cache_uid(ticker)
     if uid:

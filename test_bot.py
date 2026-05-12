@@ -793,6 +793,20 @@ class TestInstrumentCapabilities(unittest.TestCase):
         mock_find.assert_called_once_with("POSI")
         mock_get_figi.assert_not_called()
 
+    def test_resolve_instrument_ids_clears_figi_degradation_when_uid_cached(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            caps_file = os.path.join(tmpdir, "instrument_capabilities.json")
+            with patch.object(td, "_CAPABILITIES_FILE", td._pathlib.Path(caps_file)), \
+                 patch.dict(td.FIGI_MAP, {}, clear=True), \
+                 patch.dict(td._UID_CACHE, {"HEAD": "uid-head"}, clear=True):
+                td._INSTRUMENT_CAPABILITIES.clear()
+                td.mark_instrument_issue("HEAD", "has_figi", "figi_missing")
+                figi, uid = td.resolve_instrument_ids("HEAD")
+
+        self.assertIsNone(figi)
+        self.assertEqual(uid, "uid-head")
+        self.assertTrue(td.instrument_capability_available("HEAD", "has_figi"))
+
     def test_get_lot_size_learns_unknown_ticker_from_moex(self):
         with patch.dict(td.LOT_SIZE, {}, clear=True), \
              patch.object(td, "fetch_moex_lot_size", return_value=10):
