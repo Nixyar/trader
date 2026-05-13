@@ -30,6 +30,7 @@ Env:  TELEGRAM_TOKEN, TELEGRAM_CHAT_ID  (из .env или EnvironmentFile)
 import html
 import json
 import os
+import re
 import sys
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -60,6 +61,41 @@ DAILY_DIAGNOSTICS_FILE = _DIR / f"daily_diagnostics_{TODAY_STR}.json"
 _INSTRUMENT_ALIASES = {
     "BBG00F6NKQX3": "SMLT",
 }
+
+_SECRET_PATTERNS = [
+    (re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+"), r"\1***"),
+    (re.compile(r"(bot)[0-9]{6,}:[A-Za-z0-9_-]+"), r"\1***"),
+    (re.compile(r"(TELEGRAM_TOKEN\s*=\s*)\S+"), r"\1***"),
+]
+
+
+def redact_secrets(value) -> str:
+    text = str(value)
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _write_sanitized_copy(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    raw = src.read_bytes()
+    text = raw.decode("utf-8", errors="replace")
+    dst.write_text(redact_secrets(text), encoding="utf-8")
+
+
+def _add_sanitized_to_tar(tar, src: Path, arcname: str, tmp_root: Path) -> None:
+    if src.is_dir():
+        for child in src.rglob("*"):
+            if child.is_file():
+                rel = child.relative_to(src)
+                clean = tmp_root / arcname / rel
+                _write_sanitized_copy(child, clean)
+                tar.add(clean, arcname=str(Path(arcname) / rel))
+        return
+
+    clean = tmp_root / arcname
+    _write_sanitized_copy(src, clean)
+    tar.add(clean, arcname=arcname)
 
 
 def _normalize_ticker(ticker: str | None) -> str:
@@ -111,7 +147,7 @@ def tg_send(text: str) -> bool:
         r.raise_for_status()
         return True
     except Exception as e:
-        print(f"Telegram HTML error: {e}")
+        print(f"Telegram HTML error: {redact_secrets(e)}")
         # v0.9.38.3: fallback — повторяем без parse_mode, чисто plain text.
         # Причина: если в логах ошибок попался `<` / `>` или битый тег, TG 400.
         # Мы всё равно хотим доставить отчёт, пусть без форматирования.
@@ -124,7 +160,7 @@ def tg_send(text: str) -> bool:
             print("✅ Отчёт доставлен plain-text fallback (без HTML)")
             return True
         except Exception as e2:
-            print(f"Telegram plain fallback также упал: {e2}")
+            print(f"Telegram plain fallback также упал: {redact_secrets(e2)}")
             return False
 
 
@@ -136,7 +172,8 @@ def _build_daily_archive() -> Path | None:
     Запускает export_logs.sh (если есть) либо собирает архив сам.
     Возвращает путь к *_auto.tar.gz или None при ошибке.
     """
-    import subprocess, shutil, tarfile
+    import tarfile
+    import tempfile
 
     date_str = _NOW_MSK.strftime("%Y-%m-%d")
     archive  = _DIR / f"trader_export_{date_str}_auto.tar.gz"
@@ -164,14 +201,16 @@ def _build_daily_archive() -> Path | None:
         return None
 
     try:
-        with tarfile.open(archive, "w:gz") as tar:
-            for p in existing:
-                tar.add(p, arcname=p.name)
-            if (_DIR / "logs").is_dir():
-                tar.add(_DIR / "logs", arcname="logs")
+        with tempfile.TemporaryDirectory(prefix="trader_export_clean_") as tmp:
+            tmp_root = Path(tmp)
+            with tarfile.open(archive, "w:gz") as tar:
+                for p in existing:
+                    _add_sanitized_to_tar(tar, p, p.name, tmp_root)
+                if (_DIR / "logs").is_dir():
+                    _add_sanitized_to_tar(tar, _DIR / "logs", "logs", tmp_root)
         return archive
     except Exception as e:
-        print(f"❌ _build_daily_archive: {e}")
+        print(f"❌ _build_daily_archive: {redact_secrets(e)}")
         return None
 
 
@@ -199,7 +238,7 @@ def tg_send_document(path: Path, caption: str = "") -> bool:
         r.raise_for_status()
         return True
     except Exception as e:
-        print(f"Telegram sendDocument error: {e}")
+        print(f"Telegram sendDocument error: {redact_secrets(e)}")
         return False
 
 
@@ -1300,7 +1339,7 @@ def main() -> int:
         else:
             print("⚠️  Архив логов не создан (см. предыдущие warnings)")
     except Exception as _e:
-        print(f"⚠️  Ошибка при создании/отправке архива: {_e}")
+        print(f"⚠️  Ошибка при создании/отправке архива: {redact_secrets(_e)}")
 
     return 0
 
