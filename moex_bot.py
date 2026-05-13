@@ -402,6 +402,7 @@ import logging
 import logging.handlers
 import shutil
 import tempfile
+import re
 from datetime import datetime, timedelta, timezone
 from statistics import mean
 from dataclasses import dataclass, field
@@ -412,6 +413,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Пишем в logs/bot.log (RotatingFileHandler: 5 МБ × 3 файла = до 15 МБ истории)
 # + дублируем в консоль для удобства наблюдения в терминале.
 # v0.9.10: логи вынесены в подпапку logs/ — корень папки не засоряется.
+_SECRET_PATTERNS = [
+    (re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+"), r"\1***"),
+    (re.compile(r"(bot)[0-9]{6,}:[A-Za-z0-9_-]+"), r"\1***"),
+    (re.compile(r"(TELEGRAM_TOKEN\s*=\s*)\S+"), r"\1***"),
+]
+
+
+def redact_secrets(value) -> str:
+    text = str(value)
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+class SecretRedactingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = redact_secrets(record.msg)
+        if record.args:
+            record.args = tuple(redact_secrets(arg) for arg in record.args)
+        return True
+
+
 _LOG_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 _LOG_FILE = os.path.join(_LOG_DIR, "bot.log")
@@ -423,9 +446,11 @@ _fh = logging.handlers.RotatingFileHandler(
     _LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
 )
 _fh.setFormatter(_log_fmt)
+_fh.addFilter(SecretRedactingFilter())
 _sh = logging.StreamHandler()
 _sh.setFormatter(_log_fmt)
 _sh.setLevel(logging.WARNING)   # в консоль — только WARNING и выше (не засорять вывод)
+_sh.addFilter(SecretRedactingFilter())
 
 logging.basicConfig(level=logging.DEBUG, handlers=[_fh])  # root: всё в файл
 logging.getLogger().addHandler(_sh)                         # WARNING+ ещё в stderr
@@ -4132,7 +4157,7 @@ def tg_send(text: str, parse_mode: str = "HTML") -> bool:
                                r2.status_code, r2.text[:200])
             all_ok = False
         except Exception as e:
-            print(f"  ⚠️  Telegram недоступен: {e}")
+            print(f"  ⚠️  Telegram недоступен: {redact_secrets(e)}")
             logger.warning("tg_send: %s", e)
             all_ok = False
     return all_ok

@@ -19,6 +19,11 @@ cd "$(dirname "$0")"
 
 DATE=$(date +%Y-%m-%d)
 ARCHIVE="trader_export_${DATE}.tar.gz"
+TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/trader_export_clean.XXXXXX")
+cleanup() {
+    rm -rf "$TMPDIR"
+}
+trap cleanup EXIT
 
 echo "📦 Упаковываем данные бота за ${DATE}..."
 
@@ -46,7 +51,44 @@ if [ ${#FILES[@]} -eq 0 ]; then
     exit 1
 fi
 
-tar -czf "$ARCHIVE" "${FILES[@]}"
+python3 - "$TMPDIR" "${FILES[@]}" <<'PY'
+import pathlib
+import re
+import shutil
+import sys
+
+tmp_root = pathlib.Path(sys.argv[1])
+paths = [pathlib.Path(p) for p in sys.argv[2:]]
+patterns = [
+    (re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+"), r"\1***"),
+    (re.compile(r"(bot)[0-9]{6,}:[A-Za-z0-9_-]+"), r"\1***"),
+    (re.compile(r"(TELEGRAM_TOKEN\s*=\s*)\S+"), r"\1***"),
+]
+
+def redact(text: str) -> str:
+    for pattern, replacement in patterns:
+        text = pattern.sub(replacement, text)
+    return text
+
+def copy_sanitized(src: pathlib.Path, dst: pathlib.Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        text = src.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        shutil.copy2(src, dst)
+        return
+    dst.write_text(redact(text), encoding="utf-8")
+
+for src in paths:
+    if src.is_dir():
+        for child in src.rglob("*"):
+            if child.is_file():
+                copy_sanitized(child, tmp_root / src.name / child.relative_to(src))
+    elif src.is_file():
+        copy_sanitized(src, tmp_root / src.name)
+PY
+
+tar -czf "$ARCHIVE" -C "$TMPDIR" .
 
 SIZE=$(du -sh "$ARCHIVE" | cut -f1)
 echo ""
