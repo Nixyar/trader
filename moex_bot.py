@@ -427,11 +427,26 @@ def redact_secrets(value) -> str:
     return text
 
 
+def redact_log_arg(value):
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, dict):
+        return {
+            key: redact_log_arg(item)
+            for key, item in value.items()
+        }
+    return value
+
+
 class SecretRedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = redact_secrets(record.msg)
+        if isinstance(record.msg, str):
+            record.msg = redact_secrets(record.msg)
         if record.args:
-            record.args = tuple(redact_secrets(arg) for arg in record.args)
+            if isinstance(record.args, dict):
+                record.args = redact_log_arg(record.args)
+            else:
+                record.args = tuple(redact_log_arg(arg) for arg in record.args)
         return True
 
 
