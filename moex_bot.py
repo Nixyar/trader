@@ -5307,11 +5307,12 @@ def save_h1_watch(watch: dict) -> None:
 
 def add_to_h1_watch(watch: dict, ticker: str, direction: str,
                     levels: dict, anomaly: dict,
-                    state: dict | None = None) -> None:
+                    state: dict | None = None) -> bool:
     """Добавляет тикер в watch-лист для последующей проверки H1-подтверждения.
 
     v0.9.36: guard — если по (ticker, direction) уже открыта sb_-позиция,
     запись не создаётся (AFKS 16.04 добавлялся 11 раз подряд после открытия).
+    Возвращает True, если запись реально создана/обновлена; False при skip.
     """
     key = f"{ticker}_{direction}"
 
@@ -5330,7 +5331,7 @@ def add_to_h1_watch(watch: dict, ticker: str, direction: str,
                 # Дополнительно: если запись в watch была — удалим (гигиена)
                 if key in watch:
                     del watch[key]
-                return
+                return False
 
     # v0.9.36: не добавляем повторно, если запись уже есть и ещё не протухла
     if key in watch:
@@ -5338,7 +5339,7 @@ def add_to_h1_watch(watch: dict, ticker: str, direction: str,
             exp = datetime.fromisoformat(watch[key].get("expires_at", ""))
             if datetime.now(timezone.utc) < exp:
                 logger.debug("h1_watch skip: %s %s — уже в watch-листе", ticker, direction)
-                return
+                return False
         except (ValueError, TypeError):
             pass
 
@@ -5357,6 +5358,7 @@ def add_to_h1_watch(watch: dict, ticker: str, direction: str,
             "ma50":       levels.get("ma50"),
         },
     }
+    return True
 
 
 def expire_h1_watch(watch: dict) -> list[str]:
@@ -7066,18 +7068,19 @@ def run_once(news_only: bool = False):
                     # ⏳ T-Invest доступен, но H1 не подтвердил — добавляем в watch
                     watch_key = f"{ticker}_{_dir_chk}"
                     if watch_key not in h1_watch:
-                        add_to_h1_watch(h1_watch, ticker, _dir_chk, levels, anomaly, state)  # v0.9.36: state для guard
-                        print(f"       👀 H1 нет подтверждения — {watch_key} добавлен в watch ({H1_WATCH_HOURS:.0f}ч)")
-                        logger.info("%s: ДОБАВЛЕН в h1_watch, направление=%s, ×%.1f, ждём %gч",
-                                    ticker, _dir_chk, anomaly.get("ratio", 0), H1_WATCH_HOURS)
-                        append_market_radar_opportunity(
-                            ticker, "h1_watch_pending",
-                            direction=_dir_chk, levels=levels, anomaly=anomaly,
-                            change_pct=daily_change_pct(candles),
-                            extra={"signal_type": _sig_type, "watch_key": watch_key},
-                        )
-                        # v0.9.19: watch-алерты убраны из Telegram (только вход/закрытие)
-                        logger.info("%s: watch-alert подавлен (v0.9.19)", ticker)
+                        added = add_to_h1_watch(h1_watch, ticker, _dir_chk, levels, anomaly, state)  # v0.9.36: state для guard
+                        if added:
+                            print(f"       👀 H1 нет подтверждения — {watch_key} добавлен в watch ({H1_WATCH_HOURS:.0f}ч)")
+                            logger.info("%s: ДОБАВЛЕН в h1_watch, направление=%s, ×%.1f, ждём %gч",
+                                        ticker, _dir_chk, anomaly.get("ratio", 0), H1_WATCH_HOURS)
+                            append_market_radar_opportunity(
+                                ticker, "h1_watch_pending",
+                                direction=_dir_chk, levels=levels, anomaly=anomaly,
+                                change_pct=daily_change_pct(candles),
+                                extra={"signal_type": _sig_type, "watch_key": watch_key},
+                            )
+                            # v0.9.19: watch-алерты убраны из Telegram (только вход/закрытие)
+                            logger.info("%s: watch-alert подавлен (v0.9.19)", ticker)
                     else:
                         print(f"       👀 H1 ожидание... {watch_key} уже в watch-листе")
                         logger.debug("%s: уже в h1_watch, H1 снова не подтвердил", watch_key)

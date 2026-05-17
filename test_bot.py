@@ -1819,6 +1819,26 @@ class TestH1WatchHelpers(unittest.TestCase):
         exp = datetime.fromisoformat(watch["NVTK_SHORT"]["expires_at"])
         self.assertGreater(exp, datetime.now(timezone.utc))
 
+    def test_add_to_h1_watch_skips_open_sandbox_position(self):
+        watch = {"HEAD_SHORT": self._make_entry("HEAD", "SHORT", +3)}
+        added = mb.add_to_h1_watch(
+            watch,
+            "HEAD",
+            "SHORT",
+            {"last_close": 2762.0, "atr": 12.0},
+            {"ratio": 5.0},
+            {
+                "sb_HEAD_SHORT_2026-05-15": {
+                    "ticker": "HEAD",
+                    "direction": "SHORT",
+                    "order_id": "ord-1",
+                },
+            },
+        )
+
+        self.assertFalse(added)
+        self.assertNotIn("HEAD_SHORT", watch)
+
     def test_daily_change_pct_uses_previous_close(self):
         candles = [{"close": 100.0}, {"close": 97.5}]
 
