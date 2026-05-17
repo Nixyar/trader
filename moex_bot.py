@@ -733,6 +733,10 @@ _MARKET_RADAR_SEEN: set[tuple[str, str, str]] = set()  # (YYYY-MM-DD, ticker, re
 
 # Максимальный дневной убыток: если внутри дня −2% к SOD equity — стоп новых входов.
 MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "2.0"))
+# Intraday loss-streak brake: after N confirmed losing closes today, new entries
+# are rejected while stop/target monitoring continues. 0 disables the guard.
+MAX_DAILY_STOP_LOSSES = int(os.environ.get("MAX_DAILY_STOP_LOSSES", "2"))
+NEWS_EVENT_AUTO_MIN_SCORE = int(os.environ.get("NEWS_EVENT_AUTO_MIN_SCORE", "18"))
 
 # Кулдаун после target2 / stop_hit в том же направлении (anti-chasing).
 # Кейс 16.04: CBOM target2 → через 27 мин v2 вошёл на эйфории → stop_hit.
@@ -6134,6 +6138,38 @@ def check_daily_loss_brake(sod_equity: float | None, current_equity: float) -> b
     return drawdown_pct >= MAX_DAILY_LOSS_PCT
 
 
+def check_daily_stop_loss_brake(
+    trade_log: list[dict],
+    date_str: str,
+    max_losses: int | None = None,
+) -> tuple[bool, int]:
+    """Block new entries after too many confirmed losing closes today."""
+    threshold = MAX_DAILY_STOP_LOSSES if max_losses is None else max_losses
+    if threshold <= 0:
+        return False, 0
+
+    losses = 0
+    for row in trade_log:
+        if not isinstance(row, dict):
+            continue
+        if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
+            continue
+        if not str(row.get("exit_time") or "").startswith(date_str):
+            continue
+        result = str(row.get("result") or "").lower()
+        pnl = row.get("pnl_pct")
+        is_loss = result in {"loss", "stop"}
+        if not is_loss and pnl is not None:
+            try:
+                is_loss = float(pnl) < 0
+            except (TypeError, ValueError):
+                is_loss = False
+        if is_loss:
+            losses += 1
+
+    return losses >= threshold, losses
+
+
 def sandbox_strategy_reject_reason(
     signal: dict,
     quality_flags: set[str] | None = None,
@@ -6155,8 +6191,12 @@ def sandbox_strategy_reject_reason(
         if "ma50_against" in decision_reasons:
             return "index_rebound_trend_conflict"
     elif strategy == "news_event":
+        if score < NEWS_EVENT_AUTO_MIN_SCORE:
+            return "news_event_min_score"
         if "stale_intraday" in quality_flags:
             return "stale_intraday"
+        if "news_conflict" in decision_reasons or "intraday_confirmation_conflict" in decision_reasons:
+            return "news_event_conflict"
         if signal.get("vwap_confirm") is False and score < 12:
             return "news_event_vwap_conflict"
     return None
@@ -6322,6 +6362,23 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
         logger.info("monday_risk: риск снижен до %.0f%% (MONDAY_RISK_MULT=%.1f)",
                     RISK_PCT * _day_risk_mult, MONDAY_RISK_MULT)
 
+    _today_str = _now_msk.strftime("%Y-%m-%d")
+    daily_stop_brake_active = False
+    daily_stop_losses = 0
+    try:
+        daily_stop_brake_active, daily_stop_losses = check_daily_stop_loss_brake(
+            load_trade_log(), _today_str
+        )
+    except Exception as _e:
+        logger.warning("daily_stop_loss_brake check failed: %s", _e)
+    if daily_stop_brake_active and _should_log_risk_block("ALL", "DAILY_STOP_LOSS_BRAKE"):
+        msg = (
+            f"🛑 Daily stop-loss brake активен: {daily_stop_losses} убыточных закрытий "
+            f"за {_today_str} ≥ {MAX_DAILY_STOP_LOSSES} — новые входы заблокированы"
+        )
+        print(f"  {msg}")
+        logger.warning("daily_stop_loss_brake: %s", msg)
+
     # v0.9.31: таблица размера позиции по уверенности.
     # risk_mult — масштаб риск-рубля (RISK_PCT × mult).
     # pos_pct   — лимит одной позиции (% equity), НЕЗАВИСИМО от SANDBOX_MAX_POS_PCT.
@@ -6372,6 +6429,17 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
             "decision_reasons": list(decision_reasons),
             "data_quality_flags": list(quality_flags),
         }
+
+        if daily_stop_brake_active:
+            reason = "daily_stop_loss_brake"
+            append_score_log({**opportunity_base, "action": "skipped", "reason": reason})
+            append_opportunity_log({
+                **opportunity_base,
+                "action": "rejected",
+                "reason": reason,
+                "losses_today": daily_stop_losses,
+            })
+            continue
 
         if tier == "tier_3":
             reason = "tier3_watch_only"
