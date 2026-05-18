@@ -1553,6 +1553,96 @@ class TestExecutionRecording(unittest.TestCase):
             self.assertIn("tier3_watch_only", open(score_file, encoding="utf-8").read())
             self.assertIn("tier3_watch_only", open(opportunity_file, encoding="utf-8").read())
 
+    def test_daily_stop_loss_brake_counts_real_losses_today(self):
+        active, losses = mb.check_daily_stop_loss_brake([
+            {
+                "signal_id": "A",
+                "result": "loss",
+                "pnl_pct": -1.0,
+                "exit_time": "2026-05-15 11:00",
+                "executed": True,
+            },
+            {
+                "signal_id": "B",
+                "result": "win_t2",
+                "pnl_pct": 1.5,
+                "exit_time": "2026-05-15 12:00",
+                "executed": True,
+            },
+            {
+                "signal_id": "C",
+                "result": "loss",
+                "pnl_pct": -0.4,
+                "exit_time": "2026-05-15 13:00",
+                "execution_status": "virtual",
+                "executed": False,
+            },
+            {
+                "signal_id": "D",
+                "result": "loss",
+                "pnl_pct": -0.8,
+                "exit_time": "2026-05-15 14:00",
+                "executed": True,
+            },
+            {
+                "signal_id": "OLD",
+                "result": "loss",
+                "pnl_pct": -1.2,
+                "exit_time": "2026-05-14 14:00",
+                "executed": True,
+            },
+        ], "2026-05-15", max_losses=2)
+
+        self.assertTrue(active)
+        self.assertEqual(losses, 2)
+
+    def test_daily_stop_loss_brake_can_be_disabled(self):
+        active, losses = mb.check_daily_stop_loss_brake([
+            {
+                "signal_id": "A",
+                "result": "loss",
+                "pnl_pct": -1.0,
+                "exit_time": "2026-05-15 11:00",
+                "executed": True,
+            },
+        ], "2026-05-15", max_losses=0)
+
+        self.assertFalse(active)
+        self.assertEqual(losses, 0)
+
+    def test_strategy_performance_guard_blocks_negative_edge(self):
+        reason, meta = mb.strategy_performance_guard_reason(
+            {"strategy": "news_event", "confidence_score": 21},
+            [
+                {"strategy": "news_event", "pnl_pct": -1.0, "exit_time": "2026-05-10", "executed": True},
+                {"strategy": "news_event", "pnl_pct": -0.8, "exit_time": "2026-05-11", "executed": True},
+                {"strategy": "news_event", "pnl_pct": 0.4, "exit_time": "2026-05-12", "executed": True},
+                {"strategy": "news_event", "pnl_pct": -1.2, "exit_time": "2026-05-13", "executed": True},
+                {"strategy": "news_event", "pnl_pct": -0.3, "exit_time": "2026-05-14", "executed": True},
+                {"strategy": "index_rebound", "pnl_pct": -5.0, "exit_time": "2026-05-14", "executed": True},
+            ],
+            min_trades=5,
+            min_pnl=0.0,
+            min_winrate=45.0,
+        )
+
+        self.assertEqual(reason, "strategy_perf_guard")
+        self.assertEqual(meta["strategy_label"], "news_event")
+        self.assertEqual(meta["closed"], 5)
+
+    def test_strategy_performance_guard_allows_small_sample(self):
+        reason, meta = mb.strategy_performance_guard_reason(
+            {"strategy": "news_event", "confidence_score": 21},
+            [
+                {"strategy": "news_event", "pnl_pct": -1.0, "exit_time": "2026-05-10", "executed": True},
+                {"strategy": "news_event", "pnl_pct": -0.8, "exit_time": "2026-05-11", "executed": True},
+            ],
+            min_trades=5,
+        )
+
+        self.assertIsNone(reason)
+        self.assertEqual(meta["closed"], 2)
+
     def test_close_failure_does_not_mark_trade_result(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             trade_file = os.path.join(tmpdir, "trade_log.json")
@@ -1819,6 +1909,26 @@ class TestH1WatchHelpers(unittest.TestCase):
         exp = datetime.fromisoformat(watch["NVTK_SHORT"]["expires_at"])
         self.assertGreater(exp, datetime.now(timezone.utc))
 
+    def test_add_to_h1_watch_skips_open_sandbox_position(self):
+        watch = {"HEAD_SHORT": self._make_entry("HEAD", "SHORT", +3)}
+        added = mb.add_to_h1_watch(
+            watch,
+            "HEAD",
+            "SHORT",
+            {"last_close": 2762.0, "atr": 12.0},
+            {"ratio": 5.0},
+            {
+                "sb_HEAD_SHORT_2026-05-15": {
+                    "ticker": "HEAD",
+                    "direction": "SHORT",
+                    "order_id": "ord-1",
+                },
+            },
+        )
+
+        self.assertFalse(added)
+        self.assertNotIn("HEAD_SHORT", watch)
+
     def test_daily_change_pct_uses_previous_close(self):
         candles = [{"close": 100.0}, {"close": 97.5}]
 
@@ -2011,6 +2121,24 @@ class TestH1WatchHelpers(unittest.TestCase):
         )
 
         self.assertEqual(reason, "stale_intraday")
+
+    def test_sandbox_strategy_rejects_weak_news_event(self):
+        reason = mb.sandbox_strategy_reject_reason(
+            {"strategy": "news_event", "confidence_score": 17, "vwap_confirm": True},
+            set(),
+            {"news_event_signal"},
+        )
+
+        self.assertEqual(reason, "news_event_min_score")
+
+    def test_sandbox_strategy_rejects_conflicting_news_event(self):
+        reason = mb.sandbox_strategy_reject_reason(
+            {"strategy": "news_event", "confidence_score": 21, "vwap_confirm": True},
+            set(),
+            {"news_event_signal", "news_conflict"},
+        )
+
+        self.assertEqual(reason, "news_event_conflict")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -733,6 +733,13 @@ _MARKET_RADAR_SEEN: set[tuple[str, str, str]] = set()  # (YYYY-MM-DD, ticker, re
 
 # Максимальный дневной убыток: если внутри дня −2% к SOD equity — стоп новых входов.
 MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "2.0"))
+# Intraday loss-streak brake: after N confirmed losing closes today, new entries
+# are rejected while stop/target monitoring continues. 0 disables the guard.
+MAX_DAILY_STOP_LOSSES = int(os.environ.get("MAX_DAILY_STOP_LOSSES", "2"))
+NEWS_EVENT_AUTO_MIN_SCORE = int(os.environ.get("NEWS_EVENT_AUTO_MIN_SCORE", "18"))
+STRATEGY_PERF_GUARD_MIN_TRADES = int(os.environ.get("STRATEGY_PERF_GUARD_MIN_TRADES", "5"))
+STRATEGY_PERF_GUARD_MIN_PNL = float(os.environ.get("STRATEGY_PERF_GUARD_MIN_PNL", "0.0"))
+STRATEGY_PERF_GUARD_MIN_WINRATE = float(os.environ.get("STRATEGY_PERF_GUARD_MIN_WINRATE", "45.0"))
 
 # Кулдаун после target2 / stop_hit в том же направлении (anti-chasing).
 # Кейс 16.04: CBOM target2 → через 27 мин v2 вошёл на эйфории → stop_hit.
@@ -5307,11 +5314,12 @@ def save_h1_watch(watch: dict) -> None:
 
 def add_to_h1_watch(watch: dict, ticker: str, direction: str,
                     levels: dict, anomaly: dict,
-                    state: dict | None = None) -> None:
+                    state: dict | None = None) -> bool:
     """Добавляет тикер в watch-лист для последующей проверки H1-подтверждения.
 
     v0.9.36: guard — если по (ticker, direction) уже открыта sb_-позиция,
     запись не создаётся (AFKS 16.04 добавлялся 11 раз подряд после открытия).
+    Возвращает True, если запись реально создана/обновлена; False при skip.
     """
     key = f"{ticker}_{direction}"
 
@@ -5330,7 +5338,7 @@ def add_to_h1_watch(watch: dict, ticker: str, direction: str,
                 # Дополнительно: если запись в watch была — удалим (гигиена)
                 if key in watch:
                     del watch[key]
-                return
+                return False
 
     # v0.9.36: не добавляем повторно, если запись уже есть и ещё не протухла
     if key in watch:
@@ -5338,7 +5346,7 @@ def add_to_h1_watch(watch: dict, ticker: str, direction: str,
             exp = datetime.fromisoformat(watch[key].get("expires_at", ""))
             if datetime.now(timezone.utc) < exp:
                 logger.debug("h1_watch skip: %s %s — уже в watch-листе", ticker, direction)
-                return
+                return False
         except (ValueError, TypeError):
             pass
 
@@ -5357,6 +5365,7 @@ def add_to_h1_watch(watch: dict, ticker: str, direction: str,
             "ma50":       levels.get("ma50"),
         },
     }
+    return True
 
 
 def expire_h1_watch(watch: dict) -> list[str]:
@@ -6132,6 +6141,93 @@ def check_daily_loss_brake(sod_equity: float | None, current_equity: float) -> b
     return drawdown_pct >= MAX_DAILY_LOSS_PCT
 
 
+def check_daily_stop_loss_brake(
+    trade_log: list[dict],
+    date_str: str,
+    max_losses: int | None = None,
+) -> tuple[bool, int]:
+    """Block new entries after too many confirmed losing closes today."""
+    threshold = MAX_DAILY_STOP_LOSSES if max_losses is None else max_losses
+    if threshold <= 0:
+        return False, 0
+
+    losses = 0
+    for row in trade_log:
+        if not isinstance(row, dict):
+            continue
+        if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
+            continue
+        if not str(row.get("exit_time") or "").startswith(date_str):
+            continue
+        result = str(row.get("result") or "").lower()
+        pnl = row.get("pnl_pct")
+        is_loss = result in {"loss", "stop"}
+        if not is_loss and pnl is not None:
+            try:
+                is_loss = float(pnl) < 0
+            except (TypeError, ValueError):
+                is_loss = False
+        if is_loss:
+            losses += 1
+
+    return losses >= threshold, losses
+
+
+def _strategy_label(signal_or_trade: dict) -> str:
+    return str(
+        signal_or_trade.get("strategy")
+        or signal_or_trade.get("h1_type")
+        or signal_or_trade.get("pattern")
+        or "UNSPECIFIED"
+    )
+
+
+def strategy_performance_guard_reason(
+    signal: dict,
+    trade_log: list[dict],
+    *,
+    min_trades: int | None = None,
+    min_pnl: float | None = None,
+    min_winrate: float | None = None,
+) -> tuple[str | None, dict]:
+    """Block auto-order when this strategy's realized rolling edge is poor."""
+    threshold_trades = STRATEGY_PERF_GUARD_MIN_TRADES if min_trades is None else min_trades
+    pnl_floor = STRATEGY_PERF_GUARD_MIN_PNL if min_pnl is None else min_pnl
+    winrate_floor = STRATEGY_PERF_GUARD_MIN_WINRATE if min_winrate is None else min_winrate
+    if threshold_trades <= 0:
+        return None, {}
+
+    label = _strategy_label(signal)
+    rows: list[dict] = []
+    for row in trade_log:
+        if not isinstance(row, dict):
+            continue
+        if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
+            continue
+        if row.get("pnl_pct") is None or not row.get("exit_time"):
+            continue
+        if _strategy_label(row) == label:
+            rows.append(row)
+
+    rows = sorted(rows, key=lambda row: str(row.get("exit_time") or ""))[-10:]
+    if len(rows) < threshold_trades:
+        return None, {"strategy_label": label, "closed": len(rows)}
+
+    pnls = [float(row.get("pnl_pct") or 0) for row in rows]
+    wins = sum(1 for pnl in pnls if pnl > 0)
+    total_pnl = round(sum(pnls), 2)
+    winrate = round(wins / len(pnls) * 100, 1)
+    meta = {
+        "strategy_label": label,
+        "closed": len(rows),
+        "total_pnl": total_pnl,
+        "winrate": winrate,
+    }
+    if total_pnl < pnl_floor and winrate < winrate_floor:
+        return "strategy_perf_guard", meta
+    return None, meta
+
+
 def sandbox_strategy_reject_reason(
     signal: dict,
     quality_flags: set[str] | None = None,
@@ -6153,8 +6249,12 @@ def sandbox_strategy_reject_reason(
         if "ma50_against" in decision_reasons:
             return "index_rebound_trend_conflict"
     elif strategy == "news_event":
+        if score < NEWS_EVENT_AUTO_MIN_SCORE:
+            return "news_event_min_score"
         if "stale_intraday" in quality_flags:
             return "stale_intraday"
+        if "news_conflict" in decision_reasons or "intraday_confirmation_conflict" in decision_reasons:
+            return "news_event_conflict"
         if signal.get("vwap_confirm") is False and score < 12:
             return "news_event_vwap_conflict"
     return None
@@ -6320,6 +6420,28 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
         logger.info("monday_risk: риск снижен до %.0f%% (MONDAY_RISK_MULT=%.1f)",
                     RISK_PCT * _day_risk_mult, MONDAY_RISK_MULT)
 
+    _today_str = _now_msk.strftime("%Y-%m-%d")
+    _trade_log_snapshot: list[dict] = []
+    try:
+        _trade_log_snapshot = load_trade_log()
+    except Exception as _e:
+        logger.warning("trade_log load failed: %s", _e)
+    daily_stop_brake_active = False
+    daily_stop_losses = 0
+    try:
+        daily_stop_brake_active, daily_stop_losses = check_daily_stop_loss_brake(
+            _trade_log_snapshot, _today_str
+        )
+    except Exception as _e:
+        logger.warning("daily_stop_loss_brake check failed: %s", _e)
+    if daily_stop_brake_active and _should_log_risk_block("ALL", "DAILY_STOP_LOSS_BRAKE"):
+        msg = (
+            f"🛑 Daily stop-loss brake активен: {daily_stop_losses} убыточных закрытий "
+            f"за {_today_str} ≥ {MAX_DAILY_STOP_LOSSES} — новые входы заблокированы"
+        )
+        print(f"  {msg}")
+        logger.warning("daily_stop_loss_brake: %s", msg)
+
     # v0.9.31: таблица размера позиции по уверенности.
     # risk_mult — масштаб риск-рубля (RISK_PCT × mult).
     # pos_pct   — лимит одной позиции (% equity), НЕЗАВИСИМО от SANDBOX_MAX_POS_PCT.
@@ -6370,6 +6492,28 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
             "decision_reasons": list(decision_reasons),
             "data_quality_flags": list(quality_flags),
         }
+
+        if daily_stop_brake_active:
+            reason = "daily_stop_loss_brake"
+            append_score_log({**opportunity_base, "action": "skipped", "reason": reason})
+            append_opportunity_log({
+                **opportunity_base,
+                "action": "rejected",
+                "reason": reason,
+                "losses_today": daily_stop_losses,
+            })
+            continue
+
+        perf_reason, perf_meta = strategy_performance_guard_reason(s, _trade_log_snapshot)
+        if perf_reason:
+            append_score_log({**opportunity_base, "action": "skipped", "reason": perf_reason, **perf_meta})
+            append_opportunity_log({
+                **opportunity_base,
+                "action": "rejected",
+                "reason": perf_reason,
+                **perf_meta,
+            })
+            continue
 
         if tier == "tier_3":
             reason = "tier3_watch_only"
@@ -7066,18 +7210,19 @@ def run_once(news_only: bool = False):
                     # ⏳ T-Invest доступен, но H1 не подтвердил — добавляем в watch
                     watch_key = f"{ticker}_{_dir_chk}"
                     if watch_key not in h1_watch:
-                        add_to_h1_watch(h1_watch, ticker, _dir_chk, levels, anomaly, state)  # v0.9.36: state для guard
-                        print(f"       👀 H1 нет подтверждения — {watch_key} добавлен в watch ({H1_WATCH_HOURS:.0f}ч)")
-                        logger.info("%s: ДОБАВЛЕН в h1_watch, направление=%s, ×%.1f, ждём %gч",
-                                    ticker, _dir_chk, anomaly.get("ratio", 0), H1_WATCH_HOURS)
-                        append_market_radar_opportunity(
-                            ticker, "h1_watch_pending",
-                            direction=_dir_chk, levels=levels, anomaly=anomaly,
-                            change_pct=daily_change_pct(candles),
-                            extra={"signal_type": _sig_type, "watch_key": watch_key},
-                        )
-                        # v0.9.19: watch-алерты убраны из Telegram (только вход/закрытие)
-                        logger.info("%s: watch-alert подавлен (v0.9.19)", ticker)
+                        added = add_to_h1_watch(h1_watch, ticker, _dir_chk, levels, anomaly, state)  # v0.9.36: state для guard
+                        if added:
+                            print(f"       👀 H1 нет подтверждения — {watch_key} добавлен в watch ({H1_WATCH_HOURS:.0f}ч)")
+                            logger.info("%s: ДОБАВЛЕН в h1_watch, направление=%s, ×%.1f, ждём %gч",
+                                        ticker, _dir_chk, anomaly.get("ratio", 0), H1_WATCH_HOURS)
+                            append_market_radar_opportunity(
+                                ticker, "h1_watch_pending",
+                                direction=_dir_chk, levels=levels, anomaly=anomaly,
+                                change_pct=daily_change_pct(candles),
+                                extra={"signal_type": _sig_type, "watch_key": watch_key},
+                            )
+                            # v0.9.19: watch-алерты убраны из Telegram (только вход/закрытие)
+                            logger.info("%s: watch-alert подавлен (v0.9.19)", ticker)
                     else:
                         print(f"       👀 H1 ожидание... {watch_key} уже в watch-листе")
                         logger.debug("%s: уже в h1_watch, H1 снова не подтвердил", watch_key)
