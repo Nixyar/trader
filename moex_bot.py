@@ -736,7 +736,9 @@ MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "2.0"))
 # Intraday loss-streak brake: after N confirmed losing closes today, new entries
 # are rejected while stop/target monitoring continues. 0 disables the guard.
 MAX_DAILY_STOP_LOSSES = int(os.environ.get("MAX_DAILY_STOP_LOSSES", "2"))
+MAX_DAILY_NEW_ORDERS_AFTER_LOSS = int(os.environ.get("MAX_DAILY_NEW_ORDERS_AFTER_LOSS", "0"))
 NEWS_EVENT_AUTO_MIN_SCORE = int(os.environ.get("NEWS_EVENT_AUTO_MIN_SCORE", "18"))
+AUTO_ORDER_MIN_SETUP_QUALITY = os.environ.get("AUTO_ORDER_MIN_SETUP_QUALITY", "B").upper()
 STRATEGY_PERF_GUARD_MIN_TRADES = int(os.environ.get("STRATEGY_PERF_GUARD_MIN_TRADES", "5"))
 STRATEGY_PERF_GUARD_MIN_PNL = float(os.environ.get("STRATEGY_PERF_GUARD_MIN_PNL", "0.0"))
 STRATEGY_PERF_GUARD_MIN_WINRATE = float(os.environ.get("STRATEGY_PERF_GUARD_MIN_WINRATE", "45.0"))
@@ -3448,6 +3450,117 @@ def _score_to_confidence(score: int) -> str:
         return "🔴 СЛАБАЯ"
 
 
+_SETUP_QUALITY_RANK = {"D": 0, "C": 1, "B": 2, "A": 3}
+
+
+def evaluate_setup_quality(signal: dict) -> tuple[str, int, list[str]]:
+    """
+    Separate the trade thesis quality from the additive confidence score.
+
+    The old score can become high from many weak bonuses. This classifier is
+    intentionally stricter: it rewards a compact core setup and penalizes
+    direct context conflicts.
+    """
+    points = 0
+    reasons: list[str] = []
+
+    h1_type = (signal.get("h1_confirm") or {}).get("type")
+    if h1_type in {"breakout", "momentum", "volume"}:
+        points += 2
+        reasons.append(f"h1_{h1_type}")
+    elif h1_type == "index_rebound":
+        points += 1
+        reasons.append("h1_index_rebound")
+
+    vol_ratio = float(signal.get("volume_ratio") or 0)
+    if vol_ratio >= 5.0:
+        points += 2
+        reasons.append("volume_extreme")
+    elif vol_ratio >= 3.0:
+        points += 1
+        reasons.append("volume_strong")
+
+    if signal.get("vwap_confirm") is True:
+        points += 1
+        reasons.append("vwap_confirm")
+    elif signal.get("vwap_confirm") is False:
+        points -= 2
+        reasons.append("vwap_conflict")
+
+    if signal.get("weekly_aligned") is True:
+        points += 1
+        reasons.append("weekly_aligned")
+    elif signal.get("weekly_aligned") is False:
+        points -= 2
+        reasons.append("weekly_conflict")
+
+    if signal.get("ma50_against"):
+        points -= 1
+        reasons.append("ma50_conflict")
+
+    direction = signal.get("direction")
+    if signal.get("obv_bull_div") and direction == "LONG":
+        points += 1
+        reasons.append("obv_bull_div")
+    elif signal.get("obv_bear_div") and direction == "SHORT":
+        points += 1
+        reasons.append("obv_bear_div")
+    elif signal.get("obv_bull_div") and direction == "SHORT":
+        points -= 1
+        reasons.append("obv_conflict")
+    elif signal.get("obv_bear_div") and direction == "LONG":
+        points -= 1
+        reasons.append("obv_conflict")
+
+    ma_cross = signal.get("ma_crossover")
+    if ma_cross == "golden_cross" and direction == "LONG":
+        points += 1
+        reasons.append("golden_cross")
+    elif ma_cross == "death_cross" and direction == "SHORT":
+        points += 1
+        reasons.append("death_cross")
+    elif ma_cross in {"golden_cross", "death_cross"}:
+        points -= 1
+        reasons.append("ma_cross_conflict")
+
+    news_agree = int(signal.get("news_agree") or 0)
+    news_oppose = int(signal.get("news_oppose") or 0)
+    if news_agree and not news_oppose:
+        points += 1
+        reasons.append("news_aligned")
+    elif news_oppose:
+        points -= 1
+        reasons.append("news_conflict")
+
+    quality_flags = set(signal.get("data_quality_flags") or [])
+    if "stale_intraday" in quality_flags:
+        points -= 2
+        reasons.append("stale_intraday")
+    if "invalid_price" in quality_flags:
+        points -= 3
+        reasons.append("invalid_price")
+
+    if points >= 4:
+        return "A", points, reasons
+    if points >= 3:
+        return "B", points, reasons
+    if points >= 2:
+        return "C", points, reasons
+    return "D", points, reasons
+
+
+def setup_quality_reject_reason(signal: dict) -> str | None:
+    quality = signal.get("setup_quality")
+    if not quality:
+        return None
+    min_quality = AUTO_ORDER_MIN_SETUP_QUALITY
+    if min_quality not in _SETUP_QUALITY_RANK:
+        min_quality = "B"
+    if _SETUP_QUALITY_RANK.get(str(quality), 0) < _SETUP_QUALITY_RANK[min_quality]:
+        return "setup_quality_low"
+    return None
+
+
 def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem]) -> list[dict]:
     """
     v0.9.5: Score-based уверенность (0–17 очков) вместо бинарных переключателей.
@@ -3937,7 +4050,7 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
         elif agreeing:
             decision_reasons.append("news_agreement")
 
-        synthesized.append({
+        out_signal = {
             **ms,
             "confidence":       confidence,
             "confidence_score": score,
@@ -3952,7 +4065,12 @@ def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem])
             "decision_reasons": sorted(set(decision_reasons)),
             "data_quality_flags": sorted(set(data_quality_flags)),
             "news_mode":        news_mode,
-        })
+        }
+        setup_quality, setup_quality_score, setup_quality_reasons = evaluate_setup_quality(out_signal)
+        out_signal["setup_quality"] = setup_quality
+        out_signal["setup_quality_score"] = setup_quality_score
+        out_signal["setup_quality_reasons"] = setup_quality_reasons
+        synthesized.append(out_signal)
 
     return synthesized
 
@@ -6173,6 +6291,43 @@ def check_daily_stop_loss_brake(
     return losses >= threshold, losses
 
 
+def count_daily_new_orders(trade_log: list[dict], date_str: str) -> int:
+    count = 0
+    for row in trade_log:
+        if not isinstance(row, dict):
+            continue
+        if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
+            continue
+        if str(row.get("date") or "").startswith(date_str):
+            count += 1
+    return count
+
+
+def has_daily_ticker_loss(
+    trade_log: list[dict],
+    date_str: str,
+    ticker: str,
+) -> bool:
+    for row in trade_log:
+        if not isinstance(row, dict):
+            continue
+        if row.get("ticker") != ticker:
+            continue
+        if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
+            continue
+        if not str(row.get("exit_time") or "").startswith(date_str):
+            continue
+        result = str(row.get("result") or "").lower()
+        if result in {"loss", "stop"}:
+            return True
+        try:
+            if row.get("pnl_pct") is not None and float(row.get("pnl_pct")) < 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _strategy_label(signal_or_trade: dict) -> str:
     return str(
         signal_or_trade.get("strategy")
@@ -6428,6 +6583,7 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
         logger.warning("trade_log load failed: %s", _e)
     daily_stop_brake_active = False
     daily_stop_losses = 0
+    daily_new_orders = count_daily_new_orders(_trade_log_snapshot, _today_str)
     try:
         daily_stop_brake_active, daily_stop_losses = check_daily_stop_loss_brake(
             _trade_log_snapshot, _today_str
@@ -6489,6 +6645,8 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
             "signal_id": key,
             "ticker_tier": tier,
             "news_mode": s.get("news_mode"),
+            "setup_quality": s.get("setup_quality"),
+            "setup_quality_score": s.get("setup_quality_score"),
             "decision_reasons": list(decision_reasons),
             "data_quality_flags": list(quality_flags),
         }
@@ -6501,6 +6659,40 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                 "action": "rejected",
                 "reason": reason,
                 "losses_today": daily_stop_losses,
+            })
+            continue
+
+        if daily_stop_losses > 0 and daily_new_orders >= MAX_DAILY_NEW_ORDERS_AFTER_LOSS:
+            reason = "post_loss_new_order_brake"
+            append_score_log({**opportunity_base, "action": "skipped", "reason": reason})
+            append_opportunity_log({
+                **opportunity_base,
+                "action": "rejected",
+                "reason": reason,
+                "losses_today": daily_stop_losses,
+                "orders_today": daily_new_orders,
+            })
+            continue
+
+        if has_daily_ticker_loss(_trade_log_snapshot, _today_str, ticker):
+            reason = "daily_ticker_loss_cooldown"
+            append_score_log({**opportunity_base, "action": "skipped", "reason": reason})
+            append_opportunity_log({
+                **opportunity_base,
+                "action": "rejected",
+                "reason": reason,
+                "ticker": ticker,
+            })
+            continue
+
+        setup_reason = setup_quality_reject_reason(s)
+        if setup_reason:
+            append_score_log({**opportunity_base, "action": "skipped", "reason": setup_reason})
+            append_opportunity_log({
+                **opportunity_base,
+                "action": "rejected",
+                "reason": setup_reason,
+                "setup_quality_reasons": s.get("setup_quality_reasons", []),
             })
             continue
 

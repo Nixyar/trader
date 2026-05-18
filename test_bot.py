@@ -1610,6 +1610,35 @@ class TestExecutionRecording(unittest.TestCase):
         self.assertFalse(active)
         self.assertEqual(losses, 0)
 
+    def test_daily_new_order_count_ignores_virtual_trades(self):
+        count = mb.count_daily_new_orders([
+            {"signal_id": "A", "date": "2026-05-18", "executed": True},
+            {"signal_id": "B", "date": "2026-05-18", "execution_status": "virtual", "executed": False},
+            {"signal_id": "C", "date": "2026-05-17", "executed": True},
+        ], "2026-05-18")
+
+        self.assertEqual(count, 1)
+
+    def test_daily_ticker_loss_cooldown_detects_same_ticker_loss(self):
+        self.assertTrue(mb.has_daily_ticker_loss([
+            {
+                "ticker": "GAZP",
+                "result": "loss",
+                "pnl_pct": -2.94,
+                "exit_time": "2026-05-18 18:36",
+                "executed": True,
+            },
+        ], "2026-05-18", "GAZP"))
+        self.assertFalse(mb.has_daily_ticker_loss([
+            {
+                "ticker": "GAZP",
+                "result": "loss",
+                "pnl_pct": -2.94,
+                "exit_time": "2026-05-17 18:36",
+                "executed": True,
+            },
+        ], "2026-05-18", "GAZP"))
+
     def test_strategy_performance_guard_blocks_negative_edge(self):
         reason, meta = mb.strategy_performance_guard_reason(
             {"strategy": "news_event", "confidence_score": 21},
@@ -2139,6 +2168,41 @@ class TestH1WatchHelpers(unittest.TestCase):
         )
 
         self.assertEqual(reason, "news_event_conflict")
+
+    def test_setup_quality_requires_core_trade_thesis(self):
+        quality, score, reasons = mb.evaluate_setup_quality({
+            "direction": "LONG",
+            "volume_ratio": 1.6,
+            "vwap_confirm": None,
+            "news_agree": 1,
+            "news_oppose": 0,
+            "data_quality_flags": [],
+        })
+
+        self.assertEqual(quality, "D")
+        self.assertLess(score, 2)
+        self.assertIn("news_aligned", reasons)
+
+    def test_setup_quality_marks_h1_volume_vwap_as_tradable(self):
+        quality, score, reasons = mb.evaluate_setup_quality({
+            "direction": "SHORT",
+            "h1_confirm": {"type": "momentum"},
+            "volume_ratio": 3.5,
+            "vwap_confirm": True,
+            "weekly_aligned": True,
+            "data_quality_flags": [],
+        })
+
+        self.assertEqual(quality, "A")
+        self.assertGreaterEqual(score, 4)
+        self.assertIn("h1_momentum", reasons)
+
+    def test_setup_quality_rejects_low_quality_auto_order(self):
+        self.assertEqual(
+            mb.setup_quality_reject_reason({"setup_quality": "C"}),
+            "setup_quality_low",
+        )
+        self.assertIsNone(mb.setup_quality_reject_reason({"setup_quality": "B"}))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
