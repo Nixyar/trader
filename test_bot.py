@@ -2169,6 +2169,41 @@ class TestH1WatchHelpers(unittest.TestCase):
 
         self.assertEqual(reason, "news_event_conflict")
 
+    def test_setup_quality_requires_core_trade_thesis(self):
+        quality, score, reasons = mb.evaluate_setup_quality({
+            "direction": "LONG",
+            "volume_ratio": 1.6,
+            "vwap_confirm": None,
+            "news_agree": 1,
+            "news_oppose": 0,
+            "data_quality_flags": [],
+        })
+
+        self.assertEqual(quality, "D")
+        self.assertLess(score, 2)
+        self.assertIn("news_aligned", reasons)
+
+    def test_setup_quality_marks_h1_volume_vwap_as_tradable(self):
+        quality, score, reasons = mb.evaluate_setup_quality({
+            "direction": "SHORT",
+            "h1_confirm": {"type": "momentum"},
+            "volume_ratio": 3.5,
+            "vwap_confirm": True,
+            "weekly_aligned": True,
+            "data_quality_flags": [],
+        })
+
+        self.assertEqual(quality, "A")
+        self.assertGreaterEqual(score, 4)
+        self.assertIn("h1_momentum", reasons)
+
+    def test_setup_quality_rejects_low_quality_auto_order(self):
+        self.assertEqual(
+            mb.setup_quality_reject_reason({"setup_quality": "C"}),
+            "setup_quality_low",
+        )
+        self.assertIsNone(mb.setup_quality_reject_reason({"setup_quality": "B"}))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ЗАПУСК
