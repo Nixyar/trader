@@ -1610,6 +1610,39 @@ class TestExecutionRecording(unittest.TestCase):
         self.assertFalse(active)
         self.assertEqual(losses, 0)
 
+    def test_strategy_performance_guard_blocks_negative_edge(self):
+        reason, meta = mb.strategy_performance_guard_reason(
+            {"strategy": "news_event", "confidence_score": 21},
+            [
+                {"strategy": "news_event", "pnl_pct": -1.0, "exit_time": "2026-05-10", "executed": True},
+                {"strategy": "news_event", "pnl_pct": -0.8, "exit_time": "2026-05-11", "executed": True},
+                {"strategy": "news_event", "pnl_pct": 0.4, "exit_time": "2026-05-12", "executed": True},
+                {"strategy": "news_event", "pnl_pct": -1.2, "exit_time": "2026-05-13", "executed": True},
+                {"strategy": "news_event", "pnl_pct": -0.3, "exit_time": "2026-05-14", "executed": True},
+                {"strategy": "index_rebound", "pnl_pct": -5.0, "exit_time": "2026-05-14", "executed": True},
+            ],
+            min_trades=5,
+            min_pnl=0.0,
+            min_winrate=45.0,
+        )
+
+        self.assertEqual(reason, "strategy_perf_guard")
+        self.assertEqual(meta["strategy_label"], "news_event")
+        self.assertEqual(meta["closed"], 5)
+
+    def test_strategy_performance_guard_allows_small_sample(self):
+        reason, meta = mb.strategy_performance_guard_reason(
+            {"strategy": "news_event", "confidence_score": 21},
+            [
+                {"strategy": "news_event", "pnl_pct": -1.0, "exit_time": "2026-05-10", "executed": True},
+                {"strategy": "news_event", "pnl_pct": -0.8, "exit_time": "2026-05-11", "executed": True},
+            ],
+            min_trades=5,
+        )
+
+        self.assertIsNone(reason)
+        self.assertEqual(meta["closed"], 2)
+
     def test_close_failure_does_not_mark_trade_result(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             trade_file = os.path.join(tmpdir, "trade_log.json")

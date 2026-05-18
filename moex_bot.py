@@ -737,6 +737,9 @@ MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "2.0"))
 # are rejected while stop/target monitoring continues. 0 disables the guard.
 MAX_DAILY_STOP_LOSSES = int(os.environ.get("MAX_DAILY_STOP_LOSSES", "2"))
 NEWS_EVENT_AUTO_MIN_SCORE = int(os.environ.get("NEWS_EVENT_AUTO_MIN_SCORE", "18"))
+STRATEGY_PERF_GUARD_MIN_TRADES = int(os.environ.get("STRATEGY_PERF_GUARD_MIN_TRADES", "5"))
+STRATEGY_PERF_GUARD_MIN_PNL = float(os.environ.get("STRATEGY_PERF_GUARD_MIN_PNL", "0.0"))
+STRATEGY_PERF_GUARD_MIN_WINRATE = float(os.environ.get("STRATEGY_PERF_GUARD_MIN_WINRATE", "45.0"))
 
 # Кулдаун после target2 / stop_hit в том же направлении (anti-chasing).
 # Кейс 16.04: CBOM target2 → через 27 мин v2 вошёл на эйфории → stop_hit.
@@ -6170,6 +6173,61 @@ def check_daily_stop_loss_brake(
     return losses >= threshold, losses
 
 
+def _strategy_label(signal_or_trade: dict) -> str:
+    return str(
+        signal_or_trade.get("strategy")
+        or signal_or_trade.get("h1_type")
+        or signal_or_trade.get("pattern")
+        or "UNSPECIFIED"
+    )
+
+
+def strategy_performance_guard_reason(
+    signal: dict,
+    trade_log: list[dict],
+    *,
+    min_trades: int | None = None,
+    min_pnl: float | None = None,
+    min_winrate: float | None = None,
+) -> tuple[str | None, dict]:
+    """Block auto-order when this strategy's realized rolling edge is poor."""
+    threshold_trades = STRATEGY_PERF_GUARD_MIN_TRADES if min_trades is None else min_trades
+    pnl_floor = STRATEGY_PERF_GUARD_MIN_PNL if min_pnl is None else min_pnl
+    winrate_floor = STRATEGY_PERF_GUARD_MIN_WINRATE if min_winrate is None else min_winrate
+    if threshold_trades <= 0:
+        return None, {}
+
+    label = _strategy_label(signal)
+    rows: list[dict] = []
+    for row in trade_log:
+        if not isinstance(row, dict):
+            continue
+        if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
+            continue
+        if row.get("pnl_pct") is None or not row.get("exit_time"):
+            continue
+        if _strategy_label(row) == label:
+            rows.append(row)
+
+    rows = sorted(rows, key=lambda row: str(row.get("exit_time") or ""))[-10:]
+    if len(rows) < threshold_trades:
+        return None, {"strategy_label": label, "closed": len(rows)}
+
+    pnls = [float(row.get("pnl_pct") or 0) for row in rows]
+    wins = sum(1 for pnl in pnls if pnl > 0)
+    total_pnl = round(sum(pnls), 2)
+    winrate = round(wins / len(pnls) * 100, 1)
+    meta = {
+        "strategy_label": label,
+        "closed": len(rows),
+        "total_pnl": total_pnl,
+        "winrate": winrate,
+    }
+    if total_pnl < pnl_floor and winrate < winrate_floor:
+        return "strategy_perf_guard", meta
+    return None, meta
+
+
 def sandbox_strategy_reject_reason(
     signal: dict,
     quality_flags: set[str] | None = None,
@@ -6363,11 +6421,16 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                     RISK_PCT * _day_risk_mult, MONDAY_RISK_MULT)
 
     _today_str = _now_msk.strftime("%Y-%m-%d")
+    _trade_log_snapshot: list[dict] = []
+    try:
+        _trade_log_snapshot = load_trade_log()
+    except Exception as _e:
+        logger.warning("trade_log load failed: %s", _e)
     daily_stop_brake_active = False
     daily_stop_losses = 0
     try:
         daily_stop_brake_active, daily_stop_losses = check_daily_stop_loss_brake(
-            load_trade_log(), _today_str
+            _trade_log_snapshot, _today_str
         )
     except Exception as _e:
         logger.warning("daily_stop_loss_brake check failed: %s", _e)
@@ -6438,6 +6501,17 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                 "action": "rejected",
                 "reason": reason,
                 "losses_today": daily_stop_losses,
+            })
+            continue
+
+        perf_reason, perf_meta = strategy_performance_guard_reason(s, _trade_log_snapshot)
+        if perf_reason:
+            append_score_log({**opportunity_base, "action": "skipped", "reason": perf_reason, **perf_meta})
+            append_opportunity_log({
+                **opportunity_base,
+                "action": "rejected",
+                "reason": perf_reason,
+                **perf_meta,
             })
             continue
 
