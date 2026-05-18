@@ -1610,6 +1610,35 @@ class TestExecutionRecording(unittest.TestCase):
         self.assertFalse(active)
         self.assertEqual(losses, 0)
 
+    def test_daily_new_order_count_ignores_virtual_trades(self):
+        count = mb.count_daily_new_orders([
+            {"signal_id": "A", "date": "2026-05-18", "executed": True},
+            {"signal_id": "B", "date": "2026-05-18", "execution_status": "virtual", "executed": False},
+            {"signal_id": "C", "date": "2026-05-17", "executed": True},
+        ], "2026-05-18")
+
+        self.assertEqual(count, 1)
+
+    def test_daily_ticker_loss_cooldown_detects_same_ticker_loss(self):
+        self.assertTrue(mb.has_daily_ticker_loss([
+            {
+                "ticker": "GAZP",
+                "result": "loss",
+                "pnl_pct": -2.94,
+                "exit_time": "2026-05-18 18:36",
+                "executed": True,
+            },
+        ], "2026-05-18", "GAZP"))
+        self.assertFalse(mb.has_daily_ticker_loss([
+            {
+                "ticker": "GAZP",
+                "result": "loss",
+                "pnl_pct": -2.94,
+                "exit_time": "2026-05-17 18:36",
+                "executed": True,
+            },
+        ], "2026-05-18", "GAZP"))
+
     def test_strategy_performance_guard_blocks_negative_edge(self):
         reason, meta = mb.strategy_performance_guard_reason(
             {"strategy": "news_event", "confidence_score": 21},

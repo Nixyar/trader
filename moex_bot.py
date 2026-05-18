@@ -736,6 +736,7 @@ MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "2.0"))
 # Intraday loss-streak brake: after N confirmed losing closes today, new entries
 # are rejected while stop/target monitoring continues. 0 disables the guard.
 MAX_DAILY_STOP_LOSSES = int(os.environ.get("MAX_DAILY_STOP_LOSSES", "2"))
+MAX_DAILY_NEW_ORDERS_AFTER_LOSS = int(os.environ.get("MAX_DAILY_NEW_ORDERS_AFTER_LOSS", "0"))
 NEWS_EVENT_AUTO_MIN_SCORE = int(os.environ.get("NEWS_EVENT_AUTO_MIN_SCORE", "18"))
 STRATEGY_PERF_GUARD_MIN_TRADES = int(os.environ.get("STRATEGY_PERF_GUARD_MIN_TRADES", "5"))
 STRATEGY_PERF_GUARD_MIN_PNL = float(os.environ.get("STRATEGY_PERF_GUARD_MIN_PNL", "0.0"))
@@ -6173,6 +6174,43 @@ def check_daily_stop_loss_brake(
     return losses >= threshold, losses
 
 
+def count_daily_new_orders(trade_log: list[dict], date_str: str) -> int:
+    count = 0
+    for row in trade_log:
+        if not isinstance(row, dict):
+            continue
+        if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
+            continue
+        if str(row.get("date") or "").startswith(date_str):
+            count += 1
+    return count
+
+
+def has_daily_ticker_loss(
+    trade_log: list[dict],
+    date_str: str,
+    ticker: str,
+) -> bool:
+    for row in trade_log:
+        if not isinstance(row, dict):
+            continue
+        if row.get("ticker") != ticker:
+            continue
+        if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
+            continue
+        if not str(row.get("exit_time") or "").startswith(date_str):
+            continue
+        result = str(row.get("result") or "").lower()
+        if result in {"loss", "stop"}:
+            return True
+        try:
+            if row.get("pnl_pct") is not None and float(row.get("pnl_pct")) < 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _strategy_label(signal_or_trade: dict) -> str:
     return str(
         signal_or_trade.get("strategy")
@@ -6428,6 +6466,7 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
         logger.warning("trade_log load failed: %s", _e)
     daily_stop_brake_active = False
     daily_stop_losses = 0
+    daily_new_orders = count_daily_new_orders(_trade_log_snapshot, _today_str)
     try:
         daily_stop_brake_active, daily_stop_losses = check_daily_stop_loss_brake(
             _trade_log_snapshot, _today_str
@@ -6501,6 +6540,29 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                 "action": "rejected",
                 "reason": reason,
                 "losses_today": daily_stop_losses,
+            })
+            continue
+
+        if daily_stop_losses > 0 and daily_new_orders >= MAX_DAILY_NEW_ORDERS_AFTER_LOSS:
+            reason = "post_loss_new_order_brake"
+            append_score_log({**opportunity_base, "action": "skipped", "reason": reason})
+            append_opportunity_log({
+                **opportunity_base,
+                "action": "rejected",
+                "reason": reason,
+                "losses_today": daily_stop_losses,
+                "orders_today": daily_new_orders,
+            })
+            continue
+
+        if has_daily_ticker_loss(_trade_log_snapshot, _today_str, ticker):
+            reason = "daily_ticker_loss_cooldown"
+            append_score_log({**opportunity_base, "action": "skipped", "reason": reason})
+            append_opportunity_log({
+                **opportunity_base,
+                "action": "rejected",
+                "reason": reason,
+                "ticker": ticker,
             })
             continue
 
