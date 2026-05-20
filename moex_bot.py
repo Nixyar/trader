@@ -742,6 +742,10 @@ AUTO_ORDER_MIN_SETUP_QUALITY = os.environ.get("AUTO_ORDER_MIN_SETUP_QUALITY", "B
 STRATEGY_PERF_GUARD_MIN_TRADES = int(os.environ.get("STRATEGY_PERF_GUARD_MIN_TRADES", "5"))
 STRATEGY_PERF_GUARD_MIN_PNL = float(os.environ.get("STRATEGY_PERF_GUARD_MIN_PNL", "0.0"))
 STRATEGY_PERF_GUARD_MIN_WINRATE = float(os.environ.get("STRATEGY_PERF_GUARD_MIN_WINRATE", "45.0"))
+RECENT_PERF_GUARD_MIN_TRADES = int(os.environ.get("RECENT_PERF_GUARD_MIN_TRADES", "8"))
+RECENT_PERF_GUARD_MIN_PNL = float(os.environ.get("RECENT_PERF_GUARD_MIN_PNL", "0.0"))
+RECENT_PERF_GUARD_MIN_WINRATE = float(os.environ.get("RECENT_PERF_GUARD_MIN_WINRATE", "45.0"))
+RECENT_PERF_STRICT_QUALITY = os.environ.get("RECENT_PERF_STRICT_QUALITY", "A").upper()
 
 # Кулдаун после target2 / stop_hit в том же направлении (anti-chasing).
 # Кейс 16.04: CBOM target2 → через 27 мин v2 вошёл на эйфории → stop_hit.
@@ -3559,6 +3563,46 @@ def setup_quality_reject_reason(signal: dict) -> str | None:
     if _SETUP_QUALITY_RANK.get(str(quality), 0) < _SETUP_QUALITY_RANK[min_quality]:
         return "setup_quality_low"
     return None
+
+
+def recent_performance_guard(
+    trade_log: list[dict],
+    *,
+    min_trades: int | None = None,
+    min_pnl: float | None = None,
+    min_winrate: float | None = None,
+) -> tuple[bool, dict]:
+    """Return probation mode when recent realized trades show poor broad edge."""
+    threshold_trades = RECENT_PERF_GUARD_MIN_TRADES if min_trades is None else min_trades
+    pnl_floor = RECENT_PERF_GUARD_MIN_PNL if min_pnl is None else min_pnl
+    winrate_floor = RECENT_PERF_GUARD_MIN_WINRATE if min_winrate is None else min_winrate
+    if threshold_trades <= 0:
+        return False, {}
+
+    rows: list[dict] = []
+    for row in trade_log:
+        if not isinstance(row, dict):
+            continue
+        if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
+            continue
+        if row.get("pnl_pct") is None or not row.get("exit_time"):
+            continue
+        rows.append(row)
+
+    rows = sorted(rows, key=lambda row: str(row.get("exit_time") or ""))[-threshold_trades:]
+    if len(rows) < threshold_trades:
+        return False, {"closed": len(rows)}
+
+    pnls = [float(row.get("pnl_pct") or 0) for row in rows]
+    wins = sum(1 for pnl in pnls if pnl > 0)
+    total_pnl = round(sum(pnls), 2)
+    winrate = round(wins / len(pnls) * 100, 1)
+    active = total_pnl < pnl_floor and winrate < winrate_floor
+    return active, {
+        "closed": len(rows),
+        "total_pnl": total_pnl,
+        "winrate": winrate,
+    }
 
 
 def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem]) -> list[dict]:
@@ -6584,6 +6628,7 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
     daily_stop_brake_active = False
     daily_stop_losses = 0
     daily_new_orders = count_daily_new_orders(_trade_log_snapshot, _today_str)
+    recent_perf_active, recent_perf_meta = recent_performance_guard(_trade_log_snapshot)
     try:
         daily_stop_brake_active, daily_stop_losses = check_daily_stop_loss_brake(
             _trade_log_snapshot, _today_str
@@ -6695,6 +6740,25 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                 "setup_quality_reasons": s.get("setup_quality_reasons", []),
             })
             continue
+
+        if recent_perf_active:
+            strict_quality = RECENT_PERF_STRICT_QUALITY
+            if strict_quality not in _SETUP_QUALITY_RANK:
+                strict_quality = "A"
+            current_quality = str(s.get("setup_quality") or "D")
+            if _SETUP_QUALITY_RANK.get(current_quality, 0) < _SETUP_QUALITY_RANK[strict_quality]:
+                reason = "recent_perf_quality_gate"
+                append_score_log({**opportunity_base, "action": "skipped", "reason": reason, **recent_perf_meta})
+                append_opportunity_log({
+                    **opportunity_base,
+                    "action": "rejected",
+                    "reason": reason,
+                    "required_setup_quality": strict_quality,
+                    **recent_perf_meta,
+                })
+                continue
+            risk_multiplier *= 0.5
+            _conf_pos_pct = min(_conf_pos_pct, 5.0)
 
         perf_reason, perf_meta = strategy_performance_guard_reason(s, _trade_log_snapshot)
         if perf_reason:
