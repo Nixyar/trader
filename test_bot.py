@@ -2204,6 +2204,42 @@ class TestH1WatchHelpers(unittest.TestCase):
         )
         self.assertIsNone(mb.setup_quality_reject_reason({"setup_quality": "B"}))
 
+    def test_recent_performance_guard_detects_bad_rolling_edge(self):
+        trades = [
+            {
+                "ticker": f"T{i}",
+                "exit_time": f"2026-05-{10 + i:02d} 18:00",
+                "pnl_pct": pnl,
+                "executed": True,
+                "execution_status": "closed",
+            }
+            for i, pnl in enumerate([-1.0, -0.8, 0.5, -1.2, -0.4, 0.7, -1.1, -0.9])
+        ]
+
+        active, meta = mb.recent_performance_guard(trades, min_trades=8, min_pnl=0.0, min_winrate=45.0)
+
+        self.assertTrue(active)
+        self.assertEqual(meta["closed"], 8)
+        self.assertLess(meta["total_pnl"], 0)
+        self.assertLess(meta["winrate"], 45.0)
+
+    def test_recent_performance_guard_allows_good_rolling_edge(self):
+        trades = [
+            {
+                "ticker": f"T{i}",
+                "exit_time": f"2026-05-{10 + i:02d} 18:00",
+                "pnl_pct": pnl,
+                "executed": True,
+                "execution_status": "closed",
+            }
+            for i, pnl in enumerate([1.0, -0.8, 0.5, 1.2, -0.4, 0.7, 1.1, -0.9])
+        ]
+
+        active, meta = mb.recent_performance_guard(trades, min_trades=8, min_pnl=0.0, min_winrate=45.0)
+
+        self.assertFalse(active)
+        self.assertEqual(meta["closed"], 8)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ЗАПУСК
