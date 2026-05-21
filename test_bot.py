@@ -2240,6 +2240,17 @@ class TestH1WatchHelpers(unittest.TestCase):
         self.assertFalse(active)
         self.assertEqual(meta["closed"], 8)
 
+    def test_count_open_portfolio_positions_ignores_cash(self):
+        count = mb.count_open_portfolio_positions({
+            "positions": [
+                {"ticker": "RUB000UTSTOM", "quantity": 1000},
+                {"ticker": "ROSN", "quantity": -249},
+                {"ticker": "MOEX", "quantity": 0},
+            ]
+        })
+
+        self.assertEqual(count, 1)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ЗАПУСК

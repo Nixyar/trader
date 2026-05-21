@@ -746,6 +746,7 @@ RECENT_PERF_GUARD_MIN_TRADES = int(os.environ.get("RECENT_PERF_GUARD_MIN_TRADES"
 RECENT_PERF_GUARD_MIN_PNL = float(os.environ.get("RECENT_PERF_GUARD_MIN_PNL", "0.0"))
 RECENT_PERF_GUARD_MIN_WINRATE = float(os.environ.get("RECENT_PERF_GUARD_MIN_WINRATE", "45.0"))
 RECENT_PERF_STRICT_QUALITY = os.environ.get("RECENT_PERF_STRICT_QUALITY", "A").upper()
+RECENT_PERF_MAX_OPEN_POSITIONS = int(os.environ.get("RECENT_PERF_MAX_OPEN_POSITIONS", "1"))
 
 # Кулдаун после target2 / stop_hit в том же направлении (anti-chasing).
 # Кейс 16.04: CBOM target2 → через 27 мин v2 вошёл на эйфории → stop_hit.
@@ -3603,6 +3604,18 @@ def recent_performance_guard(
         "total_pnl": total_pnl,
         "winrate": winrate,
     }
+
+
+def count_open_portfolio_positions(portfolio: dict | None) -> int:
+    if not portfolio:
+        return 0
+    count = 0
+    for pos in portfolio.get("positions") or []:
+        ticker = pos.get("ticker")
+        qty = pos.get("quantity", 0) or 0
+        if ticker and ticker not in _CASH_TICKERS and qty:
+            count += 1
+    return count
 
 
 def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem]) -> list[dict]:
@@ -6629,6 +6642,7 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
     daily_stop_losses = 0
     daily_new_orders = count_daily_new_orders(_trade_log_snapshot, _today_str)
     recent_perf_active, recent_perf_meta = recent_performance_guard(_trade_log_snapshot)
+    open_portfolio_positions = count_open_portfolio_positions(_portfolio_snapshot)
     try:
         daily_stop_brake_active, daily_stop_losses = check_daily_stop_loss_brake(
             _trade_log_snapshot, _today_str
@@ -6742,6 +6756,27 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
             continue
 
         if recent_perf_active:
+            if (
+                RECENT_PERF_MAX_OPEN_POSITIONS >= 0
+                and open_portfolio_positions >= RECENT_PERF_MAX_OPEN_POSITIONS
+            ):
+                reason = "recent_perf_open_exposure_gate"
+                append_score_log({
+                    **opportunity_base,
+                    "action": "skipped",
+                    "reason": reason,
+                    "open_positions": open_portfolio_positions,
+                    **recent_perf_meta,
+                })
+                append_opportunity_log({
+                    **opportunity_base,
+                    "action": "rejected",
+                    "reason": reason,
+                    "open_positions": open_portfolio_positions,
+                    "max_open_positions": RECENT_PERF_MAX_OPEN_POSITIONS,
+                    **recent_perf_meta,
+                })
+                continue
             strict_quality = RECENT_PERF_STRICT_QUALITY
             if strict_quality not in _SETUP_QUALITY_RANK:
                 strict_quality = "A"
