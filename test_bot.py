@@ -1032,6 +1032,17 @@ class TestDailyReportDiagnostics(unittest.TestCase):
         self.assertEqual(rows["BREAKOUT"]["closed"], 0)
         self.assertEqual(rows["BREAKOUT"]["total_pnl"], 0.0)
 
+    def test_strategy_results_exclude_anomalous_pnl(self):
+        summary = dr.summarize_strategy_results([
+            {"pattern": "H1", "executed": True, "pnl_pct": 2.0},
+            {"pattern": "H1", "executed": True, "pnl_pct": -63.99},
+        ])
+        row = {row["pattern"]: row for row in summary["patterns"]}["H1"]
+
+        self.assertEqual(row["closed"], 1)
+        self.assertEqual(row["total_pnl"], 2.0)
+        self.assertEqual(row["pnl_anomaly"], 1)
+
     def test_network_and_uid_summaries_parse_log_lines(self):
         lines = [
             "2026-04-23 12:00:00 [WARNING] moex_bot: get_candles(SBER): transient network error, retry 1/2: timeout",
@@ -1672,6 +1683,39 @@ class TestExecutionRecording(unittest.TestCase):
         self.assertIsNone(reason)
         self.assertEqual(meta["closed"], 2)
 
+    def test_recent_performance_guard_excludes_anomalous_pnl(self):
+        trades = [{"ticker": "MTSS", "pnl_pct": -63.99, "exit_time": "2026-05-22", "executed": True}]
+        trades.extend(
+            {"ticker": f"T{i}", "pnl_pct": pnl, "exit_time": f"2026-05-{10+i:02d}", "executed": True}
+            for i, pnl in enumerate([1.0, -0.5, 0.7, -0.4, 0.6])
+        )
+        active, meta = mb.recent_performance_guard(trades, min_trades=5, min_pnl=0.0, min_winrate=45.0)
+
+        self.assertFalse(active)
+        self.assertEqual(meta["closed"], 5)
+
+    def test_weekly_target_status_uses_rub_and_excludes_anomalies(self):
+        status = mb.weekly_target_status([
+            {
+                "ticker": "ROSN",
+                "pnl_pct": 2.91,
+                "position_rub": 100000,
+                "exit_time": "2026-05-25 14:17",
+                "executed": True,
+            },
+            {
+                "ticker": "MTSS",
+                "pnl_pct": -63.99,
+                "position_rub": 100000,
+                "exit_time": "2026-05-25 11:46",
+                "executed": True,
+            },
+        ], now=datetime(2026, 5, 25, 19, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(status["closed"], 1)
+        self.assertEqual(status["realized_rub"], 2910.0)
+        self.assertEqual(status["anomalies_excluded"], 1)
+
     def test_close_failure_does_not_mark_trade_result(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             trade_file = os.path.join(tmpdir, "trade_log.json")
@@ -2239,6 +2283,17 @@ class TestH1WatchHelpers(unittest.TestCase):
 
         self.assertFalse(active)
         self.assertEqual(meta["closed"], 8)
+
+    def test_count_open_portfolio_positions_ignores_cash(self):
+        count = mb.count_open_portfolio_positions({
+            "positions": [
+                {"ticker": "RUB000UTSTOM", "quantity": 1000},
+                {"ticker": "ROSN", "quantity": -249},
+                {"ticker": "MOEX", "quantity": 0},
+            ]
+        })
+
+        self.assertEqual(count, 1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

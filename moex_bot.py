@@ -746,6 +746,14 @@ RECENT_PERF_GUARD_MIN_TRADES = int(os.environ.get("RECENT_PERF_GUARD_MIN_TRADES"
 RECENT_PERF_GUARD_MIN_PNL = float(os.environ.get("RECENT_PERF_GUARD_MIN_PNL", "0.0"))
 RECENT_PERF_GUARD_MIN_WINRATE = float(os.environ.get("RECENT_PERF_GUARD_MIN_WINRATE", "45.0"))
 RECENT_PERF_STRICT_QUALITY = os.environ.get("RECENT_PERF_STRICT_QUALITY", "A").upper()
+RECENT_PERF_MAX_OPEN_POSITIONS = int(os.environ.get("RECENT_PERF_MAX_OPEN_POSITIONS", "1"))
+MAX_REALISTIC_TRADE_PNL_PCT = float(os.environ.get("MAX_REALISTIC_TRADE_PNL_PCT", "25.0"))
+WEEKLY_PROFIT_TARGET_RUB = float(os.environ.get("WEEKLY_PROFIT_TARGET_RUB", "10000"))
+WEEKLY_PROFIT_LOCK_RUB = float(os.environ.get("WEEKLY_PROFIT_LOCK_RUB", "8000"))
+WEEKLY_DRAWDOWN_GUARD_RUB = float(os.environ.get("WEEKLY_DRAWDOWN_GUARD_RUB", "-5000"))
+WEEKLY_TARGET_RISK_BOOST = float(os.environ.get("WEEKLY_TARGET_RISK_BOOST", "1.15"))
+WEEKLY_TARGET_MIN_SETUP_QUALITY = os.environ.get("WEEKLY_TARGET_MIN_SETUP_QUALITY", "A").upper()
+WEEKLY_TARGET_EST_POSITION_RUB = float(os.environ.get("WEEKLY_TARGET_EST_POSITION_RUB", "100000"))
 
 # Кулдаун после target2 / stop_hit в том же направлении (anti-chasing).
 # Кейс 16.04: CBOM target2 → через 27 мин v2 вошёл на эйфории → stop_hit.
@@ -3565,6 +3573,36 @@ def setup_quality_reject_reason(signal: dict) -> str | None:
     return None
 
 
+def is_realized_trade_row(row: dict) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
+        return False
+    return row.get("pnl_pct") is not None and bool(row.get("exit_time"))
+
+
+def is_anomalous_trade_pnl(row: dict, *, max_abs_pct: float | None = None) -> bool:
+    threshold = MAX_REALISTIC_TRADE_PNL_PCT if max_abs_pct is None else max_abs_pct
+    try:
+        return abs(float(row.get("pnl_pct"))) > threshold
+    except (TypeError, ValueError):
+        return True
+
+
+def trade_realized_pnl_rub(row: dict) -> float:
+    try:
+        pnl_pct = float(row.get("pnl_pct") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    try:
+        position_rub = float(row.get("position_rub") or 0.0)
+    except (TypeError, ValueError):
+        position_rub = 0.0
+    if position_rub <= 0:
+        position_rub = WEEKLY_TARGET_EST_POSITION_RUB
+    return round(position_rub * pnl_pct / 100.0, 2)
+
+
 def recent_performance_guard(
     trade_log: list[dict],
     *,
@@ -3581,11 +3619,7 @@ def recent_performance_guard(
 
     rows: list[dict] = []
     for row in trade_log:
-        if not isinstance(row, dict):
-            continue
-        if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
-            continue
-        if row.get("pnl_pct") is None or not row.get("exit_time"):
+        if not is_realized_trade_row(row) or is_anomalous_trade_pnl(row):
             continue
         rows.append(row)
 
@@ -3603,6 +3637,56 @@ def recent_performance_guard(
         "total_pnl": total_pnl,
         "winrate": winrate,
     }
+
+
+def weekly_target_status(
+    trade_log: list[dict],
+    *,
+    now: datetime | None = None,
+) -> dict:
+    now_dt = now or now_msk()
+    week_start = (now_dt - timedelta(days=now_dt.weekday())).date()
+    rows: list[dict] = []
+    anomalies = 0
+    for row in trade_log:
+        if not is_realized_trade_row(row):
+            continue
+        if is_anomalous_trade_pnl(row):
+            anomalies += 1
+            continue
+        exit_day = str(row.get("exit_time") or "")[:10]
+        try:
+            exit_date = datetime.strptime(exit_day, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if exit_date >= week_start:
+            rows.append(row)
+    realized_rub = round(sum(trade_realized_pnl_rub(row) for row in rows), 2)
+    pnls = [float(row.get("pnl_pct") or 0.0) for row in rows]
+    wins = sum(1 for pnl in pnls if pnl > 0)
+    return {
+        "week_start": week_start.isoformat(),
+        "closed": len(rows),
+        "wins": wins,
+        "losses": sum(1 for pnl in pnls if pnl < 0),
+        "winrate": round(wins / len(rows) * 100, 1) if rows else 0.0,
+        "realized_rub": realized_rub,
+        "target_rub": WEEKLY_PROFIT_TARGET_RUB,
+        "to_target_rub": round(WEEKLY_PROFIT_TARGET_RUB - realized_rub, 2),
+        "anomalies_excluded": anomalies,
+    }
+
+
+def count_open_portfolio_positions(portfolio: dict | None) -> int:
+    if not portfolio:
+        return 0
+    count = 0
+    for pos in portfolio.get("positions") or []:
+        ticker = pos.get("ticker")
+        qty = pos.get("quantity", 0) or 0
+        if ticker and ticker not in _CASH_TICKERS and qty:
+            count += 1
+    return count
 
 
 def synthesize_signals(market_signals: list[dict], news_signals: list[NewsItem]) -> list[dict]:
@@ -5257,6 +5341,33 @@ def update_trade_execution_status(
         save_trade_log(log)
 
 
+def update_trade_open_details(
+    signal_id: str,
+    *,
+    lots: int | float | None,
+    lot_size: int | float | None,
+    entry: float | None,
+    equity: float | None,
+    risk_rub: float | None,
+    setup_quality: str | None,
+) -> None:
+    log = load_trade_log()
+    updated = False
+    for row in log:
+        if row.get("signal_id") != signal_id:
+            continue
+        row["lots"] = lots
+        row["lot_size"] = lot_size
+        row["position_rub"] = round(float(lots or 0) * float(lot_size or 1) * float(entry or 0), 2)
+        row["equity_at_open"] = round(float(equity or 0), 2) if equity else None
+        row["risk_rub"] = round(float(risk_rub or 0), 2) if risk_rub else None
+        row["setup_quality"] = setup_quality
+        updated = True
+        break
+    if updated:
+        save_trade_log(log)
+
+
 def update_trade_result(signal_id: str, result: str, exit_price: float | None = None,
                         state: dict | None = None) -> None:
     """
@@ -5306,6 +5417,18 @@ def update_trade_result(signal_id: str, result: str, exit_price: float | None = 
                 entry = r["entry"]
                 mult  = 1 if r.get("direction") == "LONG" else -1
                 r["pnl_pct"] = round(mult * (exit_price - entry) / entry * 100, 2)
+                try:
+                    pos_rub = float(r.get("position_rub") or 0)
+                except (TypeError, ValueError):
+                    pos_rub = 0.0
+                if pos_rub > 0:
+                    r["realized_pnl_rub"] = round(pos_rub * float(r["pnl_pct"]) / 100.0, 2)
+                if is_anomalous_trade_pnl(r):
+                    r["pnl_anomaly"] = True
+                    prev_notes = r.get("notes") or ""
+                    marker = "[PNL_ANOMALY_EXCLUDED_FROM_STATS]"
+                    if marker not in prev_notes:
+                        r["notes"] = (prev_notes + " " + marker).strip()
             if executed and _repair_anomalous_close_price(r, state if isinstance(state, dict) else {}):
                 logger.warning(
                     "[trade_log] repaired anomalous close price for %s: raw=%s fixed=%s",
@@ -6629,6 +6752,8 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
     daily_stop_losses = 0
     daily_new_orders = count_daily_new_orders(_trade_log_snapshot, _today_str)
     recent_perf_active, recent_perf_meta = recent_performance_guard(_trade_log_snapshot)
+    weekly_target_meta = weekly_target_status(_trade_log_snapshot, now=_now_msk)
+    open_portfolio_positions = count_open_portfolio_positions(_portfolio_snapshot)
     try:
         daily_stop_brake_active, daily_stop_losses = check_daily_stop_loss_brake(
             _trade_log_snapshot, _today_str
@@ -6692,6 +6817,8 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
             "news_mode": s.get("news_mode"),
             "setup_quality": s.get("setup_quality"),
             "setup_quality_score": s.get("setup_quality_score"),
+            "weekly_realized_rub": weekly_target_meta.get("realized_rub"),
+            "weekly_target_rub": weekly_target_meta.get("target_rub"),
             "decision_reasons": list(decision_reasons),
             "data_quality_flags": list(quality_flags),
         }
@@ -6742,6 +6869,27 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
             continue
 
         if recent_perf_active:
+            if (
+                RECENT_PERF_MAX_OPEN_POSITIONS >= 0
+                and open_portfolio_positions >= RECENT_PERF_MAX_OPEN_POSITIONS
+            ):
+                reason = "recent_perf_open_exposure_gate"
+                append_score_log({
+                    **opportunity_base,
+                    "action": "skipped",
+                    "reason": reason,
+                    "open_positions": open_portfolio_positions,
+                    **recent_perf_meta,
+                })
+                append_opportunity_log({
+                    **opportunity_base,
+                    "action": "rejected",
+                    "reason": reason,
+                    "open_positions": open_portfolio_positions,
+                    "max_open_positions": RECENT_PERF_MAX_OPEN_POSITIONS,
+                    **recent_perf_meta,
+                })
+                continue
             strict_quality = RECENT_PERF_STRICT_QUALITY
             if strict_quality not in _SETUP_QUALITY_RANK:
                 strict_quality = "A"
@@ -6759,6 +6907,49 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
                 continue
             risk_multiplier *= 0.5
             _conf_pos_pct = min(_conf_pos_pct, 5.0)
+
+        weekly_realized = float(weekly_target_meta.get("realized_rub") or 0.0)
+        weekly_common = {
+            "weekly_realized_rub": weekly_realized,
+            "weekly_target_rub": weekly_target_meta.get("target_rub"),
+            "weekly_closed": weekly_target_meta.get("closed"),
+            "weekly_anomalies_excluded": weekly_target_meta.get("anomalies_excluded"),
+        }
+        if weekly_realized <= WEEKLY_DRAWDOWN_GUARD_RUB:
+            reason = "weekly_drawdown_guard"
+            append_score_log({**opportunity_base, "action": "skipped", "reason": reason, **weekly_common})
+            append_opportunity_log({**opportunity_base, "action": "rejected", "reason": reason, **weekly_common})
+            continue
+        if weekly_realized >= WEEKLY_PROFIT_TARGET_RUB:
+            reason = "weekly_target_reached"
+            append_score_log({**opportunity_base, "action": "skipped", "reason": reason, **weekly_common})
+            append_opportunity_log({**opportunity_base, "action": "rejected", "reason": reason, **weekly_common})
+            continue
+        if weekly_realized >= WEEKLY_PROFIT_LOCK_RUB:
+            strict_quality = WEEKLY_TARGET_MIN_SETUP_QUALITY
+            if strict_quality not in _SETUP_QUALITY_RANK:
+                strict_quality = "A"
+            current_quality = str(s.get("setup_quality") or "D")
+            if _SETUP_QUALITY_RANK.get(current_quality, 0) < _SETUP_QUALITY_RANK[strict_quality]:
+                reason = "weekly_profit_lock"
+                append_score_log({**opportunity_base, "action": "skipped", "reason": reason, **weekly_common})
+                append_opportunity_log({
+                    **opportunity_base,
+                    "action": "rejected",
+                    "reason": reason,
+                    "required_setup_quality": strict_quality,
+                    **weekly_common,
+                })
+                continue
+            risk_multiplier *= 0.5
+            _conf_pos_pct = min(_conf_pos_pct, 5.0)
+        elif weekly_realized >= 0 and not recent_perf_active:
+            strict_quality = WEEKLY_TARGET_MIN_SETUP_QUALITY
+            if strict_quality not in _SETUP_QUALITY_RANK:
+                strict_quality = "A"
+            current_quality = str(s.get("setup_quality") or "D")
+            if _SETUP_QUALITY_RANK.get(current_quality, 0) >= _SETUP_QUALITY_RANK[strict_quality]:
+                risk_multiplier *= WEEKLY_TARGET_RISK_BOOST
 
         perf_reason, perf_meta = strategy_performance_guard_reason(s, _trade_log_snapshot)
         if perf_reason:
@@ -6846,6 +7037,7 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
         from tinvest_data import LOT_SIZE, get_lot_size  # type: ignore[import]
         lot_size  = get_lot_size(ticker)
         stop_dist = abs(entry - stop)
+        risk_rub = None
 
         if equity > 0 and stop_dist > 0 and entry > 0:
             risk_rub = equity * RISK_PCT / 100 * risk_multiplier
@@ -6962,6 +7154,15 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
             state[base_key]["execution_status"] = "filled"
             state[base_key]["sb_order_id"] = result.get("order_id")
             log_new_signal(s, base_key)
+            update_trade_open_details(
+                base_key,
+                lots=result.get("lots", lots),
+                lot_size=lot_size,
+                entry=entry,
+                equity=equity,
+                risk_rub=risk_rub,
+                setup_quality=s.get("setup_quality"),
+            )
             state[sb_key] = {
                 "ticker":       ticker,
                 "direction":    direction,

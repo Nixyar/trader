@@ -58,6 +58,7 @@ _NOW_MSK    = datetime.now(_MSK_TZ)
 TODAY_STR   = _NOW_MSK.strftime("%Y-%m-%d")
 TODAY_LABEL = _NOW_MSK.strftime("%d.%m.%Y")
 DAILY_DIAGNOSTICS_FILE = _DIR / f"daily_diagnostics_{TODAY_STR}.json"
+MAX_REALISTIC_TRADE_PNL_PCT = float(os.environ.get("MAX_REALISTIC_TRADE_PNL_PCT", "25.0"))
 _INSTRUMENT_ALIASES = {
     "BBG00F6NKQX3": "SMLT",
 }
@@ -442,13 +443,15 @@ def summarize_strategy_results(all_trades: list[dict]) -> dict:
         else:
             rec["virtual"] = int(rec.get("virtual", 0)) + 1
         pnl = t.get("pnl_pct")
-        if executed and pnl is not None:
+        if executed and pnl is not None and not _is_pnl_anomaly(t):
             rec["closed"] += 1
             rec["total_pnl"] += float(pnl)
             if float(pnl) > 0:
                 rec["wins"] += 1
             elif float(pnl) < 0:
                 rec["losses"] += 1
+        elif executed and pnl is not None and _is_pnl_anomaly(t):
+            rec["pnl_anomaly"] = int(rec.get("pnl_anomaly", 0)) + 1
 
     for rec in strategies.values():
         closed = int(rec["closed"])
@@ -639,6 +642,13 @@ def _is_executed(t: dict) -> bool:
     return True
 
 
+def _is_pnl_anomaly(t: dict) -> bool:
+    try:
+        return abs(float(t.get("pnl_pct"))) > MAX_REALISTIC_TRADE_PNL_PCT
+    except (TypeError, ValueError):
+        return True
+
+
 def trades_today(all_trades: list[dict]) -> tuple[list, list]:
     """Возвращает (открытые_сегодня, закрытые_сегодня).
 
@@ -657,7 +667,9 @@ def day_pnl_stats(closed: list[dict]) -> dict:
     phantom-сигналы (FIGI missing / 50002 / risk-block) возвращаются отдельно
     в поле `phantom` — это предотвращает фиктивные wins в отчёте (кейс 17.04.2026).
     """
-    real    = [t for t in closed if _is_executed(t)]
+    real_all = [t for t in closed if _is_executed(t)]
+    anomalies = [t for t in real_all if t.get("pnl_pct") is not None and _is_pnl_anomaly(t)]
+    real    = [t for t in real_all if not (t.get("pnl_pct") is not None and _is_pnl_anomaly(t))]
     phantom = [t for t in closed if not _is_executed(t)]
 
     pnls = [t["pnl_pct"] for t in real if t.get("pnl_pct") is not None]
@@ -682,6 +694,8 @@ def day_pnl_stats(closed: list[dict]) -> dict:
         }
     base["phantom_count"] = len(phantom)
     base["phantom_tickers"] = sorted({t.get("ticker", "?") for t in phantom})
+    base["pnl_anomaly_count"] = len(anomalies)
+    base["pnl_anomaly_tickers"] = sorted({t.get("ticker", "?") for t in anomalies})
     return base
 
 
@@ -693,6 +707,7 @@ def weekly_stats(all_trades: list[dict]) -> dict:
         if t.get("exit_time") and t["exit_time"] >= cutoff
         and t.get("pnl_pct") is not None
         and _is_executed(t)
+        and not _is_pnl_anomaly(t)
     ]
     if not recent:
         return {}
