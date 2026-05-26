@@ -1621,6 +1621,27 @@ class TestExecutionRecording(unittest.TestCase):
         self.assertFalse(active)
         self.assertEqual(losses, 0)
 
+    def test_daily_stop_loss_brake_ignores_micro_losses(self):
+        active, losses = mb.check_daily_stop_loss_brake([
+            {
+                "signal_id": "A",
+                "result": "loss",
+                "pnl_pct": -0.17,
+                "exit_time": "2026-05-26 09:50",
+                "executed": True,
+            },
+            {
+                "signal_id": "B",
+                "result": "loss",
+                "pnl_pct": -0.8,
+                "exit_time": "2026-05-26 11:00",
+                "executed": True,
+            },
+        ], "2026-05-26", max_losses=1, min_loss_pct=0.5)
+
+        self.assertTrue(active)
+        self.assertEqual(losses, 1)
+
     def test_daily_new_order_count_ignores_virtual_trades(self):
         count = mb.count_daily_new_orders([
             {"signal_id": "A", "date": "2026-05-18", "executed": True},
@@ -1640,6 +1661,15 @@ class TestExecutionRecording(unittest.TestCase):
                 "executed": True,
             },
         ], "2026-05-18", "GAZP"))
+        self.assertFalse(mb.has_daily_ticker_loss([
+            {
+                "ticker": "GAZP",
+                "result": "loss",
+                "pnl_pct": -0.17,
+                "exit_time": "2026-05-18 10:00",
+                "executed": True,
+            },
+        ], "2026-05-18", "GAZP", min_loss_pct=0.5))
         self.assertFalse(mb.has_daily_ticker_loss([
             {
                 "ticker": "GAZP",
