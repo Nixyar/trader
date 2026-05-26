@@ -737,6 +737,7 @@ MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "2.0"))
 # are rejected while stop/target monitoring continues. 0 disables the guard.
 MAX_DAILY_STOP_LOSSES = int(os.environ.get("MAX_DAILY_STOP_LOSSES", "2"))
 MAX_DAILY_NEW_ORDERS_AFTER_LOSS = int(os.environ.get("MAX_DAILY_NEW_ORDERS_AFTER_LOSS", "0"))
+MIN_INTRADAY_BRAKE_LOSS_PCT = float(os.environ.get("MIN_INTRADAY_BRAKE_LOSS_PCT", "0.5"))
 NEWS_EVENT_AUTO_MIN_SCORE = int(os.environ.get("NEWS_EVENT_AUTO_MIN_SCORE", "18"))
 AUTO_ORDER_MIN_SETUP_QUALITY = os.environ.get("AUTO_ORDER_MIN_SETUP_QUALITY", "B").upper()
 STRATEGY_PERF_GUARD_MIN_TRADES = int(os.environ.get("STRATEGY_PERF_GUARD_MIN_TRADES", "5"))
@@ -6430,9 +6431,11 @@ def check_daily_stop_loss_brake(
     trade_log: list[dict],
     date_str: str,
     max_losses: int | None = None,
+    min_loss_pct: float | None = None,
 ) -> tuple[bool, int]:
     """Block new entries after too many confirmed losing closes today."""
     threshold = MAX_DAILY_STOP_LOSSES if max_losses is None else max_losses
+    material_loss = MIN_INTRADAY_BRAKE_LOSS_PCT if min_loss_pct is None else min_loss_pct
     if threshold <= 0:
         return False, 0
 
@@ -6446,12 +6449,14 @@ def check_daily_stop_loss_brake(
             continue
         result = str(row.get("result") or "").lower()
         pnl = row.get("pnl_pct")
-        is_loss = result in {"loss", "stop"}
-        if not is_loss and pnl is not None:
-            try:
-                is_loss = float(pnl) < 0
-            except (TypeError, ValueError):
-                is_loss = False
+        is_loss = False
+        try:
+            if pnl is not None:
+                is_loss = float(pnl) <= -material_loss
+        except (TypeError, ValueError):
+            is_loss = False
+        if not is_loss and pnl is None and result in {"loss", "stop"}:
+            is_loss = material_loss <= 0
         if is_loss:
             losses += 1
 
@@ -6474,7 +6479,9 @@ def has_daily_ticker_loss(
     trade_log: list[dict],
     date_str: str,
     ticker: str,
+    min_loss_pct: float | None = None,
 ) -> bool:
+    material_loss = MIN_INTRADAY_BRAKE_LOSS_PCT if min_loss_pct is None else min_loss_pct
     for row in trade_log:
         if not isinstance(row, dict):
             continue
@@ -6484,14 +6491,14 @@ def has_daily_ticker_loss(
             continue
         if not str(row.get("exit_time") or "").startswith(date_str):
             continue
-        result = str(row.get("result") or "").lower()
-        if result in {"loss", "stop"}:
-            return True
         try:
-            if row.get("pnl_pct") is not None and float(row.get("pnl_pct")) < 0:
+            if row.get("pnl_pct") is not None and float(row.get("pnl_pct")) <= -material_loss:
                 return True
         except (TypeError, ValueError):
             continue
+        result = str(row.get("result") or "").lower()
+        if row.get("pnl_pct") is None and result in {"loss", "stop"} and material_loss <= 0:
+            return True
     return False
 
 
