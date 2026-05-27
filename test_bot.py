@@ -1535,6 +1535,33 @@ class TestExecutionRecording(unittest.TestCase):
             score_lines = open(score_file, encoding="utf-8").read()
             self.assertIn("sandbox_order_rejected", score_lines)
 
+    def test_portfolio_unavailable_does_not_place_order(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trade_file = os.path.join(tmpdir, "trade_log.json")
+            score_file = os.path.join(tmpdir, "score.jsonl")
+            decision_file = os.path.join(tmpdir, "decision.jsonl")
+            opportunity_file = os.path.join(tmpdir, "opportunity.jsonl")
+            fake_tinvest = MagicMock()
+            fake_tinvest.get_sandbox_portfolio.side_effect = RuntimeError("timeout")
+            state = {}
+
+            with patch.object(mb, "TRADE_LOG_FILE", trade_file), \
+                 patch.object(mb, "SCORE_LOG_FILE", score_file), \
+                 patch.object(mb, "DECISION_LOG_FILE", decision_file), \
+                 patch.object(mb, "OPPORTUNITY_LOG_FILE", opportunity_file), \
+                 patch.object(mb, "SANDBOX_AUTO_ORDER", True), \
+                 patch.object(mb, "datetime", _FixedTradingDateTime), \
+                 patch.object(mb, "_tinvest_available", return_value=True), \
+                 patch.object(mb, "_tinvest", fake_tinvest):
+                placed = mb.sandbox_execute_signals([self._signal()], state)
+
+            self.assertEqual(placed, 0)
+            fake_tinvest.sandbox_place_order.assert_not_called()
+            self.assertEqual(state, {})
+            self.assertFalse(os.path.exists(trade_file))
+            self.assertIn("sandbox_portfolio_unavailable", open(score_file, encoding="utf-8").read())
+            self.assertIn("sandbox_portfolio_unavailable", open(opportunity_file, encoding="utf-8").read())
+
     def test_tier3_signal_is_watch_only_without_order(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             trade_file = os.path.join(tmpdir, "trade_log.json")

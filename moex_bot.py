@@ -6690,7 +6690,8 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
     Пример: equity=800 000 ₽, риск 1%, стоп PHOR 25 руб, лотность=1
         → риск = 8 000 ₽ → лоты = 8 000 / 25 = 320 лотов
 
-    SANDBOX_ORDER_LOTS используется как fallback если equity недоступен.
+    Если equity недоступен, новые входы отклоняются: без актуального
+    sandbox-портфеля нельзя корректно применить риск-лимиты.
     СРЕДНЯЯ уверенность → риск ограничен 0.5% (вдвое меньше).
 
     Пропускаем сигналы, по которым уже открыта позиция.
@@ -7016,6 +7017,28 @@ def sandbox_execute_signals(synthesized: list[dict], state: dict) -> int:
             append_opportunity_log({**opportunity_base, "action": "rejected", "reason": "sandbox_unavailable"})
             if _should_log_risk_block(ticker, "SANDBOX_UNAVAILABLE"):
                 logger.info("sandbox-blacklist skip: %s (ещё в 24ч blacklist)", ticker)
+            continue
+
+        if not _portfolio_snapshot or equity <= 0:
+            reason = "sandbox_portfolio_unavailable"
+            append_score_log({
+                **opportunity_base,
+                "action": "skipped",
+                "reason": reason,
+                "equity": equity,
+            })
+            append_opportunity_log({
+                **opportunity_base,
+                "action": "rejected",
+                "reason": reason,
+                "equity": equity,
+            })
+            if _should_log_risk_block(ticker, "SANDBOX_PORTFOLIO_UNAVAILABLE"):
+                logger.warning(
+                    "sandbox portfolio unavailable: skip new order for %s %s",
+                    ticker,
+                    direction,
+                )
             continue
 
         # v0.9.36: Cooldown после target2/stop_hit того же направления.
