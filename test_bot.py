@@ -2400,6 +2400,26 @@ class TestEdgeAssessment(unittest.TestCase):
             stats = mb._compute_edge_stats()
         self.assertAlmostEqual(stats["mean_net"], 0.0, places=6)
 
+    def test_excludes_phantom_exit_price(self):
+        # Кейс MTSS 22.05: битый exit_price → pnl −63.99% при рынке 228-234.
+        rows = [self._row(1.0) for _ in range(10)] + [self._row(-63.99)]
+        with patch.object(mb, "load_trade_log", return_value=rows):
+            stats = mb._compute_edge_stats()
+        self.assertEqual(stats["n"], 10)          # фантом исключён
+        self.assertGreater(stats["mean_net"], 0)  # не отравил матожидание
+
+    def test_strategy_perf_guard_ignores_phantom(self):
+        # Фантомный −64% не должен «выключать» стратегию через perf-guard.
+        base = {"executed": True, "execution_status": "closed",
+                "exit_time": "2026-05-22 11:46", "strategy": None}
+        log = ([{**base, "pnl_pct": 1.0}] * 4
+               + [{**base, "pnl_pct": -63.99}])  # 4 плюса + фантом
+        reason, meta = mb.strategy_performance_guard_reason(
+            {"strategy": None}, log, min_trades=5, min_pnl=0.0, min_winrate=45.0)
+        # Фантом исключён → закрытых только 4 < min_trades → guard не активен
+        self.assertIsNone(reason)
+        self.assertEqual(meta.get("closed"), 4)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ЗАПУСК
