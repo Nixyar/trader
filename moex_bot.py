@@ -5619,6 +5619,9 @@ def _compute_edge_stats() -> dict | None:
         and r.get("pnl_pct") is not None
         and r.get("executed", True) is not False
         and str(r.get("execution_status") or "") not in {"virtual", "rejected", "ghost_closed"}
+        # v1.0.1: фантомные цены выхода (битый exit_price от брокера, кейс MTSS
+        # 84.18 при рынке 228-234) отравляют статистику — исключаем как и guards.
+        and not is_anomalous_trade_pnl(r)
     ]
     n = len(closed)
     if n == 0:
@@ -5678,6 +5681,7 @@ def assess_edge_significance() -> None:
         and r.get("pnl_pct") is not None
         and r.get("executed", True) is not False
         and str(r.get("execution_status") or "") not in {"virtual", "rejected", "ghost_closed"}
+        and not is_anomalous_trade_pnl(r)  # v1.0.1: фантомные exit_price не считаем
     ]
     n = len(closed)
 
@@ -6694,6 +6698,10 @@ def strategy_performance_guard_reason(
         if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
             continue
         if row.get("pnl_pct") is None or not row.get("exit_time"):
+            continue
+        if is_anomalous_trade_pnl(row):
+            # v1.0.1: фантомный exit_price (кейс MTSS −64% при рынке 228-234)
+            # не должен выключать стратегию через perf-guard.
             continue
         if _strategy_label(row) == label:
             rows.append(row)
