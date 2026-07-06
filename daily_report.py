@@ -314,6 +314,55 @@ def load_today_log_lines() -> list[str]:
     return []
 
 
+def bot_log_health() -> dict:
+    """
+    Последняя живая запись именно торгового бота.
+    Нужна для дней без сканов: строк за сегодня может быть 0, но важно показать,
+    когда бот писал лог в последний раз.
+    """
+    candidates = [
+        LOG_DIR / f"bot_{TODAY_STR}.log",
+        LOG_DIR / "bot.log",
+        LOG_FILE,
+    ]
+    best: dict = {}
+    ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except Exception:
+            continue
+        for line in reversed(lines):
+            match = ts_re.match(line)
+            if not match:
+                continue
+            try:
+                dt = _MSK_TZ.localize(datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                continue
+            if not best or dt > best["last_at"]:
+                best = {
+                    "last_at": dt,
+                    "last_line": line,
+                    "path": str(path.relative_to(_DIR)) if path.is_relative_to(_DIR) else str(path),
+                }
+            break
+    if best:
+        age = _NOW_MSK - best["last_at"]
+        best["age_minutes"] = max(0, int(age.total_seconds() // 60))
+        best["age_hours"] = round(best["age_minutes"] / 60, 1)
+        missed = 0
+        day = best["last_at"].date() + timedelta(days=1)
+        while day <= _NOW_MSK.date():
+            if day.weekday() < 5:
+                missed += 1
+            day += timedelta(days=1)
+        best["missed_trading_days"] = missed
+    return best
+
+
 def load_today_decision_entries() -> list[dict]:
     if not DECISION_LOG_FILE.exists():
         return []
@@ -794,9 +843,15 @@ def open_positions_summary(state: dict) -> tuple[list[str], int, float]:
 
         # % до стопа
         stop_dist = ""
+        risk_str = ""
         if stop and price:
             dist_pct = abs(stop - price) / price * 100
             stop_dist = f"  стоп {stop:.1f} ({dist_pct:.1f}%)"
+            actual_risk = abs(stop - price) * lots * lot_size
+            if actual_risk >= 1000:
+                risk_str = f"  риск ~{actual_risk/1000:.1f}k₽"
+            elif actual_risk > 0:
+                risk_str = f"  риск ~{actual_risk:.0f}₽"
 
         take_str = f"  цель {take2:.1f}" if take2 else ""
 
@@ -809,7 +864,7 @@ def open_positions_summary(state: dict) -> tuple[list[str], int, float]:
 
         lines.append(
             f"  {arrow}{ticker} {direction} × {lots}л @ {price:.1f}"
-            f"{stop_dist}{take_str}{deployed_str}{days_open}{date_str}"
+            f"{stop_dist}{risk_str}{take_str}{deployed_str}{days_open}{date_str}"
         )
 
     if not lines:
@@ -1114,6 +1169,7 @@ def build_report(
     stats:      dict,
     state:      dict,
     log_stats:  dict,
+    log_health: dict,
     decision_stats: dict,
     capability_stats: dict,
     eod_state:  dict,
@@ -1240,6 +1296,21 @@ def build_report(
     else:
         act_line = "🔄 <b>Активность:</b> 0 строк в логе — бот, возможно, не запущен"
     parts.append(f"\n{act_line}")
+    if log_health:
+        last_at = log_health.get("last_at")
+        missed_trading_days = int(log_health.get("missed_trading_days") or 0)
+        path = html.escape(str(log_health.get("path") or ""))
+        if last_at and n_tot == 0:
+            trading_gap = (
+                f", пропущено торговых дней: {missed_trading_days}"
+                if missed_trading_days > 0 else ""
+            )
+            parts.append(
+                f"  Последняя запись бота: {last_at.strftime('%d.%m %H:%M:%S')} МСК"
+                f" ({path}{trading_gap})"
+            )
+        elif last_at:
+            parts.append(f"  Последняя запись бота: {last_at.strftime('%H:%M:%S')} МСК ({path})")
 
     # ── Ошибки (последние 3) ──────────────────────────────────────────────────
     # v0.9.38.3: html.escape(short) — иначе SDK-сообщения вида
@@ -1311,11 +1382,19 @@ def main() -> int:
     eod_state          = load_eod_state()
     log_lines_raw      = load_today_log_lines()
     log_stats          = parse_log_stats(log_lines_raw)
+    log_health         = bot_log_health()
     decision_entries   = load_today_decision_entries()
     decision_stats     = summarize_decisions(decision_entries)
     capability_stats   = summarize_capabilities()
     opportunity_entries = load_today_opportunity_entries()
     diagnostics        = build_daily_diagnostics(all_trades, state, log_lines_raw, decision_entries, opportunity_entries)
+    if log_health:
+        diagnostics["bot_log_health"] = {
+            "last_at": log_health["last_at"].isoformat(),
+            "age_minutes": log_health.get("age_minutes"),
+            "missed_trading_days": log_health.get("missed_trading_days"),
+            "path": log_health.get("path"),
+        }
     save_daily_diagnostics(diagnostics)
     opened, closed     = trades_today(all_trades)
     stats              = day_pnl_stats(closed)
@@ -1328,6 +1407,7 @@ def main() -> int:
         stats     = stats,
         state     = state,
         log_stats = log_stats,
+        log_health = log_health,
         decision_stats = decision_stats,
         capability_stats = capability_stats,
         eod_state = eod_state,
