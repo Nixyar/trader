@@ -134,25 +134,34 @@ def build_regime_map(years: float, ma: int = 50) -> dict[str, str]:
 # ════════════════════════════════════════════════════════════════════════════
 #  Симуляция исхода одной сделки против будущих дневных свечей
 # ════════════════════════════════════════════════════════════════════════════
-def simulate_trade(sig: dict, future: list[dict], horizon: int) -> tuple[str, float]:
+def simulate_trade(sig: dict, future: list[dict], horizon: int,
+                   stop_slippage_pct: float = 0.0) -> tuple[str, float]:
     """
     Возвращает (result, exit_price).
     Консервативно: если в одной свече задеты и стоп, и тейк — считаем стоп первым.
+
+    stop_slippage_pct — проскальзывание на исполнении стопа (% от цены):
+      0.0  — идеальный жёсткий стоп (выход ровно по цене стопа);
+      ~0.7 — «мягкий» стоп бота (5-мин скан не успевает, цена проскакивает).
+    Так моделируем протечку стопов, замеренную на живых данных.
     """
     entry = sig["entry"]
     stop = sig["stop"]
     take2 = sig["take2"]
     direction = sig["direction"]
+    slip = stop_slippage_pct / 100.0
     for c in future[:horizon]:
         hi, lo = c["high"], c["low"]
         if direction == "LONG":
             if lo <= stop:
-                return "loss", stop
+                fill = stop * (1 - slip)          # хуже стопа вниз
+                return "loss", max(fill, lo)       # но не хуже дна свечи
             if hi >= take2:
                 return "win_t2", take2
         else:  # SHORT
             if hi >= stop:
-                return "loss", stop
+                fill = stop * (1 + slip)          # хуже стопа вверх
+                return "loss", min(fill, hi)       # но не хуже пика свечи
             if lo <= take2:
                 return "win_t2", take2
     # Таймаут — выход по close последней доступной свечи горизонта
@@ -219,7 +228,8 @@ def backtest_ticker(ticker: str, candles: list[dict], args) -> list[dict]:
                 continue
 
         future = candles[t + 1:]
-        result, exit_price = simulate_trade(sig, future, args.horizon)
+        result, exit_price = simulate_trade(sig, future, args.horizon,
+                                            stop_slippage_pct=getattr(args, "stop_slippage", 0.0))
         r = trade_r_multiple(sig, exit_price, args.commission)
         trades.append({
             "ticker": ticker,
@@ -320,6 +330,8 @@ def main() -> None:
     ap.add_argument("--quality", action="store_true", help="применять фильтр качества сетапа (>= B)")
     ap.add_argument("--commission", type=float, default=0.05, help="комиссия %%/сторону")
     ap.add_argument("--horizon", type=int, default=DEFAULT_HORIZON, help="макс дней удержания")
+    ap.add_argument("--stop-slippage", dest="stop_slippage", type=float, default=0.0,
+                    help="проскальзывание на стопе %% (0=жёсткий, ~0.7=мягкий как у бота)")
     ap.add_argument("--csv", type=str, default="", help="путь для выгрузки сделок в CSV")
     ap.add_argument("--split", action="store_true",
                     help="out-of-sample: разбить период пополам и сравнить + проверить устойчивость по тикерам")
