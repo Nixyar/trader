@@ -269,3 +269,9 @@ marimo/_lsp/
 __marimo__/
 /event_calendar.json
 /signals_decision_log.jsonl
+
+# Кэш загруженной истории для backtest.py
+backtest_cache/
+
+# Лог прогнозов трекера Пульса
+pulse_calls.json

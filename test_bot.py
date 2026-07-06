@@ -2353,6 +2353,74 @@ class TestH1WatchHelpers(unittest.TestCase):
         self.assertEqual(count, 1)
 
 
+class TestEdgeAssessment(unittest.TestCase):
+    """v1.0: честная оценка статистической значимости edge."""
+
+    def _row(self, pnl_pct, **kw):
+        base = {"result": "win_t2", "pnl_pct": pnl_pct, "executed": True,
+                "exit_time": "2026-01-01 10:00", "ticker": "SBER", "direction": "LONG"}
+        base.update(kw)
+        return base
+
+    def test_no_closed_trades_returns_none(self):
+        with patch.object(mb, "load_trade_log", return_value=[]):
+            self.assertIsNone(mb._compute_edge_stats())
+
+    def test_excludes_virtual_and_unexecuted(self):
+        rows = [
+            self._row(2.0),
+            self._row(2.0, executed=False),                       # не исполнена
+            self._row(2.0, execution_status="virtual"),           # виртуальная
+            self._row(2.0, execution_status="rejected"),          # отклонена
+            self._row(None, result="open"),                       # открыта
+        ]
+        with patch.object(mb, "load_trade_log", return_value=rows):
+            stats = mb._compute_edge_stats()
+        self.assertEqual(stats["n"], 1)
+
+    def test_small_sample_verdict(self):
+        rows = [self._row(1.0) for _ in range(10)]
+        with patch.object(mb, "load_trade_log", return_value=rows):
+            line = mb.edge_oneliner()
+        self.assertIn("мало", line.lower())
+
+    def test_significant_positive_edge(self):
+        # 50 сделок по +2% → после издержек +1.9%, std=0 → нижняя граница CI > 0
+        rows = [self._row(2.0) for _ in range(50)]
+        with patch.object(mb, "load_trade_log", return_value=rows):
+            stats = mb._compute_edge_stats()
+            line = mb.edge_oneliner()
+        self.assertGreater(stats["ci_lo"], 0)
+        self.assertIn("значимый плюс", line)
+
+    def test_net_expectancy_subtracts_costs(self):
+        rows = [self._row(0.10) for _ in range(40)]  # брутто +0.10% = ровно издержки
+        with patch.object(mb, "load_trade_log", return_value=rows), \
+                patch.object(mb, "ROUNDTRIP_COST_PCT", 0.10):
+            stats = mb._compute_edge_stats()
+        self.assertAlmostEqual(stats["mean_net"], 0.0, places=6)
+
+    def test_excludes_phantom_exit_price(self):
+        # Кейс MTSS 22.05: битый exit_price → pnl −63.99% при рынке 228-234.
+        rows = [self._row(1.0) for _ in range(10)] + [self._row(-63.99)]
+        with patch.object(mb, "load_trade_log", return_value=rows):
+            stats = mb._compute_edge_stats()
+        self.assertEqual(stats["n"], 10)          # фантом исключён
+        self.assertGreater(stats["mean_net"], 0)  # не отравил матожидание
+
+    def test_strategy_perf_guard_ignores_phantom(self):
+        # Фантомный −64% не должен «выключать» стратегию через perf-guard.
+        base = {"executed": True, "execution_status": "closed",
+                "exit_time": "2026-05-22 11:46", "strategy": None}
+        log = ([{**base, "pnl_pct": 1.0}] * 4
+               + [{**base, "pnl_pct": -63.99}])  # 4 плюса + фантом
+        reason, meta = mb.strategy_performance_guard_reason(
+            {"strategy": None}, log, min_trades=5, min_pnl=0.0, min_winrate=45.0)
+        # Фантом исключён → закрытых только 4 < min_trades → guard не активен
+        self.assertIsNone(reason)
+        self.assertEqual(meta.get("closed"), 4)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ЗАПУСК
 # ═══════════════════════════════════════════════════════════════════════════════

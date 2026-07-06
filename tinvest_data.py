@@ -396,6 +396,60 @@ def get_lot_size(ticker: str) -> int:
     return 1
 
 
+_INSTRUMENT_VERIFY_DONE = False
+
+
+def verify_instrument_ids(force: bool = False) -> list[tuple[str, str, str]]:
+    """
+    v1.0.2: сверяет каждый FIGI из FIGI_MAP с тем, что реально возвращает
+    T-Invest API. Возвращает список (ticker, figi, real_ticker) для битых.
+
+    Причина: аудит 06.07.2026 нашёл 8 из 32 FIGI, указывающих на ЧУЖИЕ бумаги
+    (MTSS→НЛМК, SNGS→ВТБ, MGNT↔TATN, …) — бот месяцами исполнял ордера не на
+    тех инструментах, а стопы мониторил по ценам правильного тикера.
+    Битый тикер добавляется в sandbox-blacklist — торговля по нему блокируется
+    до исправления карты. ERROR — в лог, тикеры попадут в EOD 'Universe health'.
+    """
+    global _INSTRUMENT_VERIFY_DONE
+    if _INSTRUMENT_VERIFY_DONE and not force:
+        return []
+    _INSTRUMENT_VERIFY_DONE = True
+
+    if not is_available():
+        return []
+    mismatches: list[tuple[str, str, str]] = []
+    try:
+        Client = _sdk_import("Client")
+        mod = importlib.import_module(_detect_sdk() or "")
+        IdType = getattr(mod, "InstrumentIdType", None)
+        if IdType is None:
+            return []
+        with Client(_get_token()) as client:
+            for ticker, figi in FIGI_MAP.items():
+                if not figi:
+                    continue
+                try:
+                    r = client.instruments.get_instrument_by(
+                        id_type=IdType.INSTRUMENT_ID_TYPE_FIGI, id=figi)
+                    real = r.instrument.ticker
+                    if real != ticker:
+                        mismatches.append((ticker, figi, real))
+                        logger.error(
+                            "[FIGI MISMATCH] %s: FIGI %s принадлежит %s (%s)! "
+                            "Тикер заблокирован до исправления FIGI_MAP.",
+                            ticker, figi, real, r.instrument.name)
+                        try:
+                            mark_sandbox_unavailable(ticker, f"figi_mismatch:{real}")
+                        except Exception:
+                            pass
+                except Exception as e:
+                    # NOT_FOUND — не mismatch: тикер уйдёт в runtime-blacklist сам
+                    logger.debug("verify_instrument_ids(%s): %s", ticker, e)
+    except Exception as e:
+        logger.warning("verify_instrument_ids skipped: %s", e)
+    return mismatches
+
+
 def verify_lot_sizes(timeout: float = 5.0, force: bool = False) -> list[tuple[str, int, int]]:
     """Фетчит LOTSIZE тикеров из MOEX ISS и сверяет с LOT_SIZE.
 
@@ -635,12 +689,16 @@ FIGI_MAP: dict[str, str] = {
     "ROSN":  "BBG004731354",
     "NVTK":  "BBG00475KKY8",
     "GMKN":  "BBG004731489",
-    "YDEX":  "BBG006L8G4H1",
-    "TATN":  "BBG004RVFCY3",
-    "MGNT":  "BBG004RVFFC0",
-    "PLZL":  "BBG000QJW156",
-    "SNGS":  "BBG004730ZJ9",
-    "MTSS":  "BBG004S681B4",
+    # v1.0.2 — АУДИТ FIGI (06.07.2026): 8 из 32 записей указывали на ЧУЖИЕ
+    # инструменты (MTSS→НЛМК, SNGS→ВТБ, MGNT↔TATN перепутаны, PLZL→БСПБ,
+    # NLMK→SNGSP, TRNFP→CHMF, YDEX→Nebius). Сделки исполнялись не на тех
+    # бумагах. Все значения ниже сверены с API (get_instrument_by / shares).
+    "YDEX":  "TCS00A107T19",   # Яндекс (МКПАО, новый листинг 2024)
+    "TATN":  "BBG004RVFFC0",   # Татнефть (было: FIGI Магнита)
+    "MGNT":  "BBG004RVFCY3",   # Магнит (было: FIGI Татнефти)
+    "PLZL":  "BBG000R607Y3",   # Полюс (было: FIGI Банка Санкт-Петербург)
+    "SNGS":  "BBG0047315D0",   # Сургутнефтегаз-ао (было: FIGI ВТБ)
+    "MTSS":  "BBG004S681W1",   # МТС (было: FIGI НЛМК)
     "ALRS":  "BBG004S68B31",
     "VTBR":  "BBG004730REP",
     "CHMF":  "BBG00475MY39",
@@ -651,7 +709,7 @@ FIGI_MAP: dict[str, str] = {
     "TCSG":  "BBG00QPYJ5H0",   # оставлен для обратной совместимости (может не работать)
     "PHOR":  "BBG004S689R0",
     "AFKS":  "BBG004S68614",
-    "NLMK":  "BBG004S681M2",
+    "NLMK":  "BBG004S681B4",   # НЛМК (было: FIGI префов Сургута) — v1.0.2
     "SIBN":  "BBG004FWGS36",   # Газпром нефть
     # FLOT: FIGI BBG000NF0ZQ4 даёт NOT_FOUND (50002) в T-Invest API.
     # Совкомфлот торгуется на MOEX, но инструмент может быть недоступен в T-Invest.
@@ -661,7 +719,7 @@ FIGI_MAP: dict[str, str] = {
     "OZON":  "BBG00Y91R9T3",   # Ozon
     "MOEX":  "BBG004730JJ5",   # Мосбиржа
     "SMLT":  "BBG006HBB564",   # Самолет
-    "TRNFP": "BBG00475K6C3",   # Транснефть-п
+    "TRNFP": "BBG00475KHX6",   # Транснефть-п (было: FIGI Северстали) — v1.0.2
     # v0.9.6 — новые тикеры
     "ENPG":  "BBG000FH5YM2",   # Эн+ Груп (алюминий + гидроэнергетика)
     "MAGN":  "BBG004S68507",   # ММК (Магнитогорский металлургический комбинат)

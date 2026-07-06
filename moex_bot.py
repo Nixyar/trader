@@ -756,6 +756,27 @@ WEEKLY_TARGET_RISK_BOOST = float(os.environ.get("WEEKLY_TARGET_RISK_BOOST", "1.1
 WEEKLY_TARGET_MIN_SETUP_QUALITY = os.environ.get("WEEKLY_TARGET_MIN_SETUP_QUALITY", "A").upper()
 WEEKLY_TARGET_EST_POSITION_RUB = float(os.environ.get("WEEKLY_TARGET_EST_POSITION_RUB", "100000"))
 
+# ─── v1.0: FORWARD_TEST_MODE — режим набора статистики в песочнице ──────────
+# Проблема: серия throttle-гейтов (после убытка — 0 новых ордеров, не более 1
+# открытой позиции, качество >= B) сжимает торговлю до ~6 сделок/год. Набрать
+# статистически значимую выборку для honest-оценки edge (--edge) при этом
+# НЕВОЗМОЖНО. FORWARD_TEST_MODE=1 ослабляет ИМЕННО throttle-гейты, чтобы бот
+# накапливал данные быстрее.
+# ЖЁСТКАЯ защита НЕ трогается: MAX_DAILY_LOSS_PCT (дневной стоп по equity),
+# MAX_STOP_PCT (макс. стоп на сделку), маржинальные/late-entry фильтры — активны.
+# Значения, заданные вручную в .env, имеют приоритет. ТОЛЬКО для sandbox.
+FORWARD_TEST_MODE = os.environ.get("FORWARD_TEST_MODE", "0").lower() in ("1", "true", "yes")
+if FORWARD_TEST_MODE:
+    def _ft(name: str, current, sampling_value):
+        """Берём sampling-значение, только если переменная не задана в .env явно."""
+        return current if os.environ.get(name) is not None else sampling_value
+    MAX_DAILY_NEW_ORDERS_AFTER_LOSS = _ft("MAX_DAILY_NEW_ORDERS_AFTER_LOSS", MAX_DAILY_NEW_ORDERS_AFTER_LOSS, 5)
+    RECENT_PERF_MAX_OPEN_POSITIONS  = _ft("RECENT_PERF_MAX_OPEN_POSITIONS",  RECENT_PERF_MAX_OPEN_POSITIONS, 5)
+    AUTO_ORDER_MIN_SETUP_QUALITY    = _ft("AUTO_ORDER_MIN_SETUP_QUALITY",    AUTO_ORDER_MIN_SETUP_QUALITY, "C")
+    STRATEGY_PERF_GUARD_MIN_TRADES  = _ft("STRATEGY_PERF_GUARD_MIN_TRADES",  STRATEGY_PERF_GUARD_MIN_TRADES, 0)
+    RECENT_PERF_GUARD_MIN_TRADES    = _ft("RECENT_PERF_GUARD_MIN_TRADES",    RECENT_PERF_GUARD_MIN_TRADES, 0)
+    MAX_DAILY_STOP_LOSSES           = _ft("MAX_DAILY_STOP_LOSSES",           MAX_DAILY_STOP_LOSSES, 5)
+
 # Кулдаун после target2 / stop_hit в том же направлении (anti-chasing).
 # Кейс 16.04: CBOM target2 → через 27 мин v2 вошёл на эйфории → stop_hit.
 COOLDOWN_AFTER_T2_MIN   = int(os.environ.get("COOLDOWN_AFTER_T2_MIN",   "90"))
@@ -3579,6 +3600,10 @@ def is_realized_trade_row(row: dict) -> bool:
         return False
     if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
         return False
+    if row.get("instrument_mismatch"):
+        # v1.0.2: сделка исполнялась на ЧУЖОЙ бумаге (битый FIGI) — её pnl
+        # не отражает стратегию и не должен влиять на статистику/гейты.
+        return False
     return row.get("pnl_pct") is not None and bool(row.get("exit_time"))
 
 
@@ -5582,6 +5607,151 @@ def print_trade_log_summary() -> None:
     print(f"╚{sep}╝\n")
 
 
+# v1.0: комиссия Т-Банка на круг (туда-обратно), % от оборота — для честной оценки.
+# Т-Банк «Трейдер»: ~0.04-0.05%/сделку. На круг ≈ 0.10%. Плюс спред — реально хуже.
+ROUNDTRIP_COST_PCT = float(os.environ.get("ROUNDTRIP_COST_PCT", "0.10"))
+
+
+def _compute_edge_stats() -> dict | None:
+    """v1.0: общий расчёт честной статистики edge (нетто, после издержек).
+    Возвращает None, если нет закрытых исполненных сделок."""
+    import math
+    log = load_trade_log()
+    closed = [
+        r for r in log
+        if r.get("result") and r["result"] != "open"
+        and r.get("pnl_pct") is not None
+        and r.get("executed", True) is not False
+        and str(r.get("execution_status") or "") not in {"virtual", "rejected", "ghost_closed"}
+        # v1.0.1: фантомные цены выхода (битый exit_price от брокера, кейс MTSS
+        # 84.18 при рынке 228-234) отравляют статистику — исключаем как и guards.
+        and not is_anomalous_trade_pnl(r)
+        and not r.get("instrument_mismatch")  # v1.0.2: сделки на чужих бумагах (битый FIGI)
+    ]
+    n = len(closed)
+    if n == 0:
+        return None
+    net = [r["pnl_pct"] - ROUNDTRIP_COST_PCT for r in closed]
+    mean_net = sum(net) / n
+    std = math.sqrt(sum((x - mean_net) ** 2 for x in net) / (n - 1)) if n >= 2 else 0.0
+    se = std / math.sqrt(n) if n else 0.0
+    return {
+        "n": n,
+        "mean_net": mean_net,
+        "std": std,
+        "se": se,
+        "ci_lo": mean_net - 1.96 * se,
+        "ci_hi": mean_net + 1.96 * se,
+        "t": mean_net / se if se > 0 else 0.0,
+        "wins": sum(1 for g in net if g > 0),
+    }
+
+
+def edge_oneliner() -> str:
+    """Однострочный честный вердикт по edge — для EOD-отчёта в Telegram."""
+    s = _compute_edge_stats()
+    if not s:
+        return "🔬 Edge: нет данных"
+    if s["n"] < 30:
+        return f"🔬 Edge: {s['n']} сделок — мало для вывода (нужно ≥30, в идеале сотни)"
+    if s["ci_lo"] > 0:
+        tag = "✅ значимый плюс"
+    elif s["ci_hi"] < 0:
+        tag = "⛔ значимый минус"
+    else:
+        tag = "⚪ неотличим от нуля"
+    return (f"🔬 Edge ({s['n']} сд.): {s['mean_net']:+.2f}%/сделку после costs, "
+            f"95%CI [{s['ci_lo']:+.2f};{s['ci_hi']:+.2f}] → {tag}")
+
+
+def assess_edge_significance() -> None:
+    """
+    v1.0: Честная оценка — РЕАЛЕН ли edge бота или это статистический шум.
+
+    Обычный отчёт (--trade-log) показывает «итого +X%», и это вводит в
+    заблуждение: при малой выборке любой результат неотличим от удачи.
+    Эта команда отвечает на единственный важный вопрос: «можно ли доверять
+    этой прибыльности — или это случайность?» — через доверительный интервал
+    матожидания на сделку ПОСЛЕ вычета издержек.
+
+    Метод: t-статистика средней доходности на сделку. 95% CI = mean ± 1.96·SE,
+    где SE = std/√n. Если нижняя граница CI > 0 — edge статистически значим.
+    """
+    import math
+
+    log = load_trade_log()
+    closed = [
+        r for r in log
+        if r.get("result") and r["result"] != "open"
+        and r.get("pnl_pct") is not None
+        and r.get("executed", True) is not False
+        and str(r.get("execution_status") or "") not in {"virtual", "rejected", "ghost_closed"}
+        and not is_anomalous_trade_pnl(r)  # v1.0.1: фантомные exit_price не считаем
+        and not r.get("instrument_mismatch")  # v1.0.2: сделки на чужих бумагах
+    ]
+    n = len(closed)
+
+    sep = "═" * 52
+    print(f"\n╔{sep}╗")
+    print(f"  🔬 ОЦЕНКА РЕАЛЬНОСТИ EDGE  (издержки {ROUNDTRIP_COST_PCT:.2f}%/круг)")
+    print(f"╠{sep}╣")
+
+    if n == 0:
+        print("  Нет закрытых исполненных сделок для оценки.")
+        print(f"╚{sep}╝\n")
+        return
+
+    # Чистая доходность на сделку = брутто − издержки на круг.
+    gross = [r["pnl_pct"] for r in closed]
+    net = [g - ROUNDTRIP_COST_PCT for g in gross]
+    mean_net = sum(net) / n
+    if n >= 2:
+        var = sum((x - mean_net) ** 2 for x in net) / (n - 1)
+        std = math.sqrt(var)
+    else:
+        std = 0.0
+    se = std / math.sqrt(n) if n else 0.0
+    ci_lo, ci_hi = mean_net - 1.96 * se, mean_net + 1.96 * se
+    t_stat = mean_net / se if se > 0 else 0.0
+
+    wins = sum(1 for g in net if g > 0)
+    gross_win = sum(g for g in net if g > 0)
+    gross_loss = abs(sum(g for g in net if g < 0))
+    pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
+
+    print(f"  Закрытых сделок      : {n}")
+    print(f"  Винрейт (после costs): {100*wins/n:.1f}%")
+    print(f"  Матожидание/сделку   : {mean_net:+.3f}%  (после издержек)")
+    print(f"  95% доверит. интервал: [{ci_lo:+.3f}% … {ci_hi:+.3f}%]")
+    print(f"  t-статистика         : {t_stat:+.2f}   (|t|>2 ≈ значимо)")
+    print(f"  Profit factor (нетто): {pf:.2f}")
+    print(f"╠{sep}╣")
+
+    # ── Вердикт ─────────────────────────────────────────────────────────────
+    if n < 30:
+        verdict = ("МАЛО ДАННЫХ. Что бы ни показывали проценты — при n<30 это\n"
+                   "  статистически НЕОТЛИЧИМО от удачи. Нужно набрать выборку.")
+    elif ci_lo > 0:
+        verdict = ("✅ ЗНАЧИМЫЙ ПОЛОЖИТЕЛЬНЫЙ edge: даже нижняя граница интервала\n"
+                   "  выше нуля. Стоит продолжать forward-тест в песочнице.")
+    elif ci_hi < 0:
+        verdict = ("⛔ ЗНАЧИМЫЙ ОТРИЦАТЕЛЬНЫЙ edge: стратегия статистически теряет\n"
+                   "  после издержек. НЕ переводить на реальные деньги.")
+    else:
+        verdict = ("⚪ Edge НЕОТЛИЧИМ ОТ НУЛЯ: интервал пересекает 0. Прибыль/убыток\n"
+                   "  пока в пределах случайности — реального преимущества не доказано.")
+    print(f"  ВЕРДИКТ: {verdict}")
+
+    # ── Сколько сделок нужно, чтобы доказать ТЕКУЩИЙ уровень edge ────────────
+    if std > 0 and abs(mean_net) > 1e-9:
+        n_needed = (1.96 * std / abs(mean_net)) ** 2
+        if n_needed > n:
+            print(f"╠{sep}╣")
+            print(f"  Чтобы доказать такой edge нужно ≈ {math.ceil(n_needed)} сделок "
+                  f"(есть {n}).")
+    print(f"╚{sep}╝\n")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  H1 WATCH-ЛИСТ (v0.9.3) — двухфазный вход
 #  Фаза 1: дневная аномалия объёма → зона интереса → тикер в watch-лист
@@ -6535,6 +6705,12 @@ def strategy_performance_guard_reason(
             continue
         if row.get("pnl_pct") is None or not row.get("exit_time"):
             continue
+        if is_anomalous_trade_pnl(row):
+            # v1.0.1: фантомный exit_price (кейс MTSS −64% при рынке 228-234)
+            # не должен выключать стратегию через perf-guard.
+            continue
+        if row.get("instrument_mismatch"):
+            continue  # v1.0.2: сделка шла на чужой бумаге (битый FIGI)
         if _strategy_label(row) == label:
             rows.append(row)
 
@@ -8246,6 +8422,8 @@ def send_eod_report() -> None:
         f"{'─'*30}\n"
         f"{trades_block}\n"
         f"{'─'*30}\n"
+        f"{edge_oneliner()}\n"          # v1.0: честный накопительный вердикт по edge
+        f"{'─'*30}\n"
         f"⏰ {_now_str}  |  MOEX Bot {BOT_VERSION}"
     )
 
@@ -8376,6 +8554,10 @@ def main():
     except ImportError:
         pass  # python-dotenv не установлен — переменные должны быть заданы в окружении
 
+    if FORWARD_TEST_MODE:
+        print("🧪 FORWARD_TEST_MODE включён: throttle-гейты ослаблены для набора "
+              "статистики (sandbox). Жёсткая защита активна. Проверяй edge: --edge")
+
     watch_mode  = "--watch"      in sys.argv
     news_only   = "--news-only"  in sys.argv
     show_log    = "--trade-log"  in sys.argv
@@ -8399,6 +8581,11 @@ def main():
     # v0.9.1: команды трейд-лога
     if show_log:
         print_trade_log_summary()
+        return
+
+    # v1.0: честная оценка статистической значимости edge
+    if "--edge" in sys.argv:
+        assess_edge_significance()
         return
 
     if export_csv:
@@ -8435,6 +8622,18 @@ def main():
             print(f"  ⚠️  LOT_SIZE mismatches: {len(_mm)} тикер(ов) — см. лог")
     except Exception as _e:
         logger.warning("verify_lot_sizes skipped: %s", _e)
+
+    # v1.0.2: сверка FIGI_MAP с API — битые тикеры блокируются до исправления.
+    # Причина: аудит 06.07.2026 нашёл 8/32 FIGI, указывающих на чужие бумаги
+    # (MTSS→НЛМК, SNGS→ВТБ, MGNT↔TATN, …) — ордера уходили не в те инструменты.
+    try:
+        from tinvest_data import verify_instrument_ids as _verify_ids
+        _bad = _verify_ids()
+        if _bad:
+            print(f"  🔴 FIGI MISMATCH: {len(_bad)} тикер(ов) торговали ЧУЖИЕ бумаги — "
+                  f"заблокированы: {', '.join(f'{t}→{r}' for t, _, r in _bad)}")
+    except Exception as _e:
+        logger.warning("verify_instrument_ids skipped: %s", _e)
 
     try:
         if watch_mode:
