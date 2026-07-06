@@ -38,6 +38,40 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+
+# v1.0.2: SDK t_tech.invest пишет КАЖДЫЙ ответ NOT_FOUND (50002/50004) как ERROR
+# через свой внутренний логгер. Это штатная ситуация: часть FIGI не существует
+# на новом хосте — бот такие тикеры блокирует и берёт данные с MOEX ISS, а наш
+# собственный слой (get_sandbox_portfolio, sandbox_place_order и т.д.) логирует
+# реальные проблемы сам. Поэтому глушим сырой SDK-логгер, чтобы он не пугал в
+# консоли дубликатами. ВАЖНО: вызывать ПОСЛЕ импорта SDK — он сбрасывает уровень
+# своего логгера при импорте. Отключается через TINVEST_SDK_LOG_LEVEL=INFO.
+_SDK_LOG_LEVEL = getattr(logging, os.environ.get("TINVEST_SDK_LOG_LEVEL", "CRITICAL").upper(), logging.CRITICAL)
+
+
+class _SdkNoiseFilter(logging.Filter):
+    """Отбрасывает у ХЕНДЛЕРА только SDK-записи NOT_FOUND (50002/50004).
+    Наши собственные логи (name='tinvest_data') не трогаются."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if str(record.name).startswith(("t_tech.invest", "tinkoff.invest")):
+            m = record.getMessage()
+            if "NOT_FOUND 50002" in m or "NOT_FOUND 50004" in m:
+                return False
+        return True
+
+
+def _silence_sdk_logging() -> None:
+    if _SDK_LOG_LEVEL >= logging.CRITICAL:
+        for _n in ("t_tech.invest.logging", "tinkoff.invest.logging",
+                   "t_tech.invest", "tinkoff.invest"):
+            logging.getLogger(_n).setLevel(_SDK_LOG_LEVEL)
+    # Фильтр на хендлерах root — ловит проброшенные SDK-записи даже если SDK
+    # сам сбросил уровень своего логгера при создании Client.
+    root = logging.getLogger()
+    if not any(isinstance(f, _SdkNoiseFilter) for h in root.handlers for f in h.filters):
+        for h in root.handlers:
+            h.addFilter(_SdkNoiseFilter())
+
 # ─── v0.9.38.3: Persistent sandbox blacklist для тикеров с 50002 ──────────────
 # Кейс 16.04.2026: OZON получал 50002 от T-Invest sandbox 3 раза за день.
 # v0.9.36: runtime-blacklist (in-memory, TTL 24ч).
@@ -420,31 +454,29 @@ def verify_instrument_ids(force: bool = False) -> list[tuple[str, str, str]]:
     mismatches: list[tuple[str, str, str]] = []
     try:
         Client = _sdk_import("Client")
-        mod = importlib.import_module(_detect_sdk() or "")
-        IdType = getattr(mod, "InstrumentIdType", None)
-        if IdType is None:
-            return []
+        # Одним запросом получаем весь список акций и сверяем ЛОКАЛЬНО —
+        # без per-FIGI вызовов, которые SDK логирует как ERROR 50002 при NOT_FOUND.
         with Client(_get_token()) as client:
-            for ticker, figi in FIGI_MAP.items():
-                if not figi:
-                    continue
+            figi_to_ticker: dict[str, str] = {}
+            for s in client.instruments.shares().instruments:
+                if getattr(s, "figi", ""):
+                    figi_to_ticker[s.figi] = s.ticker
+        for ticker, figi in FIGI_MAP.items():
+            if not figi:
+                continue
+            real = figi_to_ticker.get(figi)
+            if real is None:
+                continue  # FIGI нет в списке (delisted/чужой хост) — не mismatch, runtime сам разрулит
+            if real != ticker:
+                mismatches.append((ticker, figi, real))
+                logger.error(
+                    "[FIGI MISMATCH] %s: FIGI %s принадлежит %s! "
+                    "Тикер заблокирован до исправления FIGI_MAP.",
+                    ticker, figi, real)
                 try:
-                    r = client.instruments.get_instrument_by(
-                        id_type=IdType.INSTRUMENT_ID_TYPE_FIGI, id=figi)
-                    real = r.instrument.ticker
-                    if real != ticker:
-                        mismatches.append((ticker, figi, real))
-                        logger.error(
-                            "[FIGI MISMATCH] %s: FIGI %s принадлежит %s (%s)! "
-                            "Тикер заблокирован до исправления FIGI_MAP.",
-                            ticker, figi, real, r.instrument.name)
-                        try:
-                            mark_sandbox_unavailable(ticker, f"figi_mismatch:{real}")
-                        except Exception:
-                            pass
-                except Exception as e:
-                    # NOT_FOUND — не mismatch: тикер уйдёт в runtime-blacklist сам
-                    logger.debug("verify_instrument_ids(%s): %s", ticker, e)
+                    mark_sandbox_unavailable(ticker, f"figi_mismatch:{real}")
+                except Exception:
+                    pass
     except Exception as e:
         logger.warning("verify_instrument_ids skipped: %s", e)
     return mismatches
@@ -558,6 +590,7 @@ def _detect_sdk() -> Optional[str]:
             importlib.import_module(name)
             _SDK_MODULE_NAME = name
             logger.debug(f"T-Invest SDK найден: {name}")
+            _silence_sdk_logging()  # v1.0.2: после импорта SDK — глушим его сырой NOT_FOUND-спам
             return name
         except ImportError as e:
             errors.append(f"  {name}: {e}")
