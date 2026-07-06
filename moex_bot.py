@@ -3600,6 +3600,10 @@ def is_realized_trade_row(row: dict) -> bool:
         return False
     if row.get("executed") is False or str(row.get("execution_status") or "") in {"virtual", "rejected", "ghost_closed"}:
         return False
+    if row.get("instrument_mismatch"):
+        # v1.0.2: сделка исполнялась на ЧУЖОЙ бумаге (битый FIGI) — её pnl
+        # не отражает стратегию и не должен влиять на статистику/гейты.
+        return False
     return row.get("pnl_pct") is not None and bool(row.get("exit_time"))
 
 
@@ -5622,6 +5626,7 @@ def _compute_edge_stats() -> dict | None:
         # v1.0.1: фантомные цены выхода (битый exit_price от брокера, кейс MTSS
         # 84.18 при рынке 228-234) отравляют статистику — исключаем как и guards.
         and not is_anomalous_trade_pnl(r)
+        and not r.get("instrument_mismatch")  # v1.0.2: сделки на чужих бумагах (битый FIGI)
     ]
     n = len(closed)
     if n == 0:
@@ -5682,6 +5687,7 @@ def assess_edge_significance() -> None:
         and r.get("executed", True) is not False
         and str(r.get("execution_status") or "") not in {"virtual", "rejected", "ghost_closed"}
         and not is_anomalous_trade_pnl(r)  # v1.0.1: фантомные exit_price не считаем
+        and not r.get("instrument_mismatch")  # v1.0.2: сделки на чужих бумагах
     ]
     n = len(closed)
 
@@ -6703,6 +6709,8 @@ def strategy_performance_guard_reason(
             # v1.0.1: фантомный exit_price (кейс MTSS −64% при рынке 228-234)
             # не должен выключать стратегию через perf-guard.
             continue
+        if row.get("instrument_mismatch"):
+            continue  # v1.0.2: сделка шла на чужой бумаге (битый FIGI)
         if _strategy_label(row) == label:
             rows.append(row)
 
@@ -8614,6 +8622,18 @@ def main():
             print(f"  ⚠️  LOT_SIZE mismatches: {len(_mm)} тикер(ов) — см. лог")
     except Exception as _e:
         logger.warning("verify_lot_sizes skipped: %s", _e)
+
+    # v1.0.2: сверка FIGI_MAP с API — битые тикеры блокируются до исправления.
+    # Причина: аудит 06.07.2026 нашёл 8/32 FIGI, указывающих на чужие бумаги
+    # (MTSS→НЛМК, SNGS→ВТБ, MGNT↔TATN, …) — ордера уходили не в те инструменты.
+    try:
+        from tinvest_data import verify_instrument_ids as _verify_ids
+        _bad = _verify_ids()
+        if _bad:
+            print(f"  🔴 FIGI MISMATCH: {len(_bad)} тикер(ов) торговали ЧУЖИЕ бумаги — "
+                  f"заблокированы: {', '.join(f'{t}→{r}' for t, _, r in _bad)}")
+    except Exception as _e:
+        logger.warning("verify_instrument_ids skipped: %s", _e)
 
     try:
         if watch_mode:
