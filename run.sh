@@ -19,10 +19,11 @@ if [ -f .env ]; then
     set +a
 fi
 
-# Проверяем ключ
+# Проверяем ключ (опционален — без него бот падает на анализ по ключевым словам)
 if [ -z "$ANTHROPIC_API_KEY" ]; then
-    echo "⚠️  ANTHROPIC_API_KEY не задан в .env"
-    exit 1
+    echo "🤖 AI-анализ: выключен (нет ANTHROPIC_API_KEY в .env) — новости по ключевым словам"
+else
+    echo "🤖 AI-анализ: включён"
 fi
 
 # Telegram-статус

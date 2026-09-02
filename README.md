@@ -1,144 +1,236 @@
 # 📈 MOEX Signal Bot
 
-Бот сканирует топ-15 акций Московской биржи, ищет аномалии объёма и генерирует торговые сигналы.
+[Русская версия →](README.ru.md)
 
-## Что делает бот
+A trading-signal bot for the Moscow Exchange (MOEX). It scans liquid Russian
+equities for volume anomalies, confirms them with technical indicators and RSS
+news, and can place **paper trades** in the T-Investments sandbox.
 
-- Получает дневные свечи за последние 21 день через **MOEX ISS API** (бесплатно, без ключа)
-- Считает средний объём за 20 дней и ищет аномалии (объём > 2× от среднего)
-- Считает уровни поддержки и сопротивления
-- Генерирует сигнал **LONG** или **SHORT** с:
-  - Точкой входа
-  - Стопом (1.5× ATR)
-  - Тремя тейк-профитами (1×, 2×, до уровня)
-  - Соотношением Risk/Reward
-
-## Тикеры
-
-GAZP, SBER, LKOH, ROSN, NVTK, GMKN, YNDX, TATN, MGNT, PLZL, SNGS, MTSS, ALRS, VTBR, CHMF
+It also ships with the research tooling used to decide whether the strategy is
+actually worth trading — and, so far, the honest answer is **no**. See
+[Honest assessment](#-honest-assessment-read-this-first).
 
 ---
 
-## Запуск
+## ⚠️ Honest assessment (read this first)
 
-### 1. Установить зависимости (один раз)
+> A backtest over 4 years / ~3200 trades showed that the core strategy
+> (volume anomaly + support/resistance levels) has **no durable edge that
+> survives transaction costs**. The high win rate is misleading — expectancy
+> after commission and spread is around zero or negative.
+>
+> This bot runs **in the sandbox only** (paper money). It should not be moved
+> to real money unless `--edge` reports a statistically significant positive
+> expectancy on a large sample.
 
-```bash
-pip3 install -r requirements.txt
-```
-
-### 2. Запустить сканирование
-
-```bash
-python3 moex_signal_bot.py
-```
-
-### Пример вывода при найденном сигнале
-
-```
-🔍 Сканирование MOEX — 09.03.2026 09:00:00
-   Тикеров: 15
-
-  → GAZP — норма (x1.3)
-  → SBER ⚡ объём x2.8
-  ...
-
-🎯 НАЙДЕНО СИГНАЛОВ: 1
-
-=============================================
-  🟢 LONG  —  SBER
-=============================================
-  Вход:    318.5
-  Стоп:    309.2
-  Тейк 1:  324.7
-  Тейк 2:  331.0
-  Тейк 3:  340.0
-  R/R:     1:2.1
-  Объём:   x2.8 от среднего  ⚡ АНОМАЛИЯ
-```
+This repository is published as an engineering and research artifact — a
+reasonably thorough attempt to find an edge, including the tooling that proved
+the edge wasn't there. It is **not** a money-making system, **not** investment
+advice, and comes with no warranty. Trading carries risk of total loss.
 
 ---
 
-## Настройка
+## What it does
 
-В файле `moex_signal_bot.py` можно изменить:
+- Pulls daily and intraday candles from the **MOEX ISS API** (free, no key)
+  and, optionally, from the **T-Invest API** (order book, portfolio, sandbox)
+- Detects volume anomalies (volume > 2× the 20-day average) with a minimum
+  absolute turnover filter
+- Confirms with RSI(14, Wilder), MA20/MA50, ADX(14), Fibonacci levels,
+  Bollinger squeeze, OBV and MA crossovers
+- Parses RSS news from Russian financial media, deduplicated via a cache
+- Optionally scores news with the **Anthropic API** in market context
+  (CBR key rate, USDRUB, IMOEX, Brent, Gold)
+- Synthesizes everything into a score and emits a **LONG** / **SHORT** signal
+  with entry, ATR-based stop and three take-profit levels
+- Sends signals and a daily EOD report to **Telegram**
+- Places sandbox orders with position sizing and risk limits
 
-| Параметр | По умолчанию | Описание |
-|----------|-------------|----------|
-| `TICKERS` | 15 акций | Список тикеров для сканирования |
-| `threshold` в `detect_volume_anomaly` | `2.0` | Множитель аномалии объёма |
-| `days` в `get_candles` | `21` | Период анализа (торговых дней) |
-| `1.5 * atr` | — | Размер стопа (в ATR) |
-
-## Требования
+## Requirements
 
 - Python 3.10+
-- Интернет-соединение (доступ к iss.moex.com)
-- Библиотека `requests`
+- Internet access to `iss.moex.com`
+- Optional: Anthropic API key, Telegram bot, T-Invest token
 
----
+## Install
 
-## Честная оценка стратегии (v1.0)
+```bash
+git clone <your-repo-url> trader
+cd trader
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-> ⚠️ **Главное, что нужно понимать.** Бэктест на 4 годах / ~3200 сделках показал:
-> у ядровой стратегии (объёмная аномалия + уровни) **нет устойчивого
-> преимущества, которое переживает издержки**. Высокий винрейт обманчив —
-> матожидание после комиссии и спреда около нуля или отрицательное. Бот
-> работает **только в песочнице** (бумажные деньги) и не должен переводиться
-> на реальные деньги, пока `--edge` не покажет статистически значимый плюс
-> на большой выборке. Подробности — в коде `backtest.py` и `assess_edge_significance()`.
+The T-Invest SDK is optional and is **not** on public PyPI:
 
-### `backtest.py` — проверка идеи на истории
+```bash
+pip install t-tech-investments --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
+```
 
-Прогоняет реальные функции бота по 2–4 годам истории MOEX с честными
-издержками и проверкой вне выборки (out-of-sample). Любую новую гипотезу
-проверяй здесь ДО изменения боевого бота.
+Without it, the bot still runs on free MOEX ISS data; sandbox trading, order
+book and portfolio features are disabled. Check your install with
+`python3 check_sdk.py`.
+
+## Configure
+
+```bash
+cp .env.example .env
+```
+
+Then fill in `.env`. Every value is optional except where noted:
+
+| Variable | Purpose |
+|---|---|
+| `ANTHROPIC_API_KEY` | AI news analysis. Omit to skip that module. |
+| `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` | Notifications. Omit for console-only. |
+| `TINVEST_TOKEN` | T-Invest data + sandbox. Omit for MOEX ISS only. |
+| `TINVEST_SANDBOX_ACCOUNT_ID` | Filled by `--create-sandbox`. |
+| `CBR_KEY_RATE` | CBR key rate, update after each rate decision. |
+| `SANDBOX_MAX_*_PCT` | Position sizing and concentration limits. |
+| `ENABLE_REAL_TRADING` | Keep `false`. Real orders are a stub. |
+
+`.env` is git-ignored. **Never commit it.** All other tuning knobs
+(`STOP_ATR_MULT`, `WEEKLY_*`, `NEWS_*`, `RECENT_PERF_*`, …) have defaults in
+the code and only need to be set to override.
+
+Set up the sandbox account once:
+
+```bash
+python3 tinvest_data.py --create-sandbox
+python3 tinvest_data.py --fund-sandbox
+python3 tinvest_data.py --portfolio
+```
+
+## Run
+
+```bash
+./run.sh                 # one scan, output to terminal
+./run.sh --watch         # background mode, rescans every 5 min
+./run.sh --news-only     # news only, skip market data
+```
+
+Or call the bot directly:
+
+```bash
+python3 moex_bot.py --watch
+python3 moex_bot.py --trade-log      # show the trade log
+python3 moex_bot.py --export-csv     # export trades to CSV
+python3 moex_bot.py --edge           # is the edge real, or luck?
+python3 moex_bot.py --close SBER     # manually close a position
+```
+
+Daily Telegram report (cron, 19:00 MSK):
+
+```bash
+0 16 * * 1-5 /full/path/to/trader/run_report.sh >> /full/path/to/trader/logs/report.log 2>&1
+```
+
+## Research tooling
+
+This is the part worth reading. Each tool is built to *disprove* the strategy
+rather than flatter it.
+
+### `backtest.py` — test the idea on history
+
+Runs the bot's actual functions over 2–4 years of MOEX history with realistic
+costs and an out-of-sample split. Test any new hypothesis here **before**
+touching the live bot.
 
 ```bash
 python3 backtest.py --years 4 --commission 0.10 --split   # baseline + OOS
 python3 backtest.py --years 2 --regime --split            # trend-following
-python3 backtest.py --years 2 --direction SHORT           # только шорты
+python3 backtest.py --years 2 --direction SHORT           # shorts only
 ```
 
-Ключевые флаги: `--quality` (фильтр сетапа), `--min-vol-ratio`, `--type`,
-`--direction`, `--tier 1|2`, `--regime` (по тренду IMOEX), `--split` (OOS),
+Key flags: `--quality`, `--min-vol-ratio`, `--type`, `--direction`,
+`--tier 1|2`, `--regime` (IMOEX trend), `--split` (out-of-sample),
 `--csv out.csv`.
 
-### `--edge` — реален ли edge или это удача
+### `moex_bot.py --edge` — is the edge real?
+
+Computes expectancy per trade **after costs**, a 95% confidence interval and a
+t-statistic over `trade_log.json`. The verdict is honest: with a small sample
+(<30) or an interval crossing zero, it reports "edge not proven". The same line
+is appended to the daily EOD Telegram report.
+
+### `strategy_lab.py` — compare strategy families vs buy & hold
+
+The fair professional benchmark is buy & hold, which most active managers fail
+to beat after costs. This compares `bh`, `tsmom` (price > MA200),
+`ma_cross` (MA20/MA100) and `rsi2` (Connors mean reversion), long-only,
+equal-weight, out of sample.
+
+### `brute_force.py` — parameter sweep with overfitting protection
+
+Sweeping hundreds of configs and picking the best one on history is a reliable
+way to invent an edge that doesn't exist. A config counts as a candidate only
+if it passes **all** filters: positive return in *both* independent halves of
+the window, total return above the risk-free rate, and ranking by the *worse*
+half rather than the better one.
 
 ```bash
-python3 moex_bot.py --edge
+python3 brute_force.py --from 2016-01-01 --to 2021-12-31
 ```
 
-Считает матожидание на сделку **после издержек**, 95% доверительный интервал
-и t-статистику по `trade_log.json`. Вердикт честный: при малой выборке (<30)
-или интервале, пересекающем ноль, — «преимущество не доказано». Эта же
-строка добавляется в ежедневный EOD-отчёт в Telegram.
+### `pulse_tracker.py` — score other people's public calls
 
-### `FORWARD_TEST_MODE` — набор статистики в песочнице
+Turns "this trader is up +132%" into checkable statistics. Headline percentages
+on social platforms aren't verifiable (deposits and withdrawals distort them),
+but public *forecasts* are falsifiable. The tracker records the price at the
+moment of the call and scores it against MOEX quotes. No access to anyone's
+account is required — public data only.
 
-Боевые throttle-гейты сжимают торговлю до ~6 сделок в год — выборку для
-`--edge` так не набрать. Флаг ослабляет **только** эти throttle-гейты
-(жёсткая защита `MAX_DAILY_LOSS_PCT` и `MAX_STOP_PCT` остаётся активной),
-чтобы быстрее накопить данные. **Только для песочницы.**
+```bash
+python3 pulse_tracker.py add --ticker IMOEX --target 2480 --horizon 7
+python3 pulse_tracker.py add --ticker SBER --dir long --horizon 5
+python3 pulse_tracker.py score     # pull quotes, close out due forecasts
+python3 pulse_tracker.py report    # hit rate, P&L if copied vs buy & hold
+```
+
+### `FORWARD_TEST_MODE` — gathering sandbox statistics
+
+Production throttle gates squeeze trading down to ~6 trades a year, which will
+never produce a usable sample for `--edge`. This flag loosens **only** those
+throttle gates; the hard guards (`MAX_DAILY_LOSS_PCT`, `MAX_STOP_PCT`) stay
+active. **Sandbox only.**
 
 ```bash
 FORWARD_TEST_MODE=1 python3 moex_bot.py --watch
 ```
 
-### `pulse_tracker.py` — объективная проверка чужих прогнозов
+## Project layout
 
-Превращает «у трейдера из Пульса +132%» в проверяемую статистику. Витринные
-проценты в Пульсе не проверяемы (искажаются вводами/выводами), отдельные сделки
-публично закрыты — но публичные ПРОГНОЗЫ falsifiable. Трекер фиксирует цену на
-момент прогноза и беспристрастно считает результат по котировкам MOEX (без
-доступа к чьим-либо счетам).
+| File | Role |
+|---|---|
+| `moex_bot.py` | Main bot: scanning, scoring, signals, sandbox orders, Telegram |
+| `tinvest_data.py` | T-Invest API: quotes, history, order book, sandbox trading |
+| `daily_report.py` | Daily EOD report to Telegram |
+| `moex_signal_bot.py` | Standalone minimal scanner (the original prototype) |
+| `backtest.py` | Historical backtest of the core strategy |
+| `strategy_lab.py` | Strategy families vs buy & hold |
+| `brute_force.py` | Parameter sweep with overfitting protection |
+| `pulse_tracker.py` | Objective tracker for public forecasts |
+| `check_sdk.py` | T-Invest SDK install diagnostics |
+| `test_bot.py` | Test suite (152 tests) |
+| `run.sh`, `run_report.sh`, `export_logs.sh` | Launch, report and export helpers |
+
+Runtime state (`signals_state.json`, `trade_log.json`, `*.jsonl` logs, caches,
+`logs/`) is generated at run time and git-ignored.
+
+## Tests
 
 ```bash
-# уровень («минимум будет на 2480»)
-python3 pulse_tracker.py add --ticker IMOEX --target 2480 --horizon 7 --note "..."
-# направление («беру SBER в лонг»)
-python3 pulse_tracker.py add --ticker SBER --dir long --horizon 5
-python3 pulse_tracker.py score      # подтянуть котировки и закрыть прогнозы
-python3 pulse_tracker.py report     # счёт: % сбывшихся, P&L если копировать vs купи-держи
+python3 test_bot.py
 ```
+
+## Disclaimer
+
+This software is provided for educational and research purposes only. It is
+not investment advice, not a recommendation to buy or sell any security, and
+not a solicitation. The author is not a licensed financial advisor. The
+strategy has **no proven edge after costs**. If you run it, run it in the
+sandbox. Any real-money use is entirely at your own risk.
+
+## License
+
+[MIT](LICENSE)
