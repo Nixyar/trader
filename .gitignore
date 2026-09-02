@@ -2,6 +2,7 @@
 # Секреты и конфиг окружения
 .env
 .env.*
+!.env.example
 
 # Runtime state (меняется при каждом запуске — у сервера и локали разные)
 signals_state.json
@@ -275,3 +276,8 @@ backtest_cache/
 
 # Лог прогнозов трекера Пульса
 pulse_calls.json
+
+# ─── Agent / editor local dirs ───────────────────────────────────────────────
+.claude/
+.vscode/
+.DS_Store

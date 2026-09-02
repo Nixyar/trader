@@ -1,2 +1,15 @@
-requests>=2.31.0
-feedparser>=6.0.0
+# Core runtime dependencies
+requests>=2.31.0        # HTTP: MOEX ISS API, Anthropic API, Telegram API
+feedparser>=6.0.0       # RSS news parsing
+pytz>=2024.1            # Europe/Moscow trading-session timezone math
+python-dotenv>=1.0.0    # loads .env
+
+# ─── Optional: T-Invest (T-Bank) sandbox paper trading ───────────────────────
+# Not on public PyPI — install from the T-Bank package registry:
+#   pip install t-tech-investments \
+#       --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
+# Fallback (older, community mirror):
+#   pip install tinkoff-investments
+#
+# Without it the bot still runs on free MOEX ISS data, but sandbox trading,
+# order-book and portfolio features are disabled.
